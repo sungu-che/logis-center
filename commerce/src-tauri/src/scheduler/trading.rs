@@ -181,7 +181,6 @@ pub(crate) async fn resolve_title_values(
     if !headless.is_empty() {
         let he = model.get_embedding_batch(headless.clone()).await
             .unwrap_or_else(|_| vec![vec![0.0; 384]; headless.len()]);
-        // ── ① 자기선언 점수 분포를 먼저 수집 ──
         let mut ts_all: Vec<f32> = Vec::with_capacity(headless.len());
         for i in 0..headless.len() {
             if he[i].iter().all(|&x| x == 0.0) {
@@ -190,22 +189,6 @@ pub(crate) async fn resolve_title_values(
                 ts_all.push(crate::utils::ai_utils::cosine_similarity(&he[i], &anchors[0]));
             }
         }
-        // ── ② [TITLE FLOOR v2] 문서 자신의 분포에서 절대 바닥을 유도합니다 ──
-        //
-        //  ── v1(평균+표준편차)이 왜 틀렸나 (실측) ──
-        //   📏 바닥 0.6329 | 'document_type: Purchase Order' 자기선언 0.6142 → 바닥 미달
-        //   이 값은 나머지 5축을 전부 이겼습니다(액션 0.5409 / 품목 0.4982 /
-        //   껍데기 0.4917 / 행구분자 0.3666). 즉 판정은 옳았는데 바닥이 0.019 차이로 잘랐고,
-        //   표제 후보가 11개 → 1개로 줄어 프로브가 질의 1개로 동작했습니다.
-        //
-        //  ── 왜 평균이 옳은가 ──
-        //   평균+표준편차는 vision_crop::core_threshold 의 계보인데,
-        //   그것은 '연결 성분의 씨앗' 을 잡는 용도라 상위 소수만 남기는 것이 목적입니다.
-        //   표제 후보 선별은 정반대로 리콜이 생명입니다.
-        //   bank_neutral_key_scores 는 max over queries 이므로 후보가 많아도
-        //   정답 하나만 살아 있으면 잡히고, 껍데기가 섞여도 프로브의
-        //   chrome 편견 축과 EVT 보정이 2차로 걸러냅니다.
-        //   따라서 여기서는 '평균 이상의 자기선언성' 만 요구합니다.
         let floor = {
             let v: Vec<f32> = ts_all.iter().cloned().filter(|s| *s > f32::MIN).collect();
             if v.len() < 4 {
@@ -259,15 +242,10 @@ pub(crate) async fn resolve_title_values(
 }
 
 struct PageIdentityVerdict {
-    /// 표제 축 최고 점수 (없으면 f32::MIN)
     title_top: f32,
-    /// 자기 문서번호 라벨 최고 점수 (없으면 f32::MIN)
     self_id_top: f32,
-    /// 독립 문서로 인정할 수 있는가
     is_standalone: bool,
 }
-/// 🌟 [SELF IDENTITY ANCHOR] '이 문서 자신의 번호' 를 뜻하는 라벨 개념.
-///    TRADE_TITLE_LABEL_ANCHOR 와 같은 계보(영어 한 벌 + 다국어 임베딩)입니다.
 const TRADE_SELF_ID_LABEL_ANCHOR: &str = "document number of this document, \
      number printed under the title of this form, own reference number of this form, \
      invoice number, order number, certificate number, declaration number, \
@@ -297,17 +275,7 @@ pub async fn probe_trade_document(
     doc_lang: &str,
     emit_term: &(dyn Fn(&str) + Send + Sync),
 ) -> Option<TradeRerouteVerdict> {
-    // ── ⓪ [DEPTH 0 / 결정론] 코사인보다 먼저, 국제 표준 포맷 증거를 봅니다 ──
-    //
-    //  ── 왜 순서를 바꾸는가 (실측) ──
-    //   PO 문서는 incoterms:FOB / doccode:PO / doccode:LC 를 갖고 있었는데,
-    //   구 코드는 이 증거를 '진영 승부에서 이긴 뒤 마진이 얇을 때만' 참조했습니다.
-    //   진영 승부에서 먼저 져버려 증거에 도달조차 못 했습니다.
-    //   커머스 웹페이지에 Incoterms / HS / 컨테이너번호 / 서식코드 문서번호가
-    //   나오는 일은 사실상 없으므로, 이것은 코사인보다 신뢰도가 높은 축입니다.
     let (has_marker, markers) = trade_structural_evidence(light_pug);
-    // 서식 코드 접두어(PO- / LC- / BL-)는 단독으로도 결정적입니다.
-    // 그 외 증거는 2종 이상 겹칠 때만 강한 증거로 인정합니다.
     let code_marker = markers.iter().any(|m| m.starts_with("doccode:"));
     let strong_structure = code_marker || markers.len() >= 2;
     if has_marker {
@@ -331,13 +299,6 @@ pub async fn probe_trade_document(
         bias_defs.push(("trade".to_string(), code.to_string(), title.to_string()));
     }
     const COMMERCE_TYPES: [&str; 6] = ["order", "goods", "tracking", "review", "coupon", "event"];
-    // 🌟 [BILINGUAL COMMERCE BANK] 커머스 앵커를 doc_lang 과 'en' 두 벌로 만듭니다.
-    //
-    //  ── 왜 필요한가 (실측) ──
-    //   [DOC LANG] Early detection: 'fr' — 영어 YAML 을 프랑스어로 오판했습니다.
-    //   그 순간 무역 뱅크는 영어(TRADE_DOC_TITLES 고정), 커머스 뱅크는 프랑스어가 되어
-    //   두 진영이 서로 다른 언어장에서 겨루게 됩니다. 비교 자체가 성립하지 않습니다.
-    //   언어 판정기를 고치는 것과 별개로, 프로브는 언어 오판에 강건해야 합니다.
     let mut commerce_langs: Vec<String> = vec![doc_lang.to_string()];
     if doc_lang != "en" { commerce_langs.push("en".to_string()); }
     for c in COMMERCE_TYPES.iter() {
@@ -381,21 +342,6 @@ pub async fn probe_trade_document(
             None => vec![0.0f32; 384],
         }
     };
-    // ── ②-2 [CROSS-MODE AMBIGUITY MASK] 두 mode 가 공유하는 구를 커머스 뱅크에서 뺍니다 ──
-    //
-    //  ── 무엇이 문제였나 (실측) ──
-    //   get_page_type_classification_bias 의 첫 줄은 `String::from(page_type)` 이라
-    //   커머스 'order' 앵커에 문자열 "order" 가 그대로 들어갑니다.
-    //   무역 'PO' 의 전문은 "purchase order" 입니다. 두 개념은 임베딩 공간에서
-    //   사실상 같은 지점이라, 'document_code: PO' 같은 질의가 커머스 order 를
-    //   무역 PO 보다 높게 만듭니다. 이것이 mode 간 유사도 충돌의 실체입니다.
-    //
-    //  ── 판정 규칙 (scheduler.rs STEP A 의 AMBIGUITY MASK 와 동일 계보) ──
-    //   own   = 같은 커머스 키의 '다른' 구들과의 최고 유사도 (자기 뱅크 응집도)
-    //   rival = 무역 전문 뱅크 전체와의 최고 유사도
-    //   rival >= own 이면 그 구는 자기 진영보다 상대 진영을 더 잘 설명하므로 제거합니다.
-    //   무역 뱅크는 키당 구가 1개라 own 을 정의할 수 없으므로 마스크 대상이 아닙니다.
-    //   전량 실격되면 마스크를 적용하지 않습니다(뱅크 소멸 방지).
     {
         let trade_embs: Vec<Vec<f32>> = bias_defs.iter()
             .filter(|(c, _, _)| c == "trade")
@@ -1557,10 +1503,6 @@ pub async fn process_trading_task(
         .map(|(c, k, p)| (c.clone(), k.clone(), group_phrase_emb(p))).collect();
     let g_prej_bank: Vec<(String, String, Vec<f32>)> = g_prej_defs.iter()
         .map(|(c, k, p)| (c.clone(), k.clone(), group_phrase_emb(p))).collect();
-    // 🌟 [BANK-NEUTRAL GROUP SCORING] √(2 ln N) 차감을 폐기합니다.
-    //    그룹마다 앵커 구 수가 다르면(shipping 33구 vs customs 17구)
-    //    구 수가 적은 그룹이 구조적으로 유리해집니다.
-    //    vision_encoder.rs 가 이미 폐기한 편향이라 텍스트 트랙도 동일하게 맞춥니다.
     let group_scores_raw = crate::utils::ai_utils::bank_neutral_key_scores(
         &line_embs, &g_bias_bank, &g_prej_bank,
     );
@@ -1776,24 +1718,12 @@ pub async fn process_trading_task(
         .map(|(c, k, p)| (c.clone(), k.clone(), code_phrase_emb(p))).collect();
     let c_prej_bank: Vec<(String, String, Vec<f32>)> = c_prej_defs.iter()
         .map(|(c, k, p)| (c.clone(), k.clone(), code_phrase_emb(p))).collect();
-
-    // 🌟 [BANK-NEUTRAL CODE SCORING]
-    //  ── 왜 바꾸는가 ──
-    //   후보가 55개일 때 각 코드의 편견 뱅크 N 이 54배로 폭발해
-    //   √(2 ln N) ≈ 3.4 가 차감되고, surprisal_dual_scores 의
-    //   `if ps > 0.0 { sc -= ps; }` 가 거의 항상 거짓이 되었습니다.
-    //   즉 CI 의 편견 안에 'purchase order' 가 있어도 한 번도 깎지 못했습니다.
-    //   행/열 이중 센터링은 뱅크 크기와 무관하므로 이 역설이 사라집니다.
     let mut code_scores: Vec<(String, f32)> = crate::utils::ai_utils::bank_neutral_key_scores(
         &line_embs, &c_bias_bank, &c_prej_bank,
     );
     if code_scores.is_empty() {
         code_scores.push((codes[0].to_string(), 0.0));
     }
-    // 🌟 [TITLE AXIS INTEGRATION] 제목 축을 본문 축과 같은 점수 공간에 합산합니다.
-    //    가중치 2.0 은 vision_encoder.rs 의 TITLE AXIS NMS INTEGRATION 과 동일하며,
-    //    두 트랙이 같은 문서에서 같은 코드를 내도록 맞춘 값입니다.
-    //    사후 오버라이드가 아니라 단일 점수 축 편입이므로 NMS 가 결정론적으로 판정합니다.
     if !title_scores.is_empty() {
         let mut merged = 0usize;
         for (cname, cs) in code_scores.iter_mut() {
@@ -1884,9 +1814,7 @@ pub async fn process_trading_task(
                 top_p: Some(0.95),
                 ..Default::default()
             };
-            
-            
-            
+
             let res = gen
                 .generate(
                     params,
@@ -2099,16 +2027,6 @@ pub async fn process_trading_task(
         let mut phrase_single: Vec<String> = vec![String::new(); unique_labels.len()];
         let mut phrase_multi: Vec<String> = vec![String::new(); unique_labels.len()];
         let mut phrase_line: Vec<usize> = vec![0usize; unique_labels.len()];
-        // 🌟 [MULTI-VALUE SCOPE] 다중 값 접합은 '같은 섹션 안' 에서만 허용합니다.
-        //
-        //  ── 실측 사고 ──
-        //   phrase_multi 가 섹션을 무시하고 이어붙여
-        //     party_address = "456 Market St, ... USA 123 Teheran-ro, ... South Korea"
-        //   가 되었습니다. 서로 다른 회사의 주소 두 개가 한 값이 되었습니다.
-        //
-        //  ── 규칙 ──
-        //   value_all 은 '같은 셀 안의 여러 줄' 을 담기 위한 축입니다.
-        //   섹션이 다르면 물리적으로 다른 블록이므로 접합 대상이 아닙니다.
         let mut multi_section: Vec<String> = vec![String::new(); unique_labels.len()];
         for (pi, ph) in pair_phrases.iter().enumerate() {
             let h = match unique_labels.iter().position(|u| u == ph) { Some(v) => v, None => continue };
@@ -2153,23 +2071,126 @@ pub async fn process_trading_task(
             };
             let self_embs: Vec<Vec<f32>> = self_phrases.iter().map(|p| emb_of(p)).collect();
             let ref_embs: Vec<Vec<f32>> = ref_phrases.iter().map(|p| emb_of(p)).collect();
+            let gate_surface: Vec<String> = unique_labels.iter().map(|l| {
+                let s: String = l.chars()
+                    .map(|c| if c == '_' || c == '-' || c == '.' || c == '/' { ' ' } else { c })
+                    .collect();
+                s.split_whitespace().collect::<Vec<_>>().join(" ").trim().to_lowercase()
+            }).collect();
+            let gate_embs = model.get_embedding_batch(gate_surface.clone()).await
+                .unwrap_or_else(|_| vec![vec![0.0; 384]; gate_surface.len()]);
             let mut sc: Vec<f32> = vec![f32::MIN; unique_labels.len()];
             let mut rc: Vec<f32> = vec![f32::MIN; unique_labels.len()];
             for h in 0..unique_labels.len() {
-                if leaf_embs[h].iter().all(|&v| v == 0.0) { continue; }
-                sc[h] = crate::utils::ai_utils::max_pool_sim(&leaf_embs[h], &self_embs);
-                rc[h] = crate::utils::ai_utils::max_pool_sim(&leaf_embs[h], &ref_embs);
+                // 원 라벨 임베딩과 정규화 표기 임베딩 중 '참조 신호가 살아 있는 쪽' 을 씁니다.
+                // 둘 다 보되 max 를 취하므로, 표기 차이로 신호가 죽는 경우만 구제됩니다.
+                let mut s_best = f32::MIN;
+                let mut r_best = f32::MIN;
+                if !leaf_embs[h].iter().all(|&v| v == 0.0) {
+                    s_best = crate::utils::ai_utils::max_pool_sim(&leaf_embs[h], &self_embs);
+                    r_best = crate::utils::ai_utils::max_pool_sim(&leaf_embs[h], &ref_embs);
+                }
+                if !gate_embs[h].iter().all(|&v| v == 0.0) {
+                    let s2 = crate::utils::ai_utils::max_pool_sim(&gate_embs[h], &self_embs);
+                    let r2 = crate::utils::ai_utils::max_pool_sim(&gate_embs[h], &ref_embs);
+                    // 두 표기 중 '참조 - 자기' 격차가 큰 쪽을 채택합니다.
+                    // 격차가 큰 표기가 그 라벨의 방향성을 더 선명하게 담고 있습니다.
+                    let d1 = if s_best == f32::MIN { f32::MIN } else { r_best - s_best };
+                    let d2 = r2 - s2;
+                    if d1 == f32::MIN || d2.abs() > d1.abs() {
+                        s_best = s2;
+                        r_best = r2;
+                    }
+                }
+                sc[h] = s_best;
+                rc[h] = r_best;
             }
             (sc, rc)
         };
-        // 필드가 '자기 문서번호 축' 인지 여부는 스키마 구조 사실로 판정합니다.
-        // reference_ 접두어는 bias.json 의 trade_schema 가 소유한 규약이므로
-        // 서식이 늘어도 이 판정은 수정 대상이 아닙니다.
         let is_self_id_field = |name: &str| -> bool {
             let n = name.trim().to_lowercase();
             n == "doc_number" || n == "document_number"
         };
         let mut self_id_gate_logged = 0usize;
+        let self_id_anchor_label: Option<usize> = {
+            let leading_code = |v: &str| {
+                let head: String = v.trim().chars().take_while(|c| c.is_alphabetic()).collect();
+                if head.is_empty() { return None; }
+                crate::utils::bias_schema::canonical_trade_doc_code(&head)
+            };
+            let mut prefix_hits: Vec<usize> = Vec::new();
+            for h in 0..unique_labels.len() {
+                let v = phrase_single[h].trim();
+                if v.is_empty() { continue; }
+                if !crate::utils::ai_utils::value_matches_format(
+                    crate::utils::ai_utils::FieldFormat::Identifier, v,
+                ) { continue; }
+                if let Some(code) = leading_code(v) {
+                    if code.eq_ignore_ascii_case(doc_type.as_str()) {
+                        prefix_hits.push(h);
+                    }
+                }
+            }
+            // ── 2단계: 접두어 후보가 여럿이거나 없을 때만 코사인 격차로 가림 ──
+            let pick_by_gap = |cands: &[usize]| -> Option<usize> {
+                let mut best: Option<(usize, f32)> = None;
+                for &h in cands {
+                    if label_self_cos[h] == f32::MIN { continue; }
+                    let gap = label_self_cos[h] - label_ref_cos[h];
+                    match best {
+                        Some((_, g)) if g >= gap => {}
+                        _ => best = Some((h, gap)),
+                    }
+                }
+                best.map(|(h, _)| h)
+            };
+            if prefix_hits.len() == 1 {
+                let h = prefix_hits[0];
+                emit_term(&format!(
+                    "  🪪 [SELF-ID ANCHOR / DOC-CODE] '{}' 를 자기 문서번호로 확정합니다. | 값 \"{}\" 의 접두어가 이 문서의 doc_type '{}' 와 일치합니다.",
+                    unique_labels[h], phrase_single[h], doc_type
+                ));
+                Some(h)
+            } else if prefix_hits.len() > 1 {
+                let h = pick_by_gap(&prefix_hits).unwrap_or(prefix_hits[0]);
+                emit_term(&format!(
+                    "  🪪 [SELF-ID ANCHOR / DOC-CODE TIE] 접두어가 '{}' 인 라벨이 {}개입니다. 자기선언-타문서참조 격차가 최대인 '{}' 를 선택합니다. | Value: \"{}\"",
+                    doc_type, prefix_hits.len(), unique_labels[h], phrase_single[h]
+                ));
+                Some(h)
+            } else {
+                // 접두어 규약을 따르지 않는 서식(순수 숫자 번호 등)은 코사인으로 폴백합니다.
+                let mut cands: Vec<usize> = Vec::new();
+                for h in 0..unique_labels.len() {
+                    if label_self_cos[h] == f32::MIN { continue; }
+                    if label_self_cos[h] <= label_ref_cos[h] { continue; }
+                    let v = phrase_single[h].trim();
+                    if v.is_empty() { continue; }
+                    if !crate::utils::ai_utils::value_matches_format(
+                        crate::utils::ai_utils::FieldFormat::Identifier, v,
+                    ) { continue; }
+                    // 타 문서코드 접두어를 가진 값은 명시적으로 배제합니다.
+                    // (CI-, PO-, LC- 가 자기 번호로 승격되는 경로를 코사인 단계에서 차단)
+                    if let Some(code) = leading_code(v) {
+                        if !code.eq_ignore_ascii_case(doc_type.as_str()) { continue; }
+                    }
+                    cands.push(h);
+                }
+                match pick_by_gap(&cands) {
+                    Some(h) => {
+                        emit_term(&format!(
+                            "  🪪 [SELF-ID ANCHOR / COSINE] 접두어 근거가 없어 코사인으로 판정합니다. '{}' | 자기선언 {:.4} > 타문서참조 {:.4} | Value: \"{}\"",
+                            unique_labels[h], label_self_cos[h], label_ref_cos[h], phrase_single[h]
+                        ));
+                        Some(h)
+                    }
+                    None => {
+                        emit_term("  ⚪ [SELF-ID ANCHOR] 자기 문서번호로 볼 라벨이 없어 doc_number 를 비워 둡니다.");
+                        None
+                    }
+                }
+            }
+        };
 
         let pair_abs_floor = 0.50f32;
         let mut leaf_raw: Vec<Vec<f32>> = vec![vec![-1.0f32; unique_labels.len()]; t_field_names.len()];
@@ -2273,6 +2294,23 @@ pub async fn process_trading_task(
             "  🧭 [SECTION SCOPE] 섹션 보정 적용 라벨 {}개 / 전체 {}개 (고유 라벨에는 라벨 축만 사용)",
             sec_applied, unique_labels.len()
         ));
+        if let Some(anchor) = self_id_anchor_label {
+            for f in 0..t_field_names.len() {
+                if is_self_id_field(&t_field_names[f]) {
+                    // doc_number 열은 앵커 라벨만 남깁니다.
+                    for h in 0..unique_labels.len() {
+                        if h != anchor { t_matrix[f][h] = -1.0; }
+                    }
+                    // 앵커 라벨이 게이트에 걸려 -1 이 되어 있었다면 되살립니다.
+                    if t_matrix[f][anchor] < 0.0 {
+                        t_matrix[f][anchor] = leaf_raw[f][anchor].max(1.0);
+                    }
+                } else {
+                    // 앵커 라벨은 doc_number 이외의 필드로 새지 않습니다.
+                    t_matrix[f][anchor] = -1.0;
+                }
+            }
+        }
 
         let t_assign = crate::utils::ai_utils::exclusive_assign_by_score(&t_matrix, 0.0, 0.0);
         use crate::logic::trade_field_category;
@@ -2281,6 +2319,10 @@ pub async fn process_trading_task(
             let (h, score, margin) = match a { Some(v) => *v, None => continue };
             let fname = t_field_names[f].clone();
             if crate::utils::ai_utils::is_id_link_field(&fname) { continue; }
+            let pinned = match self_id_anchor_label {
+                Some(a) => a == h && is_self_id_field(&fname),
+                None => false,
+            };
             {
                 let mut best_f = usize::MAX;
                 let mut best_v = f32::MIN;
@@ -2295,7 +2337,7 @@ pub async fn process_trading_task(
                     cnt += 1;
                     if v > best_v { best_v = v; best_f = ff; }
                 }
-                if cnt >= 2 && best_f != f && t_matrix[f][h] >= 0.0 {
+                if !pinned && cnt >= 2 && best_f != f && t_matrix[f][h] >= 0.0 {
                     let mu = sum / cnt as f64;
                     let sd = ((sq / cnt as f64 - mu * mu).max(0.0)).sqrt() as f32;
                     let gap = best_v - t_matrix[f][h];
@@ -2600,13 +2642,6 @@ pub async fn process_trading_task(
                     }
                 }
             }
-            // 🌟 [PRESENCE DROP] 프롬프트 지시를 어기고 채워 온 부재 필드를 폐기합니다.
-            //
-            //  ── 왜 결과 단계에서도 막는가 ──
-            //   실측에서 LOGISTICS 는 [ALREADY CLAIMED VALUES] 지시를 받고도
-            //   당사자 주소를 잘라 pol/pod/place_receipt/place_delivery 를 채웠습니다.
-            //   프롬프트는 확률적이고 이 게이트는 결정론입니다.
-            //   [SCHEMA ECHO GUARD] 가 "N/A" 를 결과 단계에서 걷어내는 것과 같은 계보입니다.
             if !absent_fields.is_empty() {
                 let mut dropped: Vec<String> = Vec::new();
                 prune_absent_keys(&mut tile_json, &absent_fields, &mut dropped);
@@ -2928,10 +2963,17 @@ pub async fn process_trading_task(
 
         
         if clean_ref == clean_no {
-            emit_term(&format!(
-                "  🧹 [RELAY SELF-LOOP] {}.{} 가 자기 문서번호({})와 같아 릴레이를 건너뜁니다.",
-                doc_type, mine_field, ref_display
-            ));
+            if !foreign_type.eq_ignore_ascii_case(&doc_type) {
+                emit_term(&format!(
+                    "  ⚠️ [RELAY SELF-LOOP / SUSPECT] {}.{} 가 자기 문서번호({})와 같습니다. 이 참조가 기대하는 문서 타입은 '{}' 인데 이 문서는 '{}' 입니다. doc_number 오배정으로 '{}' 갈래가 소멸할 수 있습니다.",
+                    doc_type, mine_field, ref_display, foreign_type, doc_type, foreign_type
+                ));
+            } else {
+                emit_term(&format!(
+                    "  🧹 [RELAY SELF-LOOP] {}.{} 가 자기 문서번호({})와 같아 릴레이를 건너뜁니다.",
+                    doc_type, mine_field, ref_display
+                ));
+            }
             continue;
         }
 

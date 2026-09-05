@@ -1557,16 +1557,6 @@ pub fn is_sql_effective_field(field_name: &str) -> bool {
         FieldFormat::Date | FieldFormat::Numeric | FieldFormat::TrackingCode
     )
 }
-
-// 🌟 [BANK SIZE BIAS NORMALIZATION] Max-Pool 은 뱅크가 클수록 점수가 구조적으로 부풀려집니다.
-//        E[max of N draws] ≈ μ + σ·√(2 ln N)
-//    bias.json 루트 color.bias 는 50개 언어 색상명 ~700구라
-//        color(N≈700) √(2 ln 700)=3.62  vs  title(N≈11) √(2 ln 11)=2.19  → 1.65배 유리
-//    그 결과 '팔린'(0.6228) '남긴'(0.6365) '여름'(0.5433) 처럼 색상과 무관한 청크의
-//    argmax 가 전부 color 로 몰리는 '흡수 싱크' 가 됩니다.
-//    질의와 무관한 언어권 구(아랍어/힌디어/조지아어 색상명 등)를 런타임에 비활성화합니다.
-//    판정 기준은 '이 뱅크 안에서의 코사인 중앙값' 이라는 상대 통계이므로 새 상수가 아닙니다.
-//    뱅크가 작으면(중앙값 통계가 무의미) 전량 유지하여 정보 손실을 막습니다.
 pub fn bank_size_normalized_mask(query_emb: &[f32], phrase_embs: &Vec<Vec<f32>>) -> Vec<bool> {
     let n = phrase_embs.len();
     let mut keep = vec![true; n];
@@ -1592,17 +1582,6 @@ pub fn bank_size_normalized_mask(query_emb: &[f32], phrase_embs: &Vec<Vec<f32>>)
     }
     keep
 }
-
-// 🌟 [BANK SIZE EQUALIZATION] bank_size_normalized_mask 는 중앙값 컷을 '단 한 번'만 수행합니다.
-//    그래서 로그에서 color 뱅크가 603구 → 302구 로 절반만 줄었고,
-//    Max-Pool 의 구조적 이득 E[max of N] ≈ μ + σ·√(2 ln N) 은
-//        √(2 ln 603)=3.58 → √(2 ln 302)=3.38  (겨우 5.6% 감소)
-//    에 그쳐, title(11구, √(2 ln 11)=2.19) 대비 여전히 1.54배 유리한 상태였습니다.
-//    그 결과 색상과 무관한 '팔린'(0.5780) '남긴'(0.6365) 의 argmax 를 color 가 계속 독식했습니다.
-//    여기서는 '이 스키마에서 정상 규모의 뱅크가 실제로 몇 구인가'(호출부 실측 중앙값)를
-//    목표로 삼아 중앙값 컷을 반복 적용하여 유효 크기를 같은 규모로 수렴시킵니다.
-//    각 반복은 '살아남은 구 집합 안에서의 상대 통계'만 사용하므로 절대 임계치가 없고,
-//    target_size 도 호출부의 실측값이므로 새 매직 상수가 아닙니다.
 pub fn bank_size_equalized_mask(query_emb: &[f32], phrase_embs: &Vec<Vec<f32>>, target_size: usize) -> Vec<bool> {
     let n = phrase_embs.len();
     let mut keep = vec![true; n];
@@ -1638,21 +1617,6 @@ pub fn bank_size_equalized_mask(query_emb: &[f32], phrase_embs: &Vec<Vec<f32>>, 
 
     keep
 }
-
-// 🌟 [FUNCTIONAL WORD] 조사·접속 표현은 어떤 속성의 값도 될 수 없습니다.
-//    Stanza 는 '제품중에서'/'제품으로'/'중에서' 를 전부 NOUN 으로 태깅하므로 POS 로는 못 거릅니다.
-//    (로그: 세 청크가 각각 condition / bundle_shipping / status 에 Margin -0.0091, -0.0020, +0.0000 로 억지 배정)
-//
-//    🌟 [LEMMA-FREE FALLBACK] 직전 구현은 lemma 잔여 판정과 deprel 에만 의존했는데,
-//    로그의 Stanza 출력은 전 토큰이 'lemma:' 로 비어 있고 deprel 도 전달되지 않아
-//    항상 false 를 반환했습니다. ([FUNCTIONAL WORD DROP] 이 한 번도 출력되지 않은 이유)
-//    lemma/deprel 이 비어 있어도 동작하도록, 같은 질의 안의 '다른 토큰'을 원형 사전처럼 사용합니다.
-//    어떤 언어든 조사·접속 표현은 '실질 형태소 + 기능 형태소' 구조를 갖고,
-//    그 실질 형태소는 대개 같은 문장에 단독으로도 등장합니다.
-//      '제품중에서' = '제품'(같은 질의에 단독 존재) + '중에서'
-//      '제품으로'   = '제품'(같은 질의에 단독 존재) + '으로'
-//      '중에서'     = 위에서 추출된 잔여와 완전일치
-//    다국어 어휘 리터럴을 단 하나도 쓰지 않고, 문자열 구조 비교만으로 판정합니다.
 pub fn is_functional_word_chunk(
     chunk: &str,
     words: &[String],
@@ -1925,15 +1889,6 @@ pub fn prejudice_phrase_bank(doc_lang: &str, page_type: &str, field_name: &str) 
     if phrases.len() > 64 { phrases.truncate(64); }
     phrases
 }
-
-// 🌟 [EXCLUSIVE ASSIGNMENT] (필드 × 라인) 유사도 행렬을 받아 상호 배타적 1:1 그리디 매칭을 수행합니다.
-// - own    : 해당 필드 바이어스와의 weighted max-pool 유사도
-// - rival  : 같은 라인을 노리는 다른 필드들 중 최고 유사도
-// - margin : own - rival (경쟁 필드 대비 실제 우위)
-//
-// 기존 방식(필드마다 독립 argmax)은 "본사" 같은 한 라인을 여러 필드가 중복 점유했고,
-// 절대 임계치가 없어 점수 0.0000 짜리 쓰레기 라인도 무조건 힌트로 주입되었습니다.
-// 반환값 = field_idx -> Option<(line_idx, own, margin)> / None 이면 "힌트 없음(null 유도)"
 pub fn exclusive_assign(
     matrix: &Vec<Vec<f32>>,
     abs_threshold: f32,
@@ -1958,15 +1913,6 @@ pub fn exclusive_assign(
         for l in 0..line_count {
             let own = get(f, l);
             if own < abs_threshold { continue; }
-
-            // 🌟 [RIVAL FIX] rival 초기값 0.0 은 두 가지를 동시에 배제합니다.
-            //    ① 무효 칸(-1.0)  → 의도된 배제
-            //    ② double_center_matrix 를 거쳐 '유효하지만 음수'가 된 경쟁 필드 → 의도치 않은 배제
-            //    ②가 발생하면 rival 이 0.0 으로 고정되어 margin = own 이 되고,
-            //    경쟁이 치열한 라인일수록 오히려 margin 이 과대평가되어
-            //    '경쟁자가 없는 약한 후보'가 먼저 선점하는 역전이 일어납니다.
-            //    exclusive_assign_by_score 는 이미 abs_threshold 기반으로 교정되어 있으므로
-            //    두 함수의 판정 규칙을 동일하게 통일합니다.
             let mut rival = f32::MIN;
             for other in 0..field_count {
                 if other == f { continue; }
@@ -1981,8 +1927,6 @@ pub fn exclusive_assign(
             claims.push((f, l, own, margin));
         }
     }
-
-    // 경쟁 우위(margin)가 큰 순서로, 동률이면 절대 유사도(own)가 큰 순서로 선점시킵니다.
     claims.sort_by(|a, b| {
         b.3.partial_cmp(&a.3)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -1999,12 +1943,6 @@ pub fn exclusive_assign(
 
     result
 }
-
-// 🌟 [SCORE-FIRST EXCLUSIVE ASSIGN]
-// exclusive_assign 은 '경쟁 마진'이 큰 순서로 선점시키므로, 증거가 약하지만 경쟁자가 없는
-// 라벨('판매자')이 증거가 압도적인 라벨('주문하신 분 이름', own 1.0)보다 먼저 필드를 채갑니다.
-// 상세 페이지의 (라벨 → 필드) 매핑은 "가장 강한 증거부터 잠근다"가 옳으므로
-// 절대 점수(own) 우선, 동률이면 마진 우선으로 정렬합니다.
 pub fn exclusive_assign_by_score(
     matrix: &Vec<Vec<f32>>,
     abs_threshold: f32,

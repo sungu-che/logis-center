@@ -26,24 +26,7 @@ const TRADE_ITEM_ATTRIBUTE_ANCHOR: &str = "line item attribute, attribute of one
 const TRADE_ROW_MARKER_ANCHOR: &str = "row separator, table row marker, line item index, \
      item number in a list, section key, group key, metadata key, \
      continued from previous page, page break marker, list bullet";
-// 🌟 [SITE CHROME ANCHOR] '문서의 내용' 이 아니라 '사이트/앱의 껍데기' 를 뜻하는 개념 축.
-//
-//  ── 왜 새 축이 필요한가 (실측) ──
-//   기존 4축(자기선언 / 타문서참조 / 품목속성 / 행구분자)은 전부 '문서 내부' 개념입니다.
-//   관리자 화면의 '관리자 페이지 / 로그아웃 / 회원관리 / 오늘:61, 어제:182' 는
-//   네 축 어디에도 속하지 않아 네 값이 0.02 이내로 붙어 나오고,
-//   그 잡음의 부호로 통과·탈락이 갈렸습니다.
-//   실측: 후보 24개 중 15개 통과, 그 15개가 전부 껍데기.
-//
-//  ── 왜 다국어가 성립하는가 ──
-//   TRADE_SELF_ID_LABEL_ANCHOR 와 동일한 계보입니다.
-//   문자열은 영어 한 벌뿐이고 판정은 granite-embedding-97m-multilingual-r2 가
-//   만든 벡터의 코사인으로만 이루어지므로, 문서 언어와 무관하게 동작합니다.
-//   한국어 사전을 추가하는 것이 아니라 '없던 축' 을 세우는 수정입니다.
-//
-//  ── 액션 축은 왜 새로 안 만드는가 ──
-//   crate::logic::UI_ACTION_ANCHOR 가 이미 '수정/삭제/등록/검색/엑셀저장' 개념을
-//   갖고 있습니다. 같은 사전을 두 벌로 두면 반드시 어긋나므로 재사용합니다.
+
 const SITE_CHROME_ANCHOR: &str = "site name, shopping mall name, brand slogan, \
      administrator page, admin home, admin main menu, management menu, \
      dashboard, control panel, back office, console, \
@@ -1150,6 +1133,33 @@ async fn extract_continuation_page(
         let (h, own, margin) = match a { Some(v) => *v, None => continue };
         let fname = f_names[f].clone();
         if crate::utils::ai_utils::is_id_link_field(&fname) { continue; }
+        {
+            let mut best_f = usize::MAX;
+            let mut best_raw = f32::MIN;
+            let mut sum = 0.0f64;
+            let mut sq = 0.0f64;
+            let mut cnt = 0usize;
+            for ff in 0..f_names.len() {
+                let v = matrix[ff][h];
+                if v < 0.0 { continue; }
+                sum += v as f64;
+                sq += (v as f64) * (v as f64);
+                cnt += 1;
+                if v > best_raw { best_raw = v; best_f = ff; }
+            }
+            if cnt >= 2 && best_f != f && matrix[f][h] >= 0.0 {
+                let mu = sum / cnt as f64;
+                let sd = ((sq / cnt as f64 - mu * mu).max(0.0)).sqrt() as f32;
+                let gap = best_raw - matrix[f][h];
+                if gap > sd {
+                    emit_term(&format!(
+                        "    🚫 [CONTINUATION DRIFT] Label '{}' 의 원시 argmax 는 '{}'({:.4}) 인데 '{}'({:.4}) 로 밀렸습니다. 격차 {:+.4} > 분포 표준편차 {:.4} → 배정을 폐기합니다.",
+                        labels[h], f_names[best_f], best_raw, fname, matrix[f][h], gap, sd
+                    ));
+                    continue;
+                }
+            }
+        }
         let cat = trade_field_category(&fname);
         if cat.is_empty() { continue; }
         if let Some(slot) = out.get_mut(cat).and_then(|v| v.as_object_mut()) {
@@ -1333,36 +1343,16 @@ pub async fn process_trading_task(
     
     model.check_embedding_downloaded().await?;
     model.ensure_embedding().await?;
-    // =====================================================================
-    // 🌟 [PAGE CONTINUITY GATE] 표제도 자기 번호도 없으면 앞 페이지의 연속입니다.
-    //  ── 왜 STEP A 앞인가 ──
-    //   STEP A 는 문서를 '반드시' 어떤 코드로 분류합니다. 후보가 좁혀져도
-    //   가장 덜 틀린 코드 하나를 무조건 뽑습니다. 그래서 표제가 없는 꼬리 페이지가
-    //   들어오면 반드시 오분류합니다. 분류 자체를 시키지 않는 것이 유일한 해법입니다.
-    // =====================================================================
     if page_idx > 0 && !page_results.is_empty() {
         let humanize_c = |raw: &str| -> String {
             let h = crate::utils::ai_utils::humanize_url_token(raw);
             if h.trim().is_empty() { raw.trim().to_string() } else { h }
         };
-        // ── ① 표제 축 ──
-        //
-        //  🌟 [SHARED RESOLVER] STEP A 와 동일한 판정기를 씁니다.
-        //
-        //  ── v1 이 왜 실패했나 (실측) ──
-        //   🧭 [PAGE CONTINUITY] 표제 축: +2.1194 | 자기번호 축: 없음 → 독립 문서
-        //   [ROW MARKER DROP] 로그가 한 줄도 없었습니다. 즉 아무것도 안 걸러졌습니다.
-        //   라벨 게이트가 '자기선언 vs 타문서참조' 2지 선택이라
-        //     'item code'   자기선언 0.6187 vs 타문서참조 0.5412 → 통과
-        //     'description' 자기선언 0.6000 vs 타문서참조 0.5295 → 통과
-        //   가 되었고, 그 값 "SKU-B200" / "Sensor Modules" 가 제목 축을 만들었습니다.
-        //   품목 속성 축을 세 번째 선택지로 넣으면 두 라벨이 그쪽으로 갑니다.
         let mut title_top = f32::MIN;
         {
             let vals = resolve_title_values(&model, &light_pug, 0.30, &emit_term, false).await;
             if !vals.is_empty() {
-                let ve = model.get_embedding_batch(vals.clone()).await
-                    .unwrap_or_else(|_| vec![vec![0.0; 384]; vals.len()]);
+                // 🌟 [DUPLICATE EMBED FIX] 같은 배치를 두 번 부르던 중복 호출을 제거합니다.
                 let ve = model.get_embedding_batch(vals.clone()).await
                     .unwrap_or_else(|_| vec![vec![0.0; 384]; vals.len()]);
                 let mut tb: Vec<(String, String, String)> = Vec::new();
@@ -1393,8 +1383,52 @@ pub async fn process_trading_task(
                     tb.iter().map(|(c, k, p)| (c.clone(), k.clone(), te(p))).collect();
                 let tpb: Vec<(String, String, Vec<f32>)> =
                     tp.iter().map(|(c, k, p)| (c.clone(), k.clone(), te(p))).collect();
-                let s = crate::utils::ai_utils::bank_neutral_key_scores(&ve, &tbb, &tpb);
-                if let Some((_, top)) = s.first() { title_top = *top; }
+                let (t_keys, t_net, _) = crate::utils::ai_utils::bank_neutral_key_matrix(
+                    &ve, &tbb, &tpb,
+                );
+                if !t_keys.is_empty() {
+                    let q = ve.len();
+                    // ── ① net 전체의 표준편차로 단위를 z 로 통일 ──
+                    let net_sd = {
+                        let mut sum = 0.0f64;
+                        let mut sq = 0.0f64;
+                        let mut cnt = 0usize;
+                        for ki in 0..t_keys.len() {
+                            for qi in 0..q {
+                                let v = t_net[ki][qi];
+                                if v == f32::MIN { continue; }
+                                sum += v as f64;
+                                sq += (v as f64) * (v as f64);
+                                cnt += 1;
+                            }
+                        }
+                        if cnt < 2 {
+                            1.0f32
+                        } else {
+                            let mu = sum / cnt as f64;
+                            let var = (sq / cnt as f64 - mu * mu).max(0.0);
+                            (var.sqrt() as f32).max(1e-6)
+                        }
+                    };
+                    // ── ② 극값 기대치 차감 ──
+                    let draws = t_keys.len().saturating_mul(q);
+                    let base = crate::utils::ai_utils::gumbel_expected_z(draws);
+                    let mut best = f32::MIN;
+                    for ki in 0..t_keys.len() {
+                        for qi in 0..q {
+                            let v = t_net[ki][qi];
+                            if v == f32::MIN { continue; }
+                            if v > best { best = v; }
+                        }
+                    }
+                    if best != f32::MIN {
+                        title_top = best / net_sd - base;
+                        emit_term(&format!(
+                            "     📐 [PAGE CONTINUITY / EVT] 표제 후보 {}개 | 키 {}개(draw {} → 기대 최댓값 {:.4}) | net {:+.4} → z {:+.4} → 보정 {:+.4}",
+                            q, t_keys.len(), draws, base, best, best / net_sd, title_top
+                        ));
+                    }
+                }
             }
         }
         // ── ② 자기 문서번호 라벨 축 ──
@@ -1562,17 +1596,6 @@ pub async fn process_trading_task(
         .find(|(g, _)| *g == best_group)
         .map(|(_, c)| c.to_vec())
         .unwrap_or_else(|| vec!["Unknown"]);
-    // 🌟 [GROUP EXPANSION GATE]
-    //  ── 무엇이 문제였나 (실측) ──
-    //   기존 게이트는 `*s <= 0.0` 이었습니다. 그런데 점수는 48개 라인의 최댓값이라
-    //   라인이 조금만 많아지면 7개 그룹이 전부 양수가 됩니다.
-    //   로그에서 후보가 55개 전부 열려 Depth-1 승리('contract')가 무의미해졌고,
-    //   contract 에 없는 CI 가 후보로 들어와 PO 를 이겼습니다.
-    //
-    //  ── 대체 기준 (매직 상수 아님) ──
-    //   '이 문서에서 관측된 양수 그룹 점수 분포의 (평균 + 표준편차)'.
-    //   models/siglip2/vision_crop.rs::core_threshold 가 쓰는 것과 같은 도구이며,
-    //   문서 자신의 분포에서 유도되므로 문서/언어에 따라 자동으로 조정됩니다.
     let expand_gate = {
         let pos: Vec<f32> = group_scores.iter().map(|(_, s)| *s).filter(|s| *s > 0.0).collect();
         if pos.len() < 4 {
@@ -2030,13 +2053,11 @@ pub async fn process_trading_task(
     let mut unique_labels: Vec<String> = Vec::new();
     let mut unique_leaf: Vec<String> = Vec::new();
     let mut unique_section: Vec<String> = Vec::new();
+    let mut unique_qualified: Vec<bool> = Vec::new();
     let mut label_count: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for p in &detail_pairs { *label_count.entry(p.label.clone()).or_insert(0) += 1; }
 
     let mut pair_phrases: Vec<String> = Vec::with_capacity(detail_pairs.len());
-    // 🌟 [SECTION-QUALIFIED PHRASE] 섹션이 복원되었으므로 중복 라벨이
-    //    'buyer name' / 'seller name' 처럼 서로 다른 구가 됩니다.
-    //    이것이 party_address 접합 사고를 구조적으로 막습니다.
     let mut qualified = 0usize;
     for p in &detail_pairs {
         let dup = label_count.get(&p.label).copied().unwrap_or(0) > 1;
@@ -2058,6 +2079,9 @@ pub async fn process_trading_task(
         unique_labels.push(ph.clone());
         unique_leaf.push(detail_pairs[pi].label.clone());
         unique_section.push(detail_pairs[pi].section.trim().to_string());
+        unique_qualified.push(
+            label_count.get(&detail_pairs[pi].label).copied().unwrap_or(0) > 1
+        );
     }
 
     let mut assigned_fields: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -2112,11 +2136,44 @@ pub async fn process_trading_task(
             }
         }
 
-        
+        let (label_self_cos, label_ref_cos) = {
+            let self_phrases = crate::utils::ai_utils::split_bias_phrases_full(TRADE_SELF_ID_LABEL_ANCHOR);
+            let ref_phrases = crate::utils::ai_utils::split_bias_phrases_full(TRADE_REFERENCE_LABEL_ANCHOR);
+            let mut uniq: Vec<String> = Vec::new();
+            for p in self_phrases.iter().chain(ref_phrases.iter()) {
+                if !uniq.iter().any(|e| e == p) { uniq.push(p.clone()); }
+            }
+            let uniq_embs = model.get_embedding_batch(uniq.clone()).await
+                .unwrap_or_else(|_| vec![vec![0.0; 384]; uniq.len()]);
+            let emb_of = |p: &str| -> Vec<f32> {
+                match uniq.iter().position(|e| e == p) {
+                    Some(i) => uniq_embs[i].clone(),
+                    None => vec![0.0f32; 384],
+                }
+            };
+            let self_embs: Vec<Vec<f32>> = self_phrases.iter().map(|p| emb_of(p)).collect();
+            let ref_embs: Vec<Vec<f32>> = ref_phrases.iter().map(|p| emb_of(p)).collect();
+            let mut sc: Vec<f32> = vec![f32::MIN; unique_labels.len()];
+            let mut rc: Vec<f32> = vec![f32::MIN; unique_labels.len()];
+            for h in 0..unique_labels.len() {
+                if leaf_embs[h].iter().all(|&v| v == 0.0) { continue; }
+                sc[h] = crate::utils::ai_utils::max_pool_sim(&leaf_embs[h], &self_embs);
+                rc[h] = crate::utils::ai_utils::max_pool_sim(&leaf_embs[h], &ref_embs);
+            }
+            (sc, rc)
+        };
+        // 필드가 '자기 문서번호 축' 인지 여부는 스키마 구조 사실로 판정합니다.
+        // reference_ 접두어는 bias.json 의 trade_schema 가 소유한 규약이므로
+        // 서식이 늘어도 이 판정은 수정 대상이 아닙니다.
+        let is_self_id_field = |name: &str| -> bool {
+            let n = name.trim().to_lowercase();
+            n == "doc_number" || n == "document_number"
+        };
+        let mut self_id_gate_logged = 0usize;
+
         let pair_abs_floor = 0.50f32;
         let mut leaf_raw: Vec<Vec<f32>> = vec![vec![-1.0f32; unique_labels.len()]; t_field_names.len()];
         let mut sec_raw:  Vec<Vec<f32>> = vec![vec![-1.0f32; unique_labels.len()]; t_field_names.len()];
-
         for f in 0..t_field_names.len() {
             let f_fmt = crate::utils::ai_utils::detect_field_format(&t_field_names[f]);
             let f_multi = crate::utils::ai_utils::is_multi_value_field(&t_field_names[f]);
@@ -2129,7 +2186,7 @@ pub async fn process_trading_task(
                     | crate::utils::ai_utils::FieldFormat::Address
                     | crate::utils::ai_utils::FieldFormat::Text
             );
-
+            let f_self_id = is_self_id_field(&t_field_names[f]);
             let f_cohesion = crate::utils::ai_utils::bank_internal_cohesion(&t_label_embs[f]);
             for h in 0..unique_labels.len() {
                 if leaf_embs[h].iter().all(|&v| v == 0.0) { continue; }
@@ -2137,12 +2194,25 @@ pub async fn process_trading_task(
                     &leaf_embs[h], &t_label_embs[f], &t_label_weights[f]
                 );
                 if own < pair_abs_floor { continue; }
+                // 🌟 [SELF-ID GATE] 자기 문서번호 축에는 '남을 가리키는 라벨' 을 올리지 않습니다.
+                if f_self_id
+                    && label_self_cos[h] != f32::MIN
+                    && label_ref_cos[h] > label_self_cos[h]
+                {
+                    if self_id_gate_logged < 8 {
+                        self_id_gate_logged += 1;
+                        emit_term(&format!(
+                            "    🚫 [SELF-ID GATE] '{}' → '{}' | 자기번호 {:.4} < 타문서참조 {:.4} → 이 라벨은 남의 문서를 가리키므로 자기 문서번호 축에서 제외합니다.",
+                            unique_labels[h], t_field_names[f], label_self_cos[h], label_ref_cos[h]
+                        ));
+                    }
+                    continue;
+                }
                 let prej = if t_prej_embs[f].is_empty() {
                     0.0
                 } else {
                     crate::utils::ai_utils::max_pool_sim(&leaf_embs[h], &t_prej_embs[f])
                 };
-
                 if crate::utils::ai_utils::prejudice_dominates(own, prej, f_cohesion) {
                     emit_term(&format!("    🚫 [TRADING PREJUDICE GATE] '{}' → '{}' | Label: {:.4} | Prej: {:.4} | Cohesion: {:.4} (상대 우위 초과)",
                         unique_labels[h], t_field_names[f], own, prej, f_cohesion));
@@ -2174,10 +2244,11 @@ pub async fn process_trading_task(
             }
         }
 
-        
         const SECTION_WEIGHT: f32 = 0.5f32;
         let mut t_matrix: Vec<Vec<f32>> = vec![vec![-1.0f32; unique_labels.len()]; t_field_names.len()];
+        let mut sec_applied = 0usize;
         for h in 0..unique_labels.len() {
+            let qualified = unique_qualified.get(h).copied().unwrap_or(false);
             let mut sec_sum = 0.0f32;
             let mut sec_cnt = 0usize;
             for f in 0..t_field_names.len() {
@@ -2187,9 +2258,10 @@ pub async fn process_trading_task(
                 sec_cnt += 1;
             }
             let sec_mean = if sec_cnt > 0 { sec_sum / (sec_cnt as f32) } else { 0.0 };
+            if qualified && sec_cnt > 1 { sec_applied += 1; }
             for f in 0..t_field_names.len() {
                 if leaf_raw[f][h] < 0.0 { continue; }
-                let sec_term = if sec_cnt > 1 && sec_raw[f][h] >= 0.0 {
+                let sec_term = if qualified && sec_cnt > 1 && sec_raw[f][h] >= 0.0 {
                     sec_raw[f][h] - sec_mean
                 } else {
                     0.0
@@ -2197,16 +2269,46 @@ pub async fn process_trading_task(
                 t_matrix[f][h] = leaf_raw[f][h] + SECTION_WEIGHT * sec_term;
             }
         }
+        emit_term(&format!(
+            "  🧭 [SECTION SCOPE] 섹션 보정 적용 라벨 {}개 / 전체 {}개 (고유 라벨에는 라벨 축만 사용)",
+            sec_applied, unique_labels.len()
+        ));
 
         let t_assign = crate::utils::ai_utils::exclusive_assign_by_score(&t_matrix, 0.0, 0.0);
-
         use crate::logic::trade_field_category;
-
+        let mut drift_dropped = 0usize;
         for (f, a) in t_assign.iter().enumerate() {
             let (h, score, margin) = match a { Some(v) => *v, None => continue };
             let fname = t_field_names[f].clone();
             if crate::utils::ai_utils::is_id_link_field(&fname) { continue; }
-
+            {
+                let mut best_f = usize::MAX;
+                let mut best_v = f32::MIN;
+                let mut sum = 0.0f64;
+                let mut sq = 0.0f64;
+                let mut cnt = 0usize;
+                for ff in 0..t_field_names.len() {
+                    let v = t_matrix[ff][h];
+                    if v < 0.0 { continue; }
+                    sum += v as f64;
+                    sq += (v as f64) * (v as f64);
+                    cnt += 1;
+                    if v > best_v { best_v = v; best_f = ff; }
+                }
+                if cnt >= 2 && best_f != f && t_matrix[f][h] >= 0.0 {
+                    let mu = sum / cnt as f64;
+                    let sd = ((sq / cnt as f64 - mu * mu).max(0.0)).sqrt() as f32;
+                    let gap = best_v - t_matrix[f][h];
+                    if gap > sd {
+                        drift_dropped += 1;
+                        emit_term(&format!(
+                            "    🚫 [PREEMPTION DRIFT] Label '{}' 의 최적 필드는 '{}'({:+.4}) 인데 선점당해 '{}'({:+.4}) 로 밀렸습니다. 격차 {:+.4} > 분포 표준편차 {:.4} → 배정을 폐기합니다.",
+                            unique_labels[h], t_field_names[best_f], best_v, fname, t_matrix[f][h], gap, sd
+                        ));
+                        continue;
+                    }
+                }
+            }
             let f_multi = crate::utils::ai_utils::is_multi_value_field(&fname);
             let val = if f_multi { phrase_multi[h].clone() } else { phrase_single[h].clone() };
             if val.trim().is_empty() { continue; }
@@ -2246,7 +2348,10 @@ pub async fn process_trading_task(
                 unique_labels[h], fname, if cat.is_empty() { "-" } else { cat }, score, margin, phrase_line[h] + 1, val));
         }
 
-        emit_term(&format!("  ✅ [TRADING PLINKO] LLM 없이 {}개 필드 확정 완료.", assigned_fields.len()));
+        emit_term(&format!(
+            "  ✅ [TRADING PLINKO] LLM 없이 {}개 필드 확정 완료. (표류 폐기 {}건)",
+            assigned_fields.len(), drift_dropped
+        ));
     }
 
     let mut absent_fields: std::collections::HashSet<String> = std::collections::HashSet::new();

@@ -2503,7 +2503,8 @@ pub fn double_center_matrix(raw: &Vec<Vec<f32>>) -> Vec<Vec<f32>> {
             let v = raw[f][l];
             if v < 0.0 { continue; }
             let lm = if line_cnt[l] > 1 { line_mean[l] } else { global_mean };
-            out[f][l] = v - lm - field_mean[f] + global_mean;
+            let fm = if field_cnt[f] > 1 { field_mean[f] } else { global_mean };
+            out[f][l] = v - lm - fm + global_mean;
         }
     }
     out

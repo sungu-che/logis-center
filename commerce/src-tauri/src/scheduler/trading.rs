@@ -739,6 +739,62 @@ fn merge_trading_page_map(
         }
     }
 
+    // 🌟 [ROW FRAGMENT MERGE] 축이 겹치지 않는 인접 조각 행을 한 행으로 접습니다.
+    //
+    //  ── 실측 사고 (SA-2026-0828) ──
+    //   line_items: [
+    //     { "description": "Cotton T-Shirts ..." },      ← 설명만 있는 행
+    //     { "quantity": 1 }                              ← 수치만 있는 행
+    //   ]
+    //   PLINKO 가 arr[0] 에 한 축을 넣고, 그 뒤 LLM 이 다른 축만 담은 배열을 돌려주면
+    //   merge_json_manual 이 그것을 원소로 '추가' 하기 때문에 한 품목이 두 행이 됩니다.
+    //
+    //  ── 판정 규칙 (전부 구조) ──
+    //   R1 두 행의 '값이 있는 키 집합' 이 교집합 0 이어야 합니다.
+    //      (같은 축을 둘 다 갖고 있으면 서로 다른 품목이므로 절대 합치지 않습니다)
+    //   R2 두 행 모두 '행 정체성 축'(description / item_code / container_number)을
+    //      동시에 갖고 있으면 합치지 않습니다. 정체성이 둘이면 품목도 둘입니다.
+    //   R3 인접한 행끼리만 봅니다. 표의 행 순서가 곧 품목 순서이기 때문입니다.
+    fn row_identity_keys() -> [&'static str; 4] {
+        ["description", "item_code", "container_number", "charge_code"]
+    }
+    fn filled_keys(v: &Value) -> Vec<String> {
+        match v.as_object() {
+            Some(o) => o
+                .iter()
+                .filter(|(_, val)| !is_empty_val(val))
+                .map(|(k, _)| k.clone())
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+    fn try_fold_fragment_rows(arr: &mut Vec<Value>) -> usize {
+        if arr.len() < 2 { return 0; }
+        let ident = row_identity_keys();
+        let mut folded = 0usize;
+        let mut i = 0usize;
+        while i + 1 < arr.len() {
+            let a_keys = filled_keys(&arr[i]);
+            let b_keys = filled_keys(&arr[i + 1]);
+            if a_keys.is_empty() || b_keys.is_empty() { i += 1; continue; }
+            let overlap = a_keys.iter().any(|k| b_keys.iter().any(|x| x == k));
+            if overlap { i += 1; continue; }
+            let a_ident = a_keys.iter().any(|k| ident.iter().any(|x| x == k));
+            let b_ident = b_keys.iter().any(|k| ident.iter().any(|x| x == k));
+            if a_ident && b_ident { i += 1; continue; }
+            let src = arr[i + 1].clone();
+            if let (Some(tgt_obj), Some(src_obj)) = (arr[i].as_object_mut(), src.as_object()) {
+                for (k, v) in src_obj {
+                    if is_empty_val(v) { continue; }
+                    tgt_obj.insert(k.clone(), v.clone());
+                }
+            }
+            arr.remove(i + 1);
+            folded += 1;
+        }
+        folded
+    }
+
     for (cat, src_val) in source {
         
         if let Some(src_arr) = src_val.as_array() {
@@ -749,6 +805,13 @@ fn merge_trading_page_map(
                     if is_empty_val(item) { continue; }
                     if tgt_arr.iter().any(|ex| ex == item) { continue; }
                     tgt_arr.push(item.clone());
+                }
+                let folded = try_fold_fragment_rows(tgt_arr);
+                if folded > 0 {
+                    println!(
+                        "  🧬 [ROW FRAGMENT MERGE] '{}' 배열에서 축이 겹치지 않는 조각 행 {}개를 접었습니다. (잔존 {}행)",
+                        cat, folded, tgt_arr.len()
+                    );
                 }
             }
             continue;
@@ -782,14 +845,47 @@ fn merge_trading_page_map(
 }
 
 pub(crate) fn normalize_trading_data(item: &mut Value, doc_lang: &str) {
-    const NUMERIC_KEYS: [&str; 15] = [
-        "amount", "amount_subtotal", "amount_tax", "freight_amount", "insurance_amount",
-        "local_charges", "package_count", "weight_gross", "weight_net", "volume",
-        "unit_price", "total_price", "quantity", "insured_amount", "premium_amount",
+    // 🌟 [NUMERIC KEY / RULE-BASED] 이름 화이트리스트를 규칙 판정으로 대체합니다.
+    //
+    //  ── 실측 사고 ──
+    //   SR 결과에 container_gross_weight: "1000.0", item_gross_weight: "1500.0" 이
+    //   문자열로 남았습니다. 아래 배열이 15개 이름만 손으로 나열하고 있어
+    //   container_* / item_* 계열이 전부 누락되었기 때문입니다.
+    //   문자열로 저장되면 canonicalize_data 의 CanonKind::Numeric 판정에는 걸리지만,
+    //   그 전에 json_to_natural_language 가 "Its container gross weight is 1000.0" 으로
+    //   문장을 만들고, Dexie 의 belowOrEqual 비교가 문자열 비교로 떨어집니다.
+    //
+    //  ── 왜 canonical::kind_of 를 재사용하는가 ──
+    //   utils/canonical.rs 는 NUM_SUFFIX 에 "_weight" / "_volume" / "_count" 를,
+    //   NUM_CONTAINS 에 "price" / "amount" / "measurement" / "tare_weight" 를 이미 갖고 있어
+    //   container_gross_weight / item_net_weight / item_package_count 를 전부 잡습니다.
+    //   같은 규칙을 두 벌 유지하면 반드시 어긋나므로 진실의 원천 하나에 위임합니다.
+    //
+    //  ── DATE 도 동일 ──
+    //   trade_schema 는 declaration_date / clearance_date / inspection_date /
+    //   treatment_date / weighing_date / claim_date / effective_date / transaction_date /
+    //   maturity_date / valid_until / departure_date / arrival_date /
+    //   latest_shipment_date / cargo_closing_date 등 20축 이상의 날짜를 갖는데
+    //   아래 배열은 6개뿐이었습니다.
+    //   canonical 의 NUM_SUFFIX 는 "_at" 만 날짜로 보므로, 여기서는
+    //   '_date 로 끝나거나 date 를 포함' 이라는 구조 규칙을 별도로 적용합니다.
+    const DATE_EXACT: [&str; 8] = [
+        "etd", "eta", "valid_until", "due_date",
+        "maturity_date", "expiry_date", "issue_date", "registration_date",
     ];
-    const DATE_KEYS: [&str; 6] = [
-        "issue_date", "expiry_date", "etd", "eta", "shipping_date", "registration_date",
-    ];
+
+    fn is_numeric_key(k: &str) -> bool {
+        use crate::utils::canonical::{kind_of, CanonKind};
+        // 날짜가 우선입니다. registration_date 는 canonical 규칙상 Free 이지만 날짜입니다.
+        if is_date_key(k) { return false; }
+        matches!(kind_of(k), CanonKind::Numeric)
+    }
+
+    fn is_date_key(k: &str) -> bool {
+        let lower = k.to_lowercase();
+        if DATE_EXACT.iter().any(|d| *d == lower) { return true; }
+        lower.ends_with("_date") || lower.starts_with("date_") || lower.ends_with("_at")
+    }
 
     fn to_number(v: &Value) -> Option<f64> {
         match v {
@@ -816,6 +912,32 @@ pub(crate) fn normalize_trading_data(item: &mut Value, doc_lang: &str) {
         }
     }
 
+    /// 🌟 [MONTH TOKEN] 영문 월 약어를 숫자로 환원합니다.
+    ///
+    ///  ── 왜 필요한가 ──
+    ///   기존 to_iso_date 는 정규식 \d+ 로 숫자만 뽑습니다.
+    ///   "Apr-19-2022" 에서는 [19, 2022] 두 개만 얻어 nums.len() < 3 으로 즉시 포기하고,
+    ///   CI 이미지의 issue_date 가 원문 그대로 남았습니다.
+    ///   무역 서식은 숫자 날짜의 월/일 순서 모호성(03/04)을 피하려고
+    ///   영문 월 약어를 쓰는 것이 국제 관행이므로 이 경로가 오히려 다수입니다.
+    ///
+    ///  ── 왜 어휘 하드코딩이 아닌가 ──
+    ///   12개월 약어는 ISO 8601 / IATA / SWIFT 가 공유하는 국제 표준 표기이며
+    ///   언어별 사전이 아니라 서식 규약입니다.
+    ///   (컨테이너 번호가 '영문 4자 + 숫자 7자' 인 것과 같은 성격입니다)
+    fn month_token_to_num(t: &str) -> Option<u32> {
+        let s: String = t.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+        if s.chars().count() < 3 { return None; }
+        let head: String = s.chars().take(3).map(|c| c.to_ascii_uppercase()).collect();
+        let n = match head.as_str() {
+            "JAN" => 1, "FEB" => 2, "MAR" => 3, "APR" => 4,
+            "MAY" => 5, "JUN" => 6, "JUL" => 7, "AUG" => 8,
+            "SEP" => 9, "OCT" => 10, "NOV" => 11, "DEC" => 12,
+            _ => return None,
+        };
+        Some(n)
+    }
+
     fn to_iso_date(v: &Value) -> Option<String> {
         let s = match v {
             Value::String(s) => s.trim().to_string(),
@@ -825,10 +947,53 @@ pub(crate) fn normalize_trading_data(item: &mut Value, doc_lang: &str) {
         if s.is_empty() || s == "N/A" || s == "null" { return None; }
         if s.contains('T') && s.chars().count() >= 19 { return Some(s); }
 
+        // 🌟 [ALPHA MONTH PATH] 영문 월 약어가 있으면 그것을 월로 확정하고,
+        //    남은 숫자에서 일/연을 크기로 가릅니다. (일 <= 31 < 연)
+        //    'Apr-19-2022' / '19 Apr 2022' / 'APRIL 19, 2022' 를 한 경로로 처리합니다.
+        {
+            let mut alpha_month: Option<u32> = None;
+            for tok in s.split(|c: char| !c.is_alphanumeric()) {
+                if tok.is_empty() { continue; }
+                if let Some(m) = month_token_to_num(tok) {
+                    alpha_month = Some(m);
+                    break;
+                }
+            }
+            if let Some(month) = alpha_month {
+                let re_n = regex::Regex::new(r"\d+").ok()?;
+                let nums: Vec<u32> = re_n
+                    .find_iter(&s)
+                    .filter_map(|m| m.as_str().parse().ok())
+                    .collect();
+                let mut year: Option<u32> = None;
+                let mut day: Option<u32> = None;
+                for n in nums.iter() {
+                    if *n > 31 {
+                        if year.is_none() { year = Some(*n); }
+                    } else if day.is_none() {
+                        day = Some(*n);
+                    }
+                }
+                // 두 자리 연도('22')만 있는 경우: 일이 이미 잡혔으면 남은 값을 연으로 봅니다.
+                if year.is_none() {
+                    let leftover: Vec<u32> = nums
+                        .iter()
+                        .cloned()
+                        .filter(|n| Some(*n) != day)
+                        .collect();
+                    if let Some(y) = leftover.first() { year = Some(*y); }
+                }
+                if let (Some(mut y), Some(d)) = (year, day) {
+                    if y < 100 { y += if y > 50 { 1900 } else { 2000 }; }
+                    let dd = d.clamp(1, 31);
+                    return Some(format!("{:04}-{:02}-{:02}T00:00:00", y, month, dd));
+                }
+            }
+        }
+
         let re = regex::Regex::new(r"\d+").ok()?;
         let nums: Vec<u32> = re.find_iter(&s).filter_map(|m| m.as_str().parse().ok()).collect();
         if nums.len() < 3 { return None; }
-
         let (mut year, mut month, mut day) = (nums[0], nums[1], nums[2]);
         
         if day > 31 && year <= 31 {
@@ -841,48 +1006,45 @@ pub(crate) fn normalize_trading_data(item: &mut Value, doc_lang: &str) {
         if month > 12 && day <= 12 { std::mem::swap(&mut month, &mut day); }
         month = month.clamp(1, 12);
         day = day.clamp(1, 31);
-
         let hour   = if nums.len() > 3 { nums[3].clamp(0, 23) } else { 0 };
         let minute = if nums.len() > 4 { nums[4].clamp(0, 59) } else { 0 };
         let second = if nums.len() > 5 { nums[5].clamp(0, 59) } else { 0 };
-
         Some(format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", year, month, day, hour, minute, second))
     }
 
-    fn walk(v: &mut Value, numeric: &[&str], date: &[&str]) {
+    fn walk(v: &mut Value) {
         match v {
             Value::Object(map) => {
                 let keys: Vec<String> = map.keys().cloned().collect();
                 for k in keys {
-                    if numeric.iter().any(|n| *n == k.as_str()) {
-                        let converted = map.get(&k).and_then(to_number);
-                        if let Some(num) = converted {
-                            map.insert(k.clone(), json!(num));
-                        }
-                        continue;
-                    }
-                    if date.iter().any(|d| *d == k.as_str()) {
+                    if is_date_key(&k) {
                         let converted = map.get(&k).and_then(to_iso_date);
                         if let Some(iso) = converted {
                             map.insert(k.clone(), json!(iso));
                         }
                         continue;
                     }
+                    if is_numeric_key(&k) {
+                        let converted = map.get(&k).and_then(to_number);
+                        if let Some(num) = converted {
+                            map.insert(k.clone(), json!(num));
+                        }
+                        continue;
+                    }
                     if let Some(child) = map.get_mut(&k) {
                         if child.is_object() || child.is_array() {
-                            walk(child, numeric, date);
+                            walk(child);
                         }
                     }
                 }
             },
             Value::Array(arr) => {
-                for it in arr.iter_mut() { walk(it, numeric, date); }
+                for it in arr.iter_mut() { walk(it); }
             },
             _ => {}
         }
     }
-
-    walk(item, &NUMERIC_KEYS, &DATE_KEYS);
+    walk(item);
 
     if let Some(obj) = item.as_object_mut() {
         let cur = obj.get("currency").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
@@ -1956,24 +2118,44 @@ pub async fn process_trading_task(
     // 🌟 [OTHER PARTIES SLOT] 스키마는 9개 카테고리인데 여기만 8개였습니다.
     //    실측: ⚠️ [PLINKO WRITE MISS] 'party_address' (cat: 'other_parties') 를 기록할 루트 슬롯을 찾지 못했습니다.
     //    forwarder / carrier / bank / agent 등 sender·recipient 가 아닌 당사자가 전부 이 버킷입니다.
-    // 🌟 [CATEGORY / SLOT 동기화] 손으로 두 곳에 적으면 반드시 어긋납니다.
-    //    실측 ①: other_parties 누락 → ⚠️ [PLINKO WRITE MISS] 'party_address'
-    //    실측 ②: settlement 누락 → SA 의 payment_status 가 순회 대상이 아니라
-    //             인쇄되어 있어도 LLM 패스를 한 번도 타지 않았습니다.
-    //    이제 슬롯을 categories 에서 유도하므로 목록만 고치면 됩니다.
-    let categories = [
-        "header", "parties", "other_parties", "logistics", "conditions",
-        "financials", "settlement", "cargo", "items", "containers",
-    ];
+    // 🌟 [CATEGORY / SINGLE SOURCE] 카테고리 목록을 logic.rs 하나로 접습니다.
+    //
+    //  ── 무엇이 문제였나 ──
+    //   trade_field_category 는 20갈래(customs / inspection / insurance / settlement /
+    //   hazmat / origin / compliance / charges / test_results / findings_and_damage /
+    //   account_ledger 포함)를 돌려주는데, 이 배열은 10개만 적혀 있었습니다.
+    //   그래서 그 11개 카테고리로 라우팅된 필드는
+    //     ⚠️ [PLINKO WRITE MISS] '...' (cat: 'customs') 를 기록할 루트 슬롯을 찾지 못했습니다.
+    //   로 전량 폐기되고, LLM 카테고리 순회 대상에서도 빠져 두 번 소실되었습니다.
+    //
+    //  ── insurance 버킷 오염의 정체 ──
+    //   CI overlay 의 financials.insurance 는 '보험료 라인' 입니다.
+    //   그런데 trade_field_category 의 명시 매핑에 'insurance' 필드명이 없어
+    //   규칙 폴백의 f.contains("insur") 에 걸려 'insurance' 카테고리가 됩니다.
+    //   그 카테고리가 순회 대상이 아니었으므로 값이 엉뚱한 곳으로 흘렀고,
+    //   검수에서 "insurance 버킷에 cargo 값(4/20)이 중복 복제" 로 관측되었습니다.
+    //   목록을 단일화하면 그 필드는 정상적으로 insurance 슬롯을 갖게 되고,
+    //   아래 [FINANCIAL ALIAS GUARD] 가 이름 충돌 자체를 없앱니다.
+    //
+    //  ── 배열 여부 판정 ──
+    //   logic::is_trade_array_category 가 이미 소유한 사실이므로 여기에 복제하지 않습니다.
+    let categories: Vec<&'static str> = crate::logic::TRADE_EXTRACTION_CATEGORIES.to_vec();
     let mut final_data_map = serde_json::Map::new();
     for c in categories.iter() {
-        match *c {
-            // 배열 카테고리. items 는 레거시 소비처가 line_items 를 읽습니다.
-            "items"      => { final_data_map.insert("line_items".to_string(), json!([])); }
-            "containers" => { final_data_map.insert("containers".to_string(), json!([])); }
-            _            => { final_data_map.insert(c.to_string(), json!({})); }
+        if crate::logic::is_trade_array_category(c) {
+            // items 만 레거시 소비처(merge_trading_page_map / hoist_array_identifiers)가
+            // line_items 라는 이름을 읽습니다. 나머지 배열은 카테고리명을 그대로 씁니다.
+            let key = if *c == "items" { "line_items" } else { *c };
+            final_data_map.insert(key.to_string(), json!([]));
+        } else {
+            final_data_map.insert(c.to_string(), json!({}));
         }
     }
+    emit_term(&format!(
+        "  🗂️ [CATEGORY SLOTS] logic::TRADE_EXTRACTION_CATEGORIES 기준 {}개 슬롯 생성 (배열 {}개)",
+        categories.len(),
+        categories.iter().filter(|c| crate::logic::is_trade_array_category(c)).count()
+    ));
     final_data_map.insert("header".to_string(), json!({"doc_type": doc_type.clone()}));
 
     let content_pug = {
@@ -2322,6 +2504,57 @@ pub async fn process_trading_task(
                 ));
             }
         }
+
+        // 🌟 [ROLE PARTY ANCHOR] '역할 당사자' 와 '주요 당사자' 를 가르는 두 축을 준비합니다.
+        //
+        //  ── 앵커 출처 ──
+        //   bias.json 의 trade_schema.base.other_parties.party_role 설명문과
+        //   parties 의 sender/recipient/notify 설명문을 그대로 씁니다.
+        //   어휘 목록을 코드에 복제하지 않으므로 역할이 늘어도 수정 대상이 아닙니다.
+        let (role_party_embs, main_party_embs, role_party_anchor_ready) = {
+            let triples = crate::utils::bias_schema::canonical_trade_triples(&doc_type);
+            let mut role_phrases: Vec<String> = Vec::new();
+            let mut main_phrases: Vec<String> = Vec::new();
+            for (category, field, desc) in triples.iter() {
+                if category == "other_parties" && field == "party_role" {
+                    for p in crate::utils::ai_utils::split_bias_phrases_full(desc) {
+                        if !role_phrases.iter().any(|e| e == &p) { role_phrases.push(p); }
+                    }
+                }
+                if category == "parties"
+                    && (field == "sender_name" || field == "recipient_name" || field == "notify_party_name")
+                {
+                    for p in crate::utils::ai_utils::split_bias_phrases_full(desc) {
+                        if !main_phrases.iter().any(|e| e == &p) { main_phrases.push(p); }
+                    }
+                }
+            }
+            // 스키마에서 얻지 못한 극단 상황의 최소 방어선입니다.
+            if role_phrases.is_empty() {
+                for p in [
+                    "carrier", "insurer", "issuing bank", "advising bank", "customs broker",
+                    "warehouse operator", "surveying agency", "shipping agent", "freight forwarder",
+                    "drawer", "drawee", "payee", "claimant", "applicant",
+                ] { role_phrases.push(p.to_string()); }
+            }
+            if main_phrases.is_empty() {
+                for p in [
+                    "shipper", "exporter", "seller", "consignor",
+                    "consignee", "importer", "buyer", "receiver", "notify party",
+                ] { main_phrases.push(p.to_string()); }
+            }
+            let re = model.get_embedding_batch(role_phrases.clone()).await
+                .unwrap_or_else(|_| vec![vec![0.0; 384]; role_phrases.len()]);
+            let me = model.get_embedding_batch(main_phrases.clone()).await
+                .unwrap_or_else(|_| vec![vec![0.0; 384]; main_phrases.len()]);
+            let ready = !re.is_empty() && !me.is_empty();
+            emit_term(&format!(
+                "  🧑‍💼 [ROLE PARTY ANCHOR] 역할 당사자 구 {}개 | 주요 당사자 구 {}개 준비 (활성: {})",
+                re.len(), me.len(), if ready { "예" } else { "아니오" }
+            ));
+            (re, me, ready)
+        };
+
         let pair_abs_floor = 0.50f32;
         let mut leaf_raw: Vec<Vec<f32>> = vec![vec![-1.0f32; unique_labels.len()]; t_field_names.len()];
         let mut sec_raw:  Vec<Vec<f32>> = vec![vec![-1.0f32; unique_labels.len()]; t_field_names.len()];
@@ -2497,19 +2730,92 @@ pub async fn process_trading_task(
                 }
             }
             let f_multi = crate::utils::ai_utils::is_multi_value_field(&fname);
-            let val = if f_multi { phrase_multi[h].clone() } else { phrase_single[h].clone() };
+            let mut val = if f_multi { phrase_multi[h].clone() } else { phrase_single[h].clone() };
             if val.trim().is_empty() { continue; }
+            let mut split_pair: Option<(String, String, String)> = None; // (수량필드, 수량, 단위)
+            if let Some((cnt_f, unit_f)) = crate::utils::ai_utils::count_unit_pair_of(&fname) {
+                if let Some((num, unit)) = crate::utils::ai_utils::split_count_and_unit(&val) {
+                    if fname == unit_f && !unit_f.is_empty() {
+                        // 단위 축으로 배정되었는데 수량이 붙어 있는 경우
+                        emit_term(&format!(
+                            "    ✂️ [COUNT-UNIT SPLIT] '{}' 값 \"{}\" 을 분해합니다 → {}={} / {}={}",
+                            fname, val, cnt_f, num, unit_f, unit
+                        ));
+                        split_pair = Some((cnt_f.to_string(), num, unit.clone()));
+                        val = unit;
+                    } else if fname == cnt_f {
+                        // 수량 축으로 배정되었는데 단위가 붙어 있는 경우
+                        emit_term(&format!(
+                            "    ✂️ [COUNT-UNIT SPLIT] '{}' 값 \"{}\" 을 분해합니다 → {}={} / {}={}",
+                            fname, val, cnt_f, num, if unit_f.is_empty() { "(단위축 없음)" } else { unit_f }, unit
+                        ));
+                        if !unit_f.is_empty() {
+                            split_pair = Some((unit_f.to_string(), unit, num.clone()));
+                        }
+                        val = num;
+                    }
+                }
+            }
 
             let cat = trade_field_category(&fname);
+
+            // 🌟 [ROLE PARTY DIVERT] 당사자 축인데 라벨이 '역할 당사자' 를 가리키면
+            //    parties 대신 other_parties 배열로 흡수합니다.
+            //
+            //  ── 실측 사고 (SR-2026-0820) ──
+            //   recipient_name: "Pacific Ocean Lines" — 포워더가 수하인으로 배정되었습니다.
+            //   bias.json 의 편견 강화(Fix J)로 recipient_name 후보에서는 탈락하지만,
+            //   탈락한 값이 갈 곳이 없으면 그대로 소실되어 '운송인을 못 뽑는' 상태가 됩니다.
+            //   trade_schema.base.other_parties 가 party_role / party_name 축을 이미 갖고 있으므로
+            //   그쪽으로 흘려보내면 값을 잃지 않으면서 수하인 축도 오염되지 않습니다.
+            //
+            //  ── 판정 근거 ──
+            //   라벨 임베딩과 '역할 당사자 앵커' / 'sender·recipient 앵커' 를 비교합니다.
+            //   어휘를 코드에 적지 않고, bias.json 의 other_parties.party_role 설명문을
+            //   그대로 앵커로 씁니다. 역할이 늘어도 이 코드는 수정 대상이 아닙니다.
+            let mut cat = cat;
+            let mut fname = fname;
+            if (fname == "recipient_name" || fname == "sender_name" || fname == "notify_party_name")
+                && role_party_anchor_ready
+            {
+                let li = match unique_labels.iter().position(|u| u == &unique_labels[h]) {
+                    Some(v) => v,
+                    None => h,
+                };
+                if !leaf_embs[li].iter().all(|&v| v == 0.0) {
+                    let role_sim = crate::utils::ai_utils::max_pool_sim(&leaf_embs[li], &role_party_embs);
+                    let main_sim = crate::utils::ai_utils::max_pool_sim(&leaf_embs[li], &main_party_embs);
+                    if role_sim > main_sim {
+                        emit_term(&format!(
+                            "    🔀 [ROLE PARTY DIVERT] Label '{}' 는 역할 당사자({:.4}) 가 주요 당사자({:.4}) 보다 우세합니다. '{}' 대신 other_parties.party_name 으로 흡수합니다. | Value: \"{}\"",
+                            unique_labels[h], role_sim, main_sim, fname, val
+                        ));
+                        // 역할 라벨 자체를 party_role 로 함께 기록해 두면 소비처가 구분할 수 있습니다.
+                        let slot = final_data_map
+                            .entry("other_parties".to_string())
+                            .or_insert_with(|| Value::Array(Vec::new()));
+                        if let Some(arr) = slot.as_array_mut() {
+                            arr.push(json!({
+                                "party_role": unique_labels[h].clone(),
+                                "party_name": val.clone()
+                            }));
+                        }
+                        assigned_fields.insert(format!("party_name::{}", unique_labels[h]), val.clone());
+                        continue;
+                    }
+                }
+                let _ = (&mut cat, &mut fname);
+            }
+
             if cat.is_empty() {
-                emit_term(&format!("    ⚪ [TRADING CATEGORY UNMAPPED] '{}' 는 8개 카테고리에 매핑되지 않아 루트에만 주입합니다.", fname));
+                emit_term(&format!("    ⚪ [TRADING CATEGORY UNMAPPED] '{}' 는 카테고리에 매핑되지 않아 루트에만 주입합니다.", fname));
             } else if let Some(slot) = final_data_map.get_mut(cat).and_then(|v| v.as_object_mut()) {
                 slot.insert(fname.clone(), json!(val.clone()));
             } else {
-                let arr_key = match cat {
-                    "items" => Some("line_items"),
-                    "containers" => Some("containers"),
-                    _ => None,
+                let arr_key: Option<&str> = if crate::logic::is_trade_array_category(cat) {
+                    Some(if cat == "items" { "line_items" } else { cat })
+                } else {
+                    None
                 };
                 if let Some(ak) = arr_key {
                     let slot = final_data_map
@@ -2533,6 +2839,54 @@ pub async fn process_trading_task(
             assigned_fields.insert(fname.clone(), val.clone());
             emit_term(&format!("    ✨ [TRADING PLINKO ASSIGN] Label '{}' → Field '{}' (cat: {}) | Score: {:+.4} | Margin: {:+.4} | Line {} | Value: \"{}\"",
                 unique_labels[h], fname, if cat.is_empty() { "-" } else { cat }, score, margin, phrase_line[h] + 1, val));
+
+            // 🌟 [COUNT-UNIT SPLIT / 짝 축 주입] 분해된 반대편 값을 같은 카테고리 슬롯에 넣습니다.
+            //    이미 PLINKO 가 그 축을 확정했다면 덮지 않습니다. (인쇄된 별도 셀 우선)
+            if let Some((pair_field, pair_value, _)) = split_pair {
+                if assigned_fields.contains_key(&pair_field) {
+                    emit_term(&format!(
+                        "    ⏭️ [COUNT-UNIT SPLIT SKIP] '{}' 는 이미 확정값 \"{}\" 을 갖고 있어 분해값 \"{}\" 을 주입하지 않습니다.",
+                        pair_field, assigned_fields.get(&pair_field).cloned().unwrap_or_default(), pair_value
+                    ));
+                } else {
+                    let pair_cat = trade_field_category(&pair_field);
+                    let wrote = match pair_cat {
+                        "" => false,
+                        "items" | "containers" => {
+                            let ak = if pair_cat == "items" { "line_items" } else { "containers" };
+                            let slot = final_data_map
+                                .entry(ak.to_string())
+                                .or_insert_with(|| Value::Array(Vec::new()));
+                            match slot.as_array_mut() {
+                                Some(arr) => {
+                                    if arr.is_empty() { arr.push(Value::Object(serde_json::Map::new())); }
+                                    match arr[0].as_object_mut() {
+                                        Some(row) => { row.insert(pair_field.clone(), json!(pair_value.clone())); true }
+                                        None => false,
+                                    }
+                                }
+                                None => false,
+                            }
+                        }
+                        _ => match final_data_map.get_mut(pair_cat).and_then(|v| v.as_object_mut()) {
+                            Some(slot) => { slot.insert(pair_field.clone(), json!(pair_value.clone())); true }
+                            None => false,
+                        },
+                    };
+                    if wrote {
+                        assigned_fields.insert(pair_field.clone(), pair_value.clone());
+                        emit_term(&format!(
+                            "    ✅ [COUNT-UNIT SPLIT ASSIGN] '{}' (cat: {}) ← \"{}\" (복합값 분해분)",
+                            pair_field, if pair_cat.is_empty() { "-" } else { pair_cat }, pair_value
+                        ));
+                    } else {
+                        emit_term(&format!(
+                            "    ⚠️ [COUNT-UNIT SPLIT MISS] '{}' (cat: '{}') 를 기록할 슬롯이 없어 분해분을 폐기합니다.",
+                            pair_field, pair_cat
+                        ));
+                    }
+                }
+            }
         }
 
         emit_term(&format!(
@@ -2685,7 +3039,7 @@ pub async fn process_trading_task(
             ));
             continue;
         }
-        if *cat != "items" && *cat != "containers" {
+        if !crate::logic::is_trade_array_category(cat) {
             let filled = final_data_map.get(*cat)
                 .and_then(|v| v.as_object())
                 .map(|o| o.iter().filter(|(k, _)| *k != "doc_type").count())

@@ -752,7 +752,30 @@ fn trade_doc_identity_context(doc_type: &str) -> (Vec<&'static str>, Vec<(&'stat
             try_add("reference_po", vec!["P/O NO."]);
         },
     }
-
+    // 🌟 [GENERIC REFERENCE CATCH-ALL] 서식 코드 접두어를 갖지 않는 참조 라벨의 종착지.
+    //
+    //  ── 실측 사고 ──
+    //   CI 이미지에 'EXPORT REFERENCE  ORD32829' 가 인쇄되어 있는데 최종 JSON 어디에도 없습니다.
+    //   base 스키마에는 reference_number 가 존재하지만, 프롬프트의 [REFERENCE RULES] 블록은
+    //   위 match 가 만든 refs 만 나열합니다. reference_number 는 그 목록에 한 번도 등장하지 않으므로
+    //   모델 입장에서는 '라벨 예시가 하나도 없는 필드' 이고, 그런 필드는 채워지지 않습니다.
+    //   규칙 3번이 "목록에 없으면 reference_number 를 쓰라" 고 적혀 있어도
+    //   그 필드가 존재한다는 사실 자체를 라벨 축으로 인지시키지 못하면 발화하지 않습니다.
+    //
+    //  ── 왜 마지막에 넣는가 ──
+    //   ref_lines 는 위에서 아래로 렌더링되며, 2B 모델은 앞쪽 항목에 더 강하게 반응합니다.
+    //   서식별 정확 참조가 먼저 소진된 뒤 남은 라벨만 이 축으로 흘러가야 하므로 맨 뒤에 둡니다.
+    //
+    //  ── 라벨 선정 근거 ──
+    //   45종 데이터셋에서 서식 코드로 환원되지 않는 참조 라벨만 뽑았습니다.
+    //   (EXPORT REFERENCE / OUR REF / YOUR REF / REFERENCE NO. / JOB NO. / FILE NO.)
+    //   전부 '이 문서가 남의 문서를 부르는 이름' 이지만 접두어 규약이 없어
+    //   trade_reference_field_of 로는 매핑할 수 없는 것들입니다.
+    try_add("reference_number", vec![
+        "EXPORT REFERENCE", "EXPORT REF.", "REFERENCE NO.", "REF NO.",
+        "OUR REFERENCE", "OUR REF.", "YOUR REFERENCE", "YOUR REF.",
+        "JOB NO.", "FILE NO.", "CASE NO.", "ORDER REFERENCE",
+    ]);
     (doc_labels, refs, self_ref)
 }
 
@@ -969,12 +992,63 @@ pub fn get_trade_category_schema_present(
         .collect::<Vec<_>>()
         .join("\n");
 
+    // 🌟 [CLOSED VOCAB SPLIT] 닫힌 어휘 필드의 예시는 '금지' 가 아니라 '기대값' 입니다.
+    //
+    //  ── 실측 사고 ──
+    //   bias.json 의 conditions.incoterms 설명문은 "FOB, CIF, EXW, DDP, DAP {String}" 입니다.
+    //   extract_example_tokens 가 이 5개를 그대로 수확해 [FORBIDDEN VALUES] 에 올렸고,
+    //   프롬프트는 "이 토큰을 읽지 않고 반환하면 창작" 이라고 못박습니다.
+    //   그런데 CI 이미지에는 DAP 가 실제로 인쇄되어 있습니다.
+    //   2B 모델은 금지 목록에 있는 토큰을 회피해 null 을 반환했고,
+    //   그 결과가 conditions: {} 공란입니다.
+    //   transport_mode / package_unit / freight_payment_term 도 같은 구조입니다.
+    //
+    //  ── 판정 근거 ──
+    //   '닫힌 어휘인가' 는 detect_field_format 이 Enum 을 돌려주는가로 결정합니다.
+    //   어휘 목록을 여기에 다시 적지 않으므로 필드가 늘어도 이 코드는 수정 대상이 아닙니다.
+    //
+    //  ── 왜 '허용' 이 아니라 '기대' 인가 ──
+    //   "T/T, L/C, Net30" 처럼 한 글자 토큰이 is_usable 에서 탈락하는 설명문이 있습니다.
+    //   그 필드를 닫힌 집합으로 제시하면 잔존 토큰 하나만 정답이 되어 오히려 리콜이 죽습니다.
+    //   '표준 어휘이며, 인쇄된 것이 다르면 인쇄된 것을 쓰라' 로 열어 둡니다.
+    fn is_enumerated_desc(desc: &str) -> bool {
+        let flat: String = desc
+            .chars()
+            .map(|c| if c == '(' || c == ')' || c == '[' || c == ']' { ' ' } else { c })
+            .collect();
+        let parts: Vec<String> = flat
+            .replace(" or ", ",")
+            .replace('/', ",")
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        parts.len() >= 2 && parts.iter().all(|p| p.split_whitespace().count() <= 4)
+    }
+
     let mut forbidden: Vec<String> = Vec::new();
-    for (_, d, _) in parsed.iter() {
-        for tok in extract_example_tokens(d) {
+    let mut expected: Vec<(String, Vec<String>)> = Vec::new();
+    for (k, d, _) in parsed.iter() {
+        let toks = extract_example_tokens(d);
+        if toks.is_empty() { continue; }
+        let is_closed_vocab =
+            crate::utils::ai_utils::detect_field_format(k) == crate::utils::ai_utils::FieldFormat::Enum
+                && is_enumerated_desc(d);
+        if is_closed_vocab {
+            expected.push((k.clone(), toks));
+            continue;
+        }
+        for tok in toks {
             if !forbidden.iter().any(|e| e == &tok) {
                 forbidden.push(tok);
             }
+        }
+    }
+    // 🌟 [CROSS CONTAMINATION] 다른 필드의 설명문이 같은 토큰을 예시로 갖고 있으면
+    //    기대값이 금지값으로 되살아납니다. 기대 목록을 금지 목록에서 명시적으로 뺍니다.
+    for (_, toks) in expected.iter() {
+        for t in toks.iter() {
+            forbidden.retain(|f| f != t);
         }
     }
     // 타입 표기 자체도 금지 목록에 넣습니다. (실측: "voyage_number": "{String}")
@@ -984,7 +1058,6 @@ pub fn get_trade_category_schema_present(
             forbidden.push(m);
         }
     }
-
     let forbidden_block = if forbidden.is_empty() {
         String::new()
     } else {
@@ -996,6 +1069,22 @@ pub fn get_trade_category_schema_present(
              Return one of these ONLY when you can actually read that exact token in the image.",
             forbidden.join(", ")
         )
+    };
+    // ⚠️ [CONTRACT] process_trading_task 는 SCHEMA 블록에서 trim_start 후 '"' 로 시작하는
+    //    라인 수로 필드 개수를 셉니다. 아래 블록의 항목은 반드시 '-' 로 시작시켜야 합니다.
+    let expected_block = if expected.is_empty() {
+        String::new()
+    } else {
+        let mut s = String::from(
+            "\n[EXPECTED VALUES]\n\
+             The fields below use a standard printed vocabulary. These tokens are REAL answers, not forbidden examples.\n\
+             If you can read one of them in the image for that field, return it EXACTLY as printed.\n\
+             If the image shows a different token for that field, return the printed token instead.\n",
+        );
+        for (k, toks) in expected.iter() {
+            s.push_str(&format!("- \"{}\": {}\n", k, toks.join(", ")));
+        }
+        s
     };
 
     let body = parsed
@@ -1117,13 +1206,14 @@ pub fn get_trade_category_schema_present(
     format!(
         "RULES: Output JSON ONLY. Every value in SCHEMA is null on purpose — replace a null ONLY with text you can actually read in the image.\n\
          MISSION: Extract data for category '{}' of a {} document.{}{}\n\
-         [FIELD DEFINITIONS]\n{}{}\n\
+         [FIELD DEFINITIONS]\n{}{}{}\n\
          SCHEMA:\n{}",
         category.to_uppercase(),
         doc_type,
         reference_rule,
         array_rule,
         defs,
+        expected_block,
         forbidden_block,
         schema
     )

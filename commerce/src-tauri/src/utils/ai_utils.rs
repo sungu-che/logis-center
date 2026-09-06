@@ -1756,6 +1756,105 @@ pub fn prefix_match_filter_stem(category: &str, chunk: &str) -> Option<(String, 
 
     if best_stem.is_empty() { None } else { Some((best_key, best_stem)) }
 }
+// =====================================================================
+// 🌟 [COUNT-UNIT SPLIT] '30 PLTS' 처럼 수량과 포장단위가 한 셀에 붙은 값을 분해합니다.
+// ---------------------------------------------------------------------
+//  ── 무엇이 문제였나 (실측 로그) ──
+//   ✨ [PLINKO ASSIGN] 'total_packages' → 'package_unit'  ("50 PLTS")
+//   ✨ [PLINKO ASSIGN] 'packages'       → 'package_unit'  ("30 PLTS")
+//   package_unit 은 detect_field_format 상 Enum 입니다.
+//   ENUM NUMERIC GATE 는 is_pure_numeric_value 로 판정하는데
+//   "30 PLTS" 는 알파벳이 4자라 letters <= 1 이 거짓 → 게이트를 그대로 통과합니다.
+//   그 결과 수량 30 이 소실되고 단위 필드에 복합 문자열이 저장되며,
+//   SR 의 item_package_type: "30 PLTS" 오염이 여기서 확정됩니다.
+//
+//  ── 왜 split_numeric_and_comparator 로는 안 되는가 ──
+//   그 함수는 '숫자 + 비교 표현' 을 전제로 만들어졌고, 반환값 rest 에
+//   단위 제거 휴리스틱(첫 토큰 2자 이하)이 들어 있어 'PLTS'(4자)를 단위로 인정하지 않습니다.
+//   또한 호출부가 전부 검색 경로(query_chunk_matches_property_ext)라
+//   저장 경로에서 재사용하면 의미가 어긋납니다.
+//
+//  ── 판정 규칙 (전부 구조, 어휘 사전 없음) ──
+//   R1 숫자 토큰이 정확히 하나 존재해야 합니다. (2개 이상이면 표 셀 병합 사고이므로 손대지 않음)
+//   R2 그 숫자 앞뒤의 잔여가 '숫자를 포함하지 않는 짧은 토큰' 이어야 단위로 인정합니다.
+//   R3 잔여가 4단어를 넘으면 설명문이므로 분해하지 않습니다.
+//   국제 포장단위(CTN/PLT/PKG/BOX/DRUM/BALE/CASE/ROLL/BAG/BDL)는 전부 1~5자이며,
+//   한국어('팔레트')·일본어('パレット')·중국어('托盘')도 이 길이 안에 들어옵니다.
+//
+//  ── 반환 ──
+//   Some((수량 문자열, 단위 문자열)) / 분해 불가면 None
+// =====================================================================
+pub fn split_count_and_unit(value: &str) -> Option<(String, String)> {
+    let v = value.trim();
+    if v.is_empty() { return None; }
+
+    // R1 : 숫자 덩어리를 훑되, 두 개 이상이면 즉시 포기합니다.
+    let chars: Vec<char> = v.chars().collect();
+    let mut num_start: Option<usize> = None;
+    let mut num_end: usize = 0;
+    let mut num_groups = 0usize;
+    let mut i = 0usize;
+    while i < chars.len() {
+        if !chars[i].is_ascii_digit() { i += 1; continue; }
+        let s = i;
+        while i < chars.len()
+            && (chars[i].is_ascii_digit()
+                || ((chars[i] == '.' || chars[i] == ',')
+                    && i + 1 < chars.len()
+                    && chars[i + 1].is_ascii_digit()))
+        {
+            i += 1;
+        }
+        num_groups += 1;
+        if num_groups > 1 { return None; }
+        num_start = Some(s);
+        num_end = i;
+    }
+    let ns = match num_start { Some(s) => s, None => return None };
+
+    let number: String = chars[ns..num_end].iter().filter(|c| **c != ',').collect();
+    if number.is_empty() { return None; }
+
+    // R2/R3 : 숫자 앞뒤 잔여를 합쳐 단위 후보를 만듭니다.
+    let head: String = chars[..ns].iter().collect();
+    let tail: String = chars[num_end..].iter().collect();
+    let unit_raw = format!("{} {}", head.trim(), tail.trim());
+    let unit: String = unit_raw
+        .split_whitespace()
+        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if unit.is_empty() { return None; }
+    if unit.chars().any(|c| c.is_ascii_digit()) { return None; }
+    let words: Vec<&str> = unit.split_whitespace().collect();
+    if words.len() > 4 { return None; }
+    if unit.chars().count() > 24 { return None; }
+
+    Some((number, unit))
+}
+
+/// 🌟 [COUNT-UNIT PAIR] 이 필드가 '수량 축' 인지 '단위 축' 인지 결정론으로 답합니다.
+///
+///  ── 왜 이름 규칙인가 ──
+///   trade_schema 는 수량과 단위를 항상 짝으로 정의합니다.
+///     package_count ↔ package_unit
+///     item_package_count ↔ item_package_type
+///     container_package_count ↔ (컨테이너 단위 없음)
+///     quantity ↔ unit
+///   접미사만으로 짝을 유도하므로 새 축이 늘어도 이 함수는 수정 대상이 아닙니다.
+///
+///  ── 반환 ──
+///   Some((수량 필드명, 단위 필드명)) — 둘 중 어느 쪽으로 들어왔든 같은 쌍을 돌려줍니다.
+pub fn count_unit_pair_of(field: &str) -> Option<(&'static str, &'static str)> {
+    match field {
+        "package_count" | "package_unit" => Some(("package_count", "package_unit")),
+        "item_package_count" | "item_package_type" => Some(("item_package_count", "item_package_type")),
+        "container_package_count" => Some(("container_package_count", "")),
+        "quantity" | "unit" => Some(("quantity", "unit")),
+        _ => None,
+    }
+}
 
 // 🌟 [NUMERIC COMPARISON SPLIT] '5000원 이하로' 처럼 숫자와 비교 표현이 붙은 청크를
 //    (숫자 / 나머지) 로 구조 분해합니다.

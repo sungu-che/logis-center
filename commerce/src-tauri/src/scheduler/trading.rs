@@ -109,9 +109,6 @@ pub(crate) async fn resolve_title_values(
         let h = crate::utils::ai_utils::humanize_url_token(raw);
         if h.trim().is_empty() { raw.trim().to_string() } else { h }
     };
-    // 🌟 [AXIS 6] 기존 4축에 '사이트 껍데기' 와 'UI 액션' 을 추가합니다.
-    //    문서 내부 개념끼리만 비교하던 3지선다는, 문서 내부 개념이 하나도 없는
-    //    관리자 화면에서 잡음의 부호로 판정이 갈렸습니다.
     let anchors = model
         .get_embedding_batch(vec![
             TRADE_TITLE_LABEL_ANCHOR.to_string(),        // 0 자기선언
@@ -602,18 +599,6 @@ fn trade_structural_evidence(pug: &str) -> (bool, Vec<String>) {
             found.push(format!("awb:{}", m.as_str()));
         }
     }
-    // 🌟 [HS FALSE POSITIVE FIX] 기존 정규식은 ISO 날짜를 HS 코드로 오인했습니다.
-    //
-    //  ── 실측 사고 ──
-    //   'issue_date: 2026-08-10' → \d{4}-\d{2}-\d{2} 에 정확히 매칭되어
-    //   hs:2026-08-10 이라는 거짓 증거가 만들어집니다.
-    //   구조 증거를 판정의 1급 근거로 승격하는 순간 이 오탐은 치명적이 됩니다.
-    //
-    //  ── 구분 근거 (사전이 아니라 형식 사실) ──
-    //   HS 코드의 2~3번째 자리는 '류(chapter) 내 호(heading)' 라 12 를 넘을 수 있고,
-    //   날짜의 월은 1~12, 일은 1~31 을 벗어날 수 없습니다.
-    //   두 번째 그룹이 12 이하이고 세 번째 그룹이 31 이하이면 날짜로 보고 폐기합니다.
-    //   (8542.31 처럼 점 구분이면 날짜가 아니므로 그대로 통과합니다)
     if let Ok(re) = regex::Regex::new(r"\b(\d{4})([.\-])(\d{2})[.\-](\d{2,4})\b") {
         for cap in re.captures_iter(&upper) {
             let sep = cap.get(2).map(|m| m.as_str()).unwrap_or("-");
@@ -639,18 +624,6 @@ fn trade_structural_evidence(pug: &str) -> (bool, Vec<String>) {
     if upper.contains("B/L") {
         found.push("bl_label".to_string());
     }
-    // 🌟 [DOC CODE PREFIX] '{서식코드}-{일련번호}' 형태의 문서번호를 찾습니다.
-    //
-    //  ── 왜 강력한가 ──
-    //   PO-99281A / LC-88492011 / BL-55432219 / CI-2026-08001 처럼
-    //   무역 서식은 자기 코드를 접두어로 갖는 번호를 반드시 인쇄합니다.
-    //   반대로 커머스 관리자 화면에는 이 패턴이 사실상 존재하지 않습니다.
-    //   사전은 새로 만들지 않고 TRADE_DOC_TITLES 의 코드 목록을 그대로 조회하므로
-    //   서식이 늘어나도 이 코드는 수정 대상이 아닙니다.
-    //
-    //  ── 왜 다국어 무관인가 ──
-    //   서식 코드는 어느 나라 서식이든 라틴 대문자 약어로 인쇄됩니다.
-    //   임베딩도 언어 사전도 쓰지 않는 순수 형식 판정입니다.
     if let Ok(re) = regex::Regex::new(r"\b([A-Z]{2,8})-[A-Z0-9]{3,}\b") {
         let mut seen: Vec<String> = Vec::new();
         for cap in re.captures_iter(&upper) {
@@ -665,7 +638,51 @@ fn trade_structural_evidence(pug: &str) -> (bool, Vec<String>) {
     }
     (!found.is_empty(), found)
 }
-
+fn is_row_index_section(section: &str) -> bool {
+    let s: Vec<char> = section.trim().chars().collect();
+    if s.is_empty() { return false; }
+    let mut i = 0usize;
+    while i < s.len() {
+        if !s[i].is_ascii_digit() { i += 1; continue; }
+        let start = i;
+        while i < s.len() && s[i].is_ascii_digit() { i += 1; }
+        let left_ok  = start == 0 || !s[start - 1].is_alphanumeric();
+        let right_ok = i == s.len() || !s[i].is_alphanumeric();
+        if left_ok && right_ok { return true; }
+    }
+    false
+}
+fn recover_pair_sections(anchors: &[(usize, usize)], pug_lines: &[String]) -> Vec<String> {
+    let mut consumed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for (label_line, primary_line) in anchors.iter() {
+        consumed.insert(*label_line);
+        consumed.insert(*primary_line);
+    }
+    let mut out: Vec<String> = Vec::with_capacity(anchors.len());
+    for (label_line, _) in anchors.iter() {
+        let li = (*label_line).min(pug_lines.len().saturating_sub(1));
+        let mut sec = String::new();
+        let mut i = li;
+        while i > 0 {
+            i -= 1;
+            if consumed.contains(&i) { continue; }
+            if pug_lines[i].trim().is_empty() { continue; }
+            let (_, tag, _, txt) = crate::utils::ai_utils::pug_line_parts(&pug_lines[i]);
+            if matches!(
+                tag.as_str(),
+                "table" | "thead" | "tbody" | "tfoot" | "tr" | "colgroup" | "col"
+            ) {
+                continue;
+            }
+            let t = txt.trim().trim_end_matches(':').trim().to_string();
+            if t.chars().count() < 2 { continue; }
+            sec = t;
+            break;
+        }
+        out.push(sec);
+    }
+    out
+}
 fn prune_absent_keys(
     v: &mut Value,
     absent: &std::collections::HashSet<String>,
@@ -676,8 +693,18 @@ fn prune_absent_keys(
             let ks: Vec<String> = map.keys().cloned().collect();
             for k in ks {
                 if absent.contains(&k) {
+                    let was_filled = map.get(&k).map(|v| match v {
+                        Value::Null => false,
+                        Value::String(s) => {
+                            let t = s.trim();
+                            !(t.is_empty() || t == "null" || t == "N/A")
+                        }
+                        Value::Array(a) => !a.is_empty(),
+                        Value::Object(o) => !o.is_empty(),
+                        _ => true,
+                    }).unwrap_or(false);
                     map.remove(&k);
-                    if !dropped.iter().any(|e| e == &k) { dropped.push(k); }
+                    if was_filled && !dropped.iter().any(|e| e == &k) { dropped.push(k); }
                     continue;
                 }
                 if let Some(child) = map.get_mut(&k) {
@@ -754,7 +781,7 @@ fn merge_trading_page_map(
     }
 }
 
-fn normalize_trading_data(item: &mut Value, doc_lang: &str) {
+pub(crate) fn normalize_trading_data(item: &mut Value, doc_lang: &str) {
     const NUMERIC_KEYS: [&str; 15] = [
         "amount", "amount_subtotal", "amount_tax", "freight_amount", "insurance_amount",
         "local_charges", "package_count", "weight_gross", "weight_net", "volume",
@@ -1013,7 +1040,26 @@ async fn extract_continuation_page(
     };
     let pug_lines: Vec<String> = content_pug.lines().map(|s| s.to_string()).collect();
     let pug_lines_ref: Vec<&str> = pug_lines.iter().map(|s| s.as_str()).collect();
-    let detail_pairs = crate::utils::ai_utils::collect_detail_label_value_pairs(&pug_lines_ref);
+    let mut detail_pairs = crate::utils::ai_utils::collect_detail_label_value_pairs(&pug_lines_ref);
+    {
+        let anchors: Vec<(usize, usize)> = detail_pairs.iter()
+            .map(|p| (p.label_line, p.primary_line)).collect();
+        let recovered_secs = recover_pair_sections(&anchors, &pug_lines);
+        let mut recovered = 0usize;
+        for (i, p) in detail_pairs.iter_mut().enumerate() {
+            if !p.section.trim().is_empty() { continue; }
+            let s = match recovered_secs.get(i) { Some(s) => s, None => continue };
+            if s.is_empty() { continue; }
+            p.section = s.clone();
+            recovered += 1;
+        }
+        if recovered > 0 {
+            emit_term(&format!(
+                "  🧭 [SECTION RECOVERY / CONTINUATION] {}페이지 섹션 {}개 복원",
+                page_idx + 1, recovered
+            ));
+        }
+    }
     emit_term(&format!(
         "  🧷 [CONTINUATION PAIR] {}페이지 구조적 라벨-값 페어 {}개 확보 (doc_type='{}')",
         page_idx + 1, detail_pairs.len(), doc_type
@@ -1042,6 +1088,7 @@ async fn extract_continuation_page(
     let mut leafs: Vec<String> = Vec::new();
     let mut vals: Vec<String> = Vec::new();
     let mut lines: Vec<usize> = Vec::new();
+    let mut sections: Vec<String> = Vec::new();
     for p in detail_pairs.iter() {
         if p.value.trim().is_empty() { continue; }
         let key = format!("{}\u{1}{}", p.label, p.value);
@@ -1052,17 +1099,39 @@ async fn extract_continuation_page(
         leafs.push(p.label.clone());
         vals.push(p.value.clone());
         lines.push(p.primary_line);
+        sections.push(p.section.trim().to_string());
     }
     if labels.is_empty() {
         return Ok(out);
     }
     let leaf_embs = model.get_embedding_batch(leafs.clone()).await
         .unwrap_or_else(|_| vec![vec![0.0; 384]; leafs.len()]);
+    let row_index_section: Vec<bool> = sections
+        .iter()
+        .map(|s| is_row_index_section(s))
+        .collect();
+    {
+        let hits: Vec<String> = (0..labels.len())
+            .filter(|&h| row_index_section[h])
+            .map(|h| format!("{}('{}')", labels[h], sections[h]))
+            .collect();
+        if !hits.is_empty() {
+            emit_term(&format!(
+                "  🧾 [ROW SECTION SCOPE / CONTINUATION] 행 인덱스 섹션 라벨 {}개는 items/containers 에만 배정합니다: {:?}",
+                hits.len(), hits.iter().take(8).collect::<Vec<_>>()
+            ));
+        }
+    }
     let mut matrix: Vec<Vec<f32>> = vec![vec![-1.0f32; labels.len()]; f_names.len()];
     for f in 0..f_names.len() {
         let fmt = crate::utils::ai_utils::detect_field_format(&f_names[f]);
+        let f_row_cat = {
+            let c = crate::logic::trade_field_category(&f_names[f]);
+            c == "items" || c == "containers"
+        };
         for h in 0..labels.len() {
             if leaf_embs[h].iter().all(|&v| v == 0.0) { continue; }
+            if row_index_section[h] && !f_row_cat { continue; }
             if !crate::utils::ai_utils::value_matches_format(fmt, &vals[h]) {
                 continue;
             }
@@ -1075,6 +1144,8 @@ async fn extract_continuation_page(
     let assign = crate::utils::ai_utils::exclusive_assign_by_score(&centered, 0.0, 0.0);
     use crate::logic::trade_field_category;
     let mut assigned = 0usize;
+    let mut item_row = serde_json::Map::new();
+    let mut container_row = serde_json::Map::new();
     for (f, a) in assign.iter().enumerate() {
         let (h, own, margin) = match a { Some(v) => *v, None => continue };
         let fname = f_names[f].clone();
@@ -1108,14 +1179,46 @@ async fn extract_continuation_page(
         }
         let cat = trade_field_category(&fname);
         if cat.is_empty() { continue; }
-        if let Some(slot) = out.get_mut(cat).and_then(|v| v.as_object_mut()) {
-            slot.insert(fname.clone(), json!(vals[h].clone()));
-            assigned += 1;
+        let wrote = match cat {
+            "items" => { item_row.insert(fname.clone(), json!(vals[h].clone())); true }
+            "containers" => { container_row.insert(fname.clone(), json!(vals[h].clone())); true }
+            _ => match out.get_mut(cat).and_then(|v| v.as_object_mut()) {
+                Some(slot) => { slot.insert(fname.clone(), json!(vals[h].clone())); true }
+                None => false,
+            },
+        };
+        if !wrote {
+            // 🌟 구버전은 이 경로에서도 ASSIGN 로그를 찍어 소실을 감췄습니다.
+            emit_term(&format!(
+                "    ⚠️ [CONTINUATION WRITE MISS] Label '{}' → Field '{}' (cat: '{}') 를 기록할 슬롯이 없어 폐기합니다.",
+                labels[h], fname, cat
+            ));
+            continue;
         }
+        assigned += 1;
         emit_term(&format!(
             "    ✨ [CONTINUATION ASSIGN] Label '{}' → Field '{}' (cat: {}) | Score: {:+.4} | Margin: {:+.4} | Line {} | Value: \"{}\"",
             labels[h], fname, cat, own, margin, lines[h] + 1, vals[h]
         ));
+    }
+    // 🌟 [COUNT] 행 필드는 위 루프에서 이미 assigned 에 반영되었습니다. 여기서 다시 더하지 않습니다.
+    if !item_row.is_empty() {
+        let n = item_row.len();
+        if let Some(arr) = out.get_mut("line_items").and_then(|v| v.as_array_mut()) {
+            arr.push(Value::Object(item_row));
+            emit_term(&format!(
+                "    🧾 [CONTINUATION ROW] items 행 1개(필드 {}개)를 line_items 에 추가했습니다.", n
+            ));
+        }
+    }
+    if !container_row.is_empty() {
+        let n = container_row.len();
+        if let Some(arr) = out.get_mut("containers").and_then(|v| v.as_array_mut()) {
+            arr.push(Value::Object(container_row));
+            emit_term(&format!(
+                "    🧾 [CONTINUATION ROW] containers 행 1개(필드 {}개)를 추가했습니다.", n
+            ));
+        }
     }
     emit_term(&format!(
         "  ✅ [CONTINUATION] {}페이지에서 {}개 필드를 앞 문서 '{}' 에 병합합니다. (LLM 호출 0회)",
@@ -1850,17 +1953,28 @@ pub async fn process_trading_task(
     emit_term(&format!("[TRADING STEP A] ✅ Document classified as: {} (group: {})", doc_type, best_group));
     emit_term("[TRADING STEP B] Running PLINKO field assignment before LLM...");
 
-    let categories = ["header", "parties", "logistics", "conditions", "financials", "cargo", "items", "containers"];
-
+    // 🌟 [OTHER PARTIES SLOT] 스키마는 9개 카테고리인데 여기만 8개였습니다.
+    //    실측: ⚠️ [PLINKO WRITE MISS] 'party_address' (cat: 'other_parties') 를 기록할 루트 슬롯을 찾지 못했습니다.
+    //    forwarder / carrier / bank / agent 등 sender·recipient 가 아닌 당사자가 전부 이 버킷입니다.
+    // 🌟 [CATEGORY / SLOT 동기화] 손으로 두 곳에 적으면 반드시 어긋납니다.
+    //    실측 ①: other_parties 누락 → ⚠️ [PLINKO WRITE MISS] 'party_address'
+    //    실측 ②: settlement 누락 → SA 의 payment_status 가 순회 대상이 아니라
+    //             인쇄되어 있어도 LLM 패스를 한 번도 타지 않았습니다.
+    //    이제 슬롯을 categories 에서 유도하므로 목록만 고치면 됩니다.
+    let categories = [
+        "header", "parties", "other_parties", "logistics", "conditions",
+        "financials", "settlement", "cargo", "items", "containers",
+    ];
     let mut final_data_map = serde_json::Map::new();
+    for c in categories.iter() {
+        match *c {
+            // 배열 카테고리. items 는 레거시 소비처가 line_items 를 읽습니다.
+            "items"      => { final_data_map.insert("line_items".to_string(), json!([])); }
+            "containers" => { final_data_map.insert("containers".to_string(), json!([])); }
+            _            => { final_data_map.insert(c.to_string(), json!({})); }
+        }
+    }
     final_data_map.insert("header".to_string(), json!({"doc_type": doc_type.clone()}));
-    final_data_map.insert("parties".to_string(), json!({}));
-    final_data_map.insert("logistics".to_string(), json!({}));
-    final_data_map.insert("conditions".to_string(), json!({}));
-    final_data_map.insert("financials".to_string(), json!({}));
-    final_data_map.insert("cargo".to_string(), json!({}));
-    final_data_map.insert("line_items".to_string(), json!([]));
-    final_data_map.insert("containers".to_string(), json!([]));
 
     let content_pug = {
         let full_pug =
@@ -1874,39 +1988,17 @@ pub async fn process_trading_task(
 
     
     let mut detail_pairs = crate::utils::ai_utils::collect_detail_label_value_pairs(&pug_lines_ref);
-
     {
-        let mut consumed: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        for p in detail_pairs.iter() {
-            consumed.insert(p.primary_line);
-            consumed.insert(p.label_line);
-        }
+        let anchors: Vec<(usize, usize)> = detail_pairs.iter()
+            .map(|p| (p.label_line, p.primary_line)).collect();
+        let recovered_secs = recover_pair_sections(&anchors, &pug_lines);
         let mut recovered = 0usize;
-        for p in detail_pairs.iter_mut() {
+        for (i, p) in detail_pairs.iter_mut().enumerate() {
             if !p.section.trim().is_empty() { continue; }
-            let li = p.label_line.min(pug_lines.len().saturating_sub(1));
-            let mut sec = String::new();
-            let mut i = li;
-            while i > 0 {
-                i -= 1;
-                if consumed.contains(&i) { continue; }
-                if pug_lines[i].trim().is_empty() { continue; }
-                let (_, tag, _, txt) = crate::utils::ai_utils::pug_line_parts(&pug_lines[i]);
-                if matches!(
-                    tag.as_str(),
-                    "table" | "thead" | "tbody" | "tfoot" | "tr" | "colgroup" | "col"
-                ) {
-                    continue;
-                }
-                let t = txt.trim().trim_end_matches(':').trim().to_string();
-                if t.chars().count() < 2 { continue; }
-                sec = t;
-                break;
-            }
-            if !sec.is_empty() {
-                p.section = sec;
-                recovered += 1;
-            }
+            let s = match recovered_secs.get(i) { Some(s) => s, None => continue };
+            if s.is_empty() { continue; }
+            p.section = s.clone();
+            recovered += 1;
         }
         if recovered > 0 {
             emit_term(&format!(
@@ -2112,12 +2204,15 @@ pub async fn process_trading_task(
             n == "doc_number" || n == "document_number"
         };
         let mut self_id_gate_logged = 0usize;
+        // 🌟 [DOC-CODE PREFIX] 값의 선두 알파벳을 국제 문서코드로 해석합니다.
+        //    SELF-ID ANCHOR 와 FOREIGN REF SKIP 이 같은 판정을 공유합니다.
+        let leading_code = |v: &str| {
+            let head: String = v.trim().chars().take_while(|c| c.is_alphabetic()).collect();
+            if head.is_empty() { return None; }
+            crate::utils::bias_schema::canonical_trade_doc_code(&head)
+        };
         let self_id_anchor_label: Option<usize> = {
-            let leading_code = |v: &str| {
-                let head: String = v.trim().chars().take_while(|c| c.is_alphabetic()).collect();
-                if head.is_empty() { return None; }
-                crate::utils::bias_schema::canonical_trade_doc_code(&head)
-            };
+            // ── 1단계: 문서코드 접두어 일치 (결정론) ──
             let mut prefix_hits: Vec<usize> = Vec::new();
             for h in 0..unique_labels.len() {
                 let v = phrase_single[h].trim();
@@ -2191,13 +2286,53 @@ pub async fn process_trading_task(
                 }
             }
         };
-
+        let foreign_ref_label: Vec<bool> = (0..unique_labels.len()).map(|h| {
+            if Some(h) == self_id_anchor_label { return false; }
+            let v = phrase_single[h].trim();
+            if v.is_empty() { return false; }
+            if !crate::utils::ai_utils::value_matches_format(
+                crate::utils::ai_utils::FieldFormat::Identifier, v,
+            ) { return false; }
+            match leading_code(v) {
+                Some(code) => !code.eq_ignore_ascii_case(doc_type.as_str()),
+                None => false,
+            }
+        }).collect();
+        for h in 0..unique_labels.len() {
+            if foreign_ref_label[h] {
+                emit_term(&format!(
+                    "    🚫 [FOREIGN REF SKIP] '{}' 값 \"{}\" 은 타 문서코드 접두어를 가집니다. header.reference_* 는 LLM 이 채우므로 PLINKO 배정에서 제외합니다.",
+                    unique_labels[h], phrase_single[h]
+                ));
+            }
+        }
+        let row_index_section: Vec<bool> = unique_section
+            .iter()
+            .map(|s| is_row_index_section(s))
+            .collect();
+        {
+            let hits: Vec<String> = (0..unique_labels.len())
+                .filter(|&h| row_index_section[h])
+                .map(|h| format!("{}('{}')", unique_labels[h], unique_section[h]))
+                .collect();
+            if !hits.is_empty() {
+                emit_term(&format!(
+                    "  🧾 [ROW SECTION SCOPE] 행 인덱스 섹션의 라벨 {}개는 items/containers 에만 배정합니다: {:?}",
+                    hits.len(), hits.iter().take(8).collect::<Vec<_>>()
+                ));
+            }
+        }
         let pair_abs_floor = 0.50f32;
         let mut leaf_raw: Vec<Vec<f32>> = vec![vec![-1.0f32; unique_labels.len()]; t_field_names.len()];
         let mut sec_raw:  Vec<Vec<f32>> = vec![vec![-1.0f32; unique_labels.len()]; t_field_names.len()];
         for f in 0..t_field_names.len() {
             let f_fmt = crate::utils::ai_utils::detect_field_format(&t_field_names[f]);
             let f_multi = crate::utils::ai_utils::is_multi_value_field(&t_field_names[f]);
+            // 🌟 [ROW SECTION SCOPE] 이 필드가 '행 속성' 축인가.
+            let f_row_cat = {
+                let c = crate::logic::trade_field_category(&t_field_names[f]);
+                c == "items" || c == "containers"
+            };
             let f_strict = matches!(
                 f_fmt,
                 crate::utils::ai_utils::FieldFormat::Date
@@ -2211,6 +2346,8 @@ pub async fn process_trading_task(
             let f_cohesion = crate::utils::ai_utils::bank_internal_cohesion(&t_label_embs[f]);
             for h in 0..unique_labels.len() {
                 if leaf_embs[h].iter().all(|&v| v == 0.0) { continue; }
+                // 🌟 [ROW SECTION SCOPE] '[ Item N ]' 안의 라벨은 문서 수준 축과 겨루지 않습니다.
+                if row_index_section[h] && !f_row_cat { continue; }
                 let own = crate::utils::ai_utils::weighted_max_pool_sim(
                     &leaf_embs[h], &t_label_embs[f], &t_label_weights[f]
                 );
@@ -2309,6 +2446,14 @@ pub async fn process_trading_task(
                     // 앵커 라벨은 doc_number 이외의 필드로 새지 않습니다.
                     t_matrix[f][anchor] = -1.0;
                 }
+            }
+        }
+
+        // 🌟 [FOREIGN REF PIN] 타 문서 참조 라벨의 열을 전 필드에서 닫습니다.
+        for h in 0..unique_labels.len() {
+            if !foreign_ref_label[h] { continue; }
+            for f in 0..t_field_names.len() {
+                t_matrix[f][h] = -1.0;
             }
         }
 
@@ -2517,14 +2662,6 @@ pub async fn process_trading_task(
     model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, None).await?;
     for cat in &categories {
         if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
-
-        let schema_prompt = crate::parsing::get_trade_category_schema(cat, &doc_type);
-
-        if schema_prompt.contains("SCHEMA:\n{}") || schema_prompt.contains("SCHEMA:\n[ {} ]") {
-            emit_term(&format!("[TRADING STEP B] Category '{}' has no fields for {}. Skipping.", cat.to_uppercase(), doc_type));
-            continue;
-        }
-
         let cat_schema_fields: Vec<String> = trade_fields.iter()
             .map(|(f, _, _, _)| f.clone())
             .filter(|f| crate::logic::trade_field_category(f) == *cat)
@@ -2533,6 +2670,14 @@ pub async fn process_trading_task(
             .filter(|f| absent_fields.contains(*f))
             .cloned()
             .collect();
+        // 🌟 [PRESENCE-AWARE SCHEMA] 부재 필드를 뺀 스키마로 프롬프트를 만듭니다.
+        //    (PRESENCE GATE 결과를 사후 필터가 아니라 프롬프트 생성에 직접 연결)
+        let absent_set: std::collections::HashSet<String> = absent_in_cat.iter().cloned().collect();
+        let schema_prompt = crate::parsing::get_trade_category_schema_present(cat, &doc_type, &absent_set);
+        if schema_prompt.contains("SCHEMA:\n{}") || schema_prompt.contains("SCHEMA:\n[ {} ]") {
+            emit_term(&format!("[TRADING STEP B] Category '{}' has no fields for {}. Skipping.", cat.to_uppercase(), doc_type));
+            continue;
+        }
         if !cat_schema_fields.is_empty() && absent_in_cat.len() == cat_schema_fields.len() {
             emit_term(&format!(
                 "  ⚪ [PRESENCE SKIP] Category '{}' 의 필드 {}개가 이 문서에 하나도 인쇄되어 있지 않습니다. LLM 호출을 생략합니다. (빈 슬롯 창작 차단)",
@@ -2576,19 +2721,18 @@ pub async fn process_trading_task(
                 serde_json::to_string_pretty(&list).unwrap_or_default())
         };
 
-        let absent_ctx = if absent_in_cat.is_empty() {
-            String::new()
-        } else {
+        // 🌟 [PRESENCE FILTER v2] 부재 필드는 스키마 자체에서 빠졌으므로
+        //    "null 로 답하라" 는 지시문이 더는 필요 없습니다. 로그만 남깁니다.
+        if !absent_in_cat.is_empty() {
             emit_term(&format!(
-                "  🚧 [PRESENCE FILTER] Category '{}' | 존재 {}필드 / 부재 {}필드 {:?}",
+                "  🚧 [PRESENCE FILTER] Category '{}' | 존재 {}필드 / 부재 {}필드 (스키마에서 제거) {:?}",
                 cat.to_uppercase(),
                 cat_schema_fields.len().saturating_sub(absent_in_cat.len()),
                 absent_in_cat.len(),
                 absent_in_cat.iter().take(10).collect::<Vec<_>>()
             ));
-            format!("\n\n[FIELDS NOT PRESENT IN THIS DOCUMENT]\nThe deterministic label engine scanned every line of this document and found NO evidence for the fields below. You MUST return null for every one of them. Do NOT infer, guess, or derive them from addresses, incoterms, party names, or any other field:\n{}",
-                serde_json::to_string_pretty(&absent_in_cat).unwrap_or_default())
-        };
+        }
+        let absent_ctx = String::new();
 
         emit_term(&format!("[TRADING STEP B] Extracting category '{}' for {}...", cat.to_uppercase(), doc_type));
         log_task_progress(app_handle, &task.id, &json!({
@@ -2715,8 +2859,12 @@ pub async fn process_trading_task(
 
     let mut extracted_data = Value::Object(merged_map);    
     {
-        const TRADE_GROUPS_FLAT: [&str; 6] =
-            ["header", "parties", "logistics", "financials", "conditions", "cargo"];
+        // 🌟 other_parties / settlement 추가. 비전 경로는 이미 party_name 을 루트에 올리고
+        //    있어 두 경로의 루트 축이 어긋나 있었습니다.
+        const TRADE_GROUPS_FLAT: [&str; 8] = [
+            "header", "parties", "other_parties", "logistics",
+            "financials", "conditions", "settlement", "cargo",
+        ];
 
         fn canonical_name(raw: &str) -> String {
             let k = raw.trim();

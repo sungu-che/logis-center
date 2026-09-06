@@ -17,7 +17,7 @@ pub mod translit;
 pub mod indexing;
 mod worker;
 mod entity;
-mod trading;
+pub mod trading;
 
 use crate::scheduler::translit::{generate_transliteration_aliases, transliterate_cross_language};
 use crate::scheduler::indexing::{upsert_alias_chunks, index_item_chunks, save_item};

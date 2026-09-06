@@ -618,59 +618,13 @@ impl crate::model::LogisModel {
                     extracted_data = Value::Object(merged);
                 }
             }
-            
-            // ── STEP 6 : 값 접지 검증 ──
-            //
-            // 🌟 [왜 필요한가 — 실측 사고 3건]
-            //  ① reference_invoice = "CI-2026-08001"
-            //     문서 어디에도 없습니다. bias.json 설명문의 (e.g. CI-2026-08001) 복사입니다.
-            //     [SCHEMA ECHO] 게이트는 {String} 같은 플레이스홀더만 잡으므로 통과했습니다.
-            //  ② voyage_number = "26"
-            //     logistics 크롭에 항차가 없는데, 같은 크롭의 CI-43726 뒤 두 자리를 뗐습니다.
-            //  ③ recipient_name = "BUYER (IF NOT CONSIGNEE)"
-            //     빈 박스의 헤더 라벨을 값으로 읽었습니다.
-            //  셋 다 '문법적으로 완벽한 답' 이라 파싱 단계에서는 절대 걸러지지 않습니다.
-            //  픽셀에 그 값이 실제로 있는지 되묻는 것만이 유일한 검증입니다.
-            //
-            // 🌟 [VRAM 순서]
-            //  Qwen3.5(2GB) 해제 → SigLIP2 재로드 → 값 인코딩 1회 → 즉시 해제.
-            //  패치 임베딩(grid.patches)은 STEP 1 산출물이 CPU 메모리에 그대로 있으므로
-            //  (252 × 1152 × 4B ≈ 1.2MB) 비전 순전파를 다시 돌리지 않습니다.
+
             if !grounding_claims.is_empty() {
                 emit_term(&format!(
                     "[STAGE-6] 🔬 추출값 {}건 접지 검증 (SigLIP2 텍스트 ↔ 이미지 패치)",
                     grounding_claims.len()
                 ));
 
-                // 🌟 [PURGE 제거] 이 자리의 deep_purge_resources() 는 GROUNDING v1 의 잔재입니다.
-                //
-                //  ── v1 에서는 왜 필요했나 ──
-                //   v1 은 값 텍스트를 SigLIP2 텍스트 인코더로 임베딩해 패치와 코사인을 쟀습니다.
-                //   그래서 Qwen3.5(2GB)를 내리고 SigLIP2 를 다시 올릴 공간이 필요했습니다.
-                //
-                //  ── v2 는 아무 모델도 쓰지 않습니다 ──
-                //   verify_claims_v2 의 인자는 grid 치수 / 원본 크기 / legibility 뿐이고,
-                //   legibility 는 휘도 기울기 기반 순수 CPU 산출물입니다.
-                //   바로 아래 v2 주석이 "SigLIP2 재로드가 불필요해져 VRAM 핑도 제거됩니다" 라고
-                //   명시하고 있는데 purge 호출만 남아 있었습니다.
-                //
-                //  ── 남겨 두면 무엇이 나쁜가 ──
-                //   ① Qwen3.5 2GB 를 파기하므로 다음 이미지 태스크가 GGUF 를 처음부터 다시 읽습니다.
-                //   ② 이 purge 이후 아래 [VISION-JIT] 블록은 qwen3_5_generator == None 이라
-                //      도달해도 아무 일도 하지 않는 죽은 코드가 됩니다.
-                //   ③ scheduler.rs 의 process_task 는 태스크 종료 후 이미
-                //      deep_purge_resources() 를 호출하므로 완전한 중복입니다.
-                //   ④ STEP 6 이후 남은 작업(자연어 변환 / DB 동기화)은 GPU 를 쓰지 않습니다.
-
-                // 🌟 [TEXT ONLY] 값 텍스트만 인코딩하면 됩니다.
-                //    패치 임베딩은 STEP 1 산출물(grid.patches ≈ 1.2MB)이 CPU 메모리에 있으므로
-                //    비전 인코더 820MB 를 다시 올릴 이유가 전혀 없습니다.
-                // 🌟 [GROUNDING v2] v1 코사인 접지는 실측 26건 중 25건을 오폐기했습니다.
-                //    (로그: 🚫 [UNGROUNDED] [items] 'description' = "T-Shirt" | in -0.6821 ≤ 0 → 폐기)
-                //    v2 는 '출처 영역에 판독 가능한 패치가 있는가' 만 봅니다.
-                //    블러/여백에서 읽어낸 값(로그의 sender_name="Michael Johnson" 등)은
-                //    legibility 맵이 이미 잡으므로 여기서도 폐기됩니다.
-                //    SigLIP2 재로드가 불필요해져 VRAM 핑도 제거됩니다.
                 let verdicts = crate::models::siglip2::value_grounding::verify_claims_v2(
                     &grounding_claims,
                     grid.grid_rows,
@@ -678,12 +632,11 @@ impl crate::model::LogisModel {
                     grid.orig_width,
                     grid.orig_height,
                     &legibility,
+                    // 🌟 resolve_trade_doc_identity 에 넘기고 있는 값과 동일한 언어 축입니다.
+                    &language,
                     &emit_term,
                 );
 
-                // 🌟 [APPLY TARGET] final_data_map 은 이미 Value::Object(...) 로 이동했습니다.
-                //    폐기 판정은 '최종 저장될 객체' 에 적용해야 하므로 extracted_data 를 직접 고칩니다.
-                //    (TRACKING fast-track / commerce 경로도 같은 변수를 쓰므로 경로 하나로 통일됩니다)
                 if let Some(map) = extracted_data.as_object_mut() {
                     apply_grounding_verdicts(map, &verdicts, &emit_term);
                 } else {
@@ -699,16 +652,26 @@ impl crate::model::LogisModel {
             emit_term(&format!("[DEBUG-VISION] 🤖 AI Raw Response Extracted."));
             emit_term("=======================================\n");
 
+            if is_trade_doc {
+                let nested_cur = extracted_data
+                    .get("financials")
+                    .and_then(|f| f.get("currency"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty() && s != "N/A" && s != "null");
+                if let (Some(c), Some(obj)) = (nested_cur, extracted_data.as_object_mut()) {
+                    let root_empty = obj
+                        .get("currency")
+                        .and_then(|v| v.as_str())
+                        .map_or(true, |s| s.trim().is_empty());
+                    if root_empty {
+                        obj.insert("currency".to_string(), json!(c));
+                    }
+                }
+                crate::scheduler::trading::normalize_trading_data(&mut extracted_data, &language);
+            }
             let nl = crate::parsing::json_to_natural_language(&extracted_data);
-            
-            // [PRIVACY] 무역 문서(BL, CI 등) 및 송장(Tracking)은 개인정보 밀집 구역이므로 반드시 마스킹을 적용합니다.
-            // 커머스 상품(goods) 이미지인 경우에만 예외적으로 우회합니다.
             let doc_type = if is_trade_doc {
-                // 🌟 [DOC TYPE RESOLVE] 두 경로가 doc_type 을 서로 다른 위치에 기록합니다.
-                //   · Slice & Merge 경로   : extracted_data["header"]["doc_type"]
-                //   · TRACKING Fast-Track : extracted_data["doc_type"] (루트)
-                //   기존에는 header 만 봤기 때문에 운송장 라벨이 전부 "shipping_doc" 으로
-                //   저장되어 index_val / hashed_id / DB type 까지 뭉개졌습니다.
                 extracted_data.get("header")
                     .and_then(|h| h.get("doc_type"))
                     .and_then(|s| s.as_str())
@@ -722,9 +685,6 @@ impl crate::model::LogisModel {
 
             let item_digest = crate::utils::hash::digest(&nl);
 
-            // 🌟 [VISION-JIT] 비전 추론이 모두 끝났습니다. 이어지는 임베딩/DB 동기화 단계가
-            //    VRAM 을 쓸 수 있도록 mmproj 가중치를 여기서 즉시 반환합니다.
-            //    (2B 텍스트 모델 본체는 그대로 상주하므로 재로딩 비용은 0 입니다)
             {
                 let mut q35_guard = self.qwen3_5_generator.lock().await;
                 if let Some(gen) = q35_guard.as_mut() {
@@ -957,22 +917,18 @@ impl crate::model::LogisModel {
                         hoisted.iter().take(12).collect::<Vec<_>>()
                     ));
                 }
-                
-                // 🌟 [비전 벡터 저장] STEP 1 의 encode_image() 가 이미 산출해 둔
-                //    L2 정규화 pooled 벡터를 그대로 재사용합니다.
-                //
-                //  ── 무엇이 문제였나 ──
-                //   구버전은 여기서 encode_image_pooled() 를 다시 호출했습니다.
-                //   그러면 전처리 → 패치 임베딩 → 27층 순전파 → 어텐션 풀링이 통째로 재실행되고,
-                //   그 시점까지 SigLIP2 를 붙들고 있어야 하므로 820MB 를 Qwen3.5 와 동시에 점유했습니다.
-                //   (실측 로그에 [SigLIP2/NaFlex] 가 두 번 찍히는 원인)
-                //   PatchGrid.pooled 는 동일한 값이므로 재계산은 순수 낭비입니다.
+
+                if let Some(o) = final_data.as_object_mut() {
+                    o.insert(
+                        "updated_at".to_string(),
+                        json!(chrono::Utc::now().timestamp_millis()),
+                    );
+                }
                 let vision_vec: Option<Vec<f32>> = if grid.pooled.len() == 1152 {
                     Some(grid.pooled.clone())
                 } else {
                     None
                 };
-
                 let _ = db.upsert_item(
                     table_name, // 분기된 테이블 적용
                     &hashed_id,
@@ -988,16 +944,6 @@ impl crate::model::LogisModel {
                     Some(&item_digest)
                 ).await;
 
-                // =====================================================================
-                // 🌟 [TRADE RELAY] 무역 서식 간 연결고리 처리
-                // Commerce의 TRACKING RELAY와 동일한 패턴:
-                //   1. 현재 문서의 참조 필드(reference_invoice 등)에서 연결 키 추출
-                //   2. 해당 키로 타겟 서식 검색
-                //   3. 발견되면 상호 필드 병합 / 미발견이면 draft 생성
-                // =====================================================================
-                // 🌟 [SCOPE FIX] relay_starved 는 블록 내부(규칙 푸시)와 블록 외부(집계 출력)
-                //    양쪽에서 사용되므로, is_trade_doc 블록보다 바깥에서 선언합니다.
-                //    커머스가 아닌 경로에서는 비어 있어 출력이 자동 억제됩니다.
                 let mut relay_starved: Vec<String> = Vec::new();
 
                 // 🌟 relay_plan 을 if is_trade_doc 블록 외부에서 선언하여
@@ -1005,15 +951,6 @@ impl crate::model::LogisModel {
                 
 
                 if is_trade_doc {
-                    // 🌟 [RELAY v4] parsing.rs 의 plan_trade_relays 를 사용합니다.
-                    //    기존은 logic.rs 의 trade_relay_rules 가 하드코딩한
-                    //    (target, target_field, source_field) 튜플을 순회했는데,
-                    //    필드 이름이 추출 결과의 실제 키와 어긋나면 릴레이가 성립하지 않았습니다.
-                    //    (실측: "BL←doc_number(빈 키)" 가 4건 반복)
-                    //
-                    //    plan_trade_relays 는 extract_trade_relay_keys 가 확정한
-                    //    역할별 키를 기반으로 릴레이 대상을 계산합니다.
-                    //    역할이 같으면 서식 코드가 달라도 연결됩니다.
                     relay_plan = crate::parsing::plan_trade_relays(&doc_type, &extracted_data, &language);
                     if relay_plan.is_empty() {
                         emit_term("  ⚪ [RELAY v4] 릴레이 키가 확보되지 않아 릴레이를 건너뜁니다.");

@@ -757,8 +757,14 @@ fn trade_doc_identity_context(doc_type: &str) -> (Vec<&'static str>, Vec<(&'stat
 }
 
 pub fn get_trade_category_schema(category: &str, doc_type: &str) -> String {
+    get_trade_category_schema_present(category, doc_type, &std::collections::HashSet::new())
+}
+pub fn get_trade_category_schema_present(
+    category: &str,
+    doc_type: &str,
+    absent: &std::collections::HashSet<String>,
+) -> String {
     use serde_json::Value;
-
     // ── 코드 폴백 base : bias.json 에 trade_schema 노드가 없어도 동작해야 합니다 ──
     fn fallback_base(category: &str) -> Vec<(&'static str, &'static str)> {
         match category {
@@ -899,7 +905,11 @@ pub fn get_trade_category_schema(category: &str, doc_type: &str) -> String {
     if category == "header" {
         fields.retain(|(n, _)| n != "doc_type");
     }
-
+    // 🌟 [PRESENCE FIELD DROP] 부재 판정 필드를 스키마에서 제거합니다.
+    //    doc_number 는 문서 기본키라 PRESENCE 오판에도 절대 빼지 않습니다.
+    if !absent.is_empty() {
+        fields.retain(|(n, _)| n == "doc_number" || !absent.contains(n));
+    }
     // 🌟 [IDENTITY FIRST] doc_number 를 항상 첫 필드로 올립니다.
     //   2B 모델은 [FIELD DEFINITIONS] 앞쪽 항목에 더 강하게 반응합니다.
     //   문서 기본키가 되는 축은 14개 중 아무 자리가 아니라 첫 줄에 있어야 합니다.

@@ -1148,39 +1148,6 @@ pub fn build_column_heatmaps(
         return Ok(Vec::new());
     }
 
-    // ── 2) 편견 : 다른 카테고리의 bias 구 + 시각 노이즈 ──
-    //
-    // 🌟 [PREJUDICE COLLAPSE — 카테고리 단위]
-    //
-    //  ── 무엇이 문제였나 ──
-    //   구버전은 편견을 '필드 단위' 로 만들었습니다.
-    //     for (cat, field, _) in bias_defs   ← 구(phrase)마다 한 번씩 도는 루프
-    //         for (other_cat, _, p) in bias_defs
-    //   dedup 덕분에 (cat, field, phrase) 단위로 접히긴 했지만,
-    //   같은 카테고리의 모든 필드가 '완전히 동일한 편견 집합' 을 중복 보유했습니다.
-    //   header 의 11개 필드가 각각 "header 아닌 229구" 를 따로 들고 있었던 셈입니다.
-    //   그 결과가 실측 로그의 편견 구 13,598개입니다.
-    //
-    //  ── 왜 카테고리 단위로 접어도 결과가 같은가 ──
-    //   surprisal_dual_scores 는 편견을 이렇게 씁니다.
-    //     if let Some(pi) = p_order.iter().position(|(a,b)| a==c && b==k) {
-    //         if ps > 0.0 { sc -= ps; }
-    //     }
-    //   (category, key) 그룹의 '최댓값 하나' 만 감산에 쓰입니다.
-    //   그런데 같은 카테고리의 모든 필드가 동일한 구 집합을 갖고 있었으므로
-    //   그 최댓값도 필드와 무관하게 항상 같은 값이었습니다.
-    //   따라서 key 를 필드명에서 카테고리 공용 키로 바꿔도 감산량이 변하지 않습니다.
-    //
-    //  ── 절감 ──
-    //   편견 구 = Σ_cat (전체구수 - 구수_cat) + 카테고리수 × 21
-    //   44필드 기준 13,598 → 약 2,100 (6.5배 감소)
-    //   dedup 비교는 O(N²) 이므로 9,200만 → 약 220만 (42배 감소)
-    //
-    //  ⚠️ [CONTRACT] 아래 3-단계 채점 루프가 편견 키를 '카테고리명' 으로 조회해야 합니다.
-    //     bias 쪽 key 는 필드명 그대로 두고, 편견만 카테고리명을 씁니다.
-    //     surprisal_dual_scores 가 (category, key) 쌍으로 매칭하므로
-    //     bias 의 (cat, field) 와 편견의 (cat, cat) 은 서로 만나지 않습니다.
-    //     → 이 계약을 지키기 위해 아래 apply_category_prejudice() 로 감산을 직접 수행합니다.
     let cats: Vec<String> = {
         let mut v: Vec<String> = Vec::new();
         for (c, _, _) in bias_defs.iter() {
@@ -1191,32 +1158,6 @@ pub fn build_column_heatmaps(
         v
     };
 
-    // =====================================================================
-    // 🌟 [PREJUDICE SCOPE v3] 교차 카테고리 편견을 폐기하고 크롬 + 제목만 남깁니다.
-    // ---------------------------------------------------------------------
-    //  ── 구버전이 실제로는 아무 일도 하지 않았습니다 ──
-    //   bias_defs 의 key 는 '필드명', prej_defs 의 key 는 '카테고리명' 이었습니다.
-    //   score_patches_bank_neutral 은 prej_idx.get(key) 로 조회하는데
-    //   key 가 필드명이므로 이 조회는 항상 None 이었고, zp = 0.0,
-    //   즉 편견 감산이 단 한 번도 일어나지 않았습니다.
-    //   구버전 주석의 "apply_category_prejudice() 로 감산을 직접 수행합니다" 는
-    //   실제로 작성된 적이 없는 함수를 가리키고 있었습니다.
-    //   결과적으로
-    //     · VISION_CHROME_ANCHOR (로고/스탬프/괘선/여백) 억제  → 0
-    //     · TITLE PREJUDICE (문서 전문) 억제                    → 0
-    //   이 상태로 약 2,100구를 27층에 통과시켜 인코딩만 하고 버렸습니다.
-    //
-    //  ── 왜 교차 카테고리 편견은 되살리지 않는가 ──
-    //   ⑤ 열 센터링이 net[k][i] -= mean_k(net[·][i]) 로 이미 수행합니다.
-    //   그 위에 다른 카테고리 max-pool 을 또 빼면 같은 경쟁을 두 번 벌하는 셈입니다.
-    //   반면 크롬/제목 구는 bias 뱅크에 아예 없으므로 열 센터링으로는 잡히지 않습니다.
-    //   로고 패치는 전 필드에서 낮은 점수를 받아 센터링 후 0 근처에 남고 살아남습니다.
-    //   그 축만 복구하는 것이 정확히 필요한 만큼입니다.
-    //
-    //  ── 부수 효과 ──
-    //   편견 구 약 2,100 → 카테고리수 × (크롬 21 + 제목 n) ≈ 380개.
-    //   cat_phrases HashMap(345 String 클론)과 O(N²) dedup 도 함께 사라집니다.
-    // =====================================================================
     let mut prej_defs: Vec<(String, String, String)> = Vec::new();
     {
         let mut global: Vec<String> = Vec::new();
@@ -1344,29 +1285,87 @@ pub fn build_column_heatmaps(
     //    행/열 이중 센터링으로 뱅크 크기·응집도 편향을 제거합니다.
     //    (실측: reference_sr 1구가 status 19구보다 2.4점 공짜 우위)
     let (keys, matrix) = score_patches_bank_neutral(grid, &bank, legibility);
+
+    const FIELD_COUNT_NEUTRAL_WEIGHT: f32 = 1.0;
+
+    let cat_pos = |c: &str| -> Option<usize> { cats.iter().position(|x| x == c) };
+    let mut cat_raw: Vec<Vec<f32>> = vec![vec![f32::MIN; n]; cats.len()];
+    let mut cat_arg: Vec<Vec<usize>> = vec![vec![usize::MAX; n]; cats.len()];
+    let mut cat_fields: Vec<usize> = vec![0usize; cats.len()];
     let mut mapped_keys = 0usize;
-    let mut positive_by_cat: HashMap<String, usize> = HashMap::new();
     for (ki, fname) in keys.iter().enumerate() {
-        let cat = match field_to_cat.get(fname) {
-            Some(c) => c.clone(),
-            None => continue,
-        };
+        let cat = match field_to_cat.get(fname) { Some(c) => c.clone(), None => continue };
+        let ci = match cat_pos(&cat) { Some(v) => v, None => continue };
         mapped_keys += 1;
+        cat_fields[ci] += 1;
         for i in 0..n {
             let v = matrix[ki][i];
             if v == f32::MIN { continue; }
-            if v > 0.0 {
-                *positive_by_cat.entry(cat.clone()).or_insert(0) += 1;
-            }
-            if let Some(slot) = cat_scores.get_mut(&cat) {
-                if v > slot[i] { slot[i] = v; }
-            }
-            if let Some(t) = cat_top.get_mut(&cat) {
-                if v > t.1 { *t = (fname.clone(), v); }
+            if v > cat_raw[ci][i] {
+                cat_raw[ci][i] = v;
+                cat_arg[ci][i] = ki;
             }
         }
     }
-
+    // ── ① 필드 수 보정 ──
+    {
+        let mut detail: Vec<String> = Vec::new();
+        for ci in 0..cats.len() {
+            let f = cat_fields[ci].max(1);
+            let base = crate::utils::ai_utils::gumbel_expected_z(f) * FIELD_COUNT_NEUTRAL_WEIGHT;
+            detail.push(format!("{}({}필드 −{:.3})", cats[ci], cat_fields[ci], base));
+            if base <= 0.0 { continue; }
+            for i in 0..n {
+                if cat_raw[ci][i] != f32::MIN { cat_raw[ci][i] -= base; }
+            }
+        }
+        detail.sort();
+        emit(&format!(
+            "    ⚖️ [CATEGORY-NEUTRAL] max-pool 필드 수 편향 보정: {}",
+            detail.join(" | ")
+        ));
+    }
+    // ── ② 카테고리 축 센터링 ──
+    for i in 0..n {
+        let mut s = 0.0f32;
+        let mut c = 0usize;
+        for ci in 0..cats.len() {
+            if cat_raw[ci][i] == f32::MIN { continue; }
+            s += cat_raw[ci][i];
+            c += 1;
+        }
+        if c < 2 { continue; }
+        let mean = s / c as f32;
+        for ci in 0..cats.len() {
+            if cat_raw[ci][i] == f32::MIN { continue; }
+            cat_raw[ci][i] -= mean;
+        }
+    }
+    // ── ③ 결과 반영. top_field 는 최종 봉우리 패치의 argmax 필드입니다. ──
+    let mut positive_by_cat: HashMap<String, usize> = HashMap::new();
+    for (ci, c) in cats.iter().enumerate() {
+        let mut best = f32::MIN;
+        let mut best_i = usize::MAX;
+        let mut pos = 0usize;
+        for i in 0..n {
+            let v = cat_raw[ci][i];
+            if v == f32::MIN { continue; }
+            if v > 0.0 { pos += 1; }
+            if v > best { best = v; best_i = i; }
+        }
+        positive_by_cat.insert(c.clone(), pos);
+        if let Some(slot) = cat_scores.get_mut(c) {
+            *slot = cat_raw[ci].clone();
+        }
+        if let Some(t) = cat_top.get_mut(c) {
+            let f = if best_i != usize::MAX && cat_arg[ci][best_i] != usize::MAX {
+                keys[cat_arg[ci][best_i]].clone()
+            } else {
+                String::new()
+            };
+            *t = (f, best);
+        }
+    }
     emit(&format!(
         "    📊 [HEATMAP SCORING SUMMARY] 채점 키 {}개 (카테고리 매핑 성공 {}) | 패치 {}개",
         keys.len(), mapped_keys, n
@@ -1378,7 +1377,7 @@ pub fn build_column_heatmaps(
         }
         pf_detail.sort();
         emit(&format!(
-            "    📊 [HEATMAP POSITIVE PATCHES] 카테고리별 양수 (필드×패치) 수: {}",
+            "    📊 [HEATMAP POSITIVE PATCHES] 카테고리별 양수 패치 수 (카테고리 축 센터링 후): {}",
             pf_detail.join(" | ")
         ));
     }

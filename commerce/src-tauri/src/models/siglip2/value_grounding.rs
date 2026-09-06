@@ -233,11 +233,38 @@ pub fn verify_claims_v2(
     orig_w: u32,
     orig_h: u32,
     legibility: &LegibilityMap,
+    doc_lang: &str,
     emit: &dyn Fn(&str),
 ) -> Vec<GroundingVerdict> {
+    // 🌟 [ROLE FIELD EXEMPT] 값 자체가 '역할 이름' 인 축은 라벨 어휘와 정당하게 겹칩니다.
+    //    party_role 의 정답이 "Shipper" / "Consignee" 인데 그 둘은 인쇄 라벨이기도 합니다.
+    let role_field = |f: &str| -> bool { matches!(f.trim(), "party_role" | "doc_type") };
     let mut out = Vec::with_capacity(claims.len());
     let mut rejected = 0usize;
     for c in claims {
+        // 🌟 [LABEL ECHO GATE] 값 자리에 서식의 '박스 라벨' 이 그대로 들어온 경우를 폐기합니다.
+        //    "SIGNATORY COMPANY" 는 이미지에 실제로 인쇄되어 있어 판독성 검사는 반드시 통과합니다.
+        //    라벨인지 값인지는 픽셀이 아니라 어휘로만 판정할 수 있습니다.
+        //    사전은 parsing.rs 의 TRADE_PRINTED_LABELS + TRADE_COLUMN_ALIASES 를 그대로 씁니다.
+        if !role_field(&c.field) && crate::parsing::is_printed_label_echo(&c.value, doc_lang) {
+            rejected += 1;
+            emit(&format!(
+                "    🚫 [LABEL ECHO] [{}] '{}' = \"{}\" | 이 문자열은 서식의 인쇄 라벨입니다. 값이 아니므로 폐기합니다.",
+                c.category, c.field, c.value
+            ));
+            out.push(GroundingVerdict {
+                category: c.category.clone(),
+                field: c.field.clone(),
+                value: c.value.clone(),
+                surprisal_in: 0.0,
+                surprisal_out: 0.0,
+                top_patch: 0,
+                top_legible: true,
+                accepted: false,
+                reason: "인쇄 라벨을 값으로 읽음".to_string(),
+            });
+            continue;
+        }
         let (lg, il, bl) = legibility.count_in_bbox(c.bbox, orig_w, orig_h);
         let accepted = lg > 0;
         if !accepted {

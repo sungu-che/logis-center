@@ -1863,29 +1863,58 @@ Output Language: {LANG}
 //    흐름(cross_action_flow) / 의도 변화(intent_evolution) / 반복 성향(consistent_preferences)을
 //    한 번에 합성합니다. analytics-logis-center 의 Cron 산출물과 동일한 3축입니다.
 pub fn analytic_flow_prompt(lang: &str, records_json: &str) -> String {
+    analytic_flow_prompt_scoped(lang, records_json, 0, 1)
+}
+
+/// 🌟 [U-1] 의도 에피소드 맥락을 실은 흐름 합성 프롬프트.
+///
+///  ── 왜 필요한가 ──
+///   에피소드 분할 이후 모델이 받는 것은 '페이지의 모든 행동' 이 아니라
+///   '하나의 의도 구간' 입니다. 그 사실을 알리지 않으면 모델이
+///   구간 밖의 맥락을 상상해서 intent_evolution 을 채웁니다.
+///   (실제로는 그 구간 안에서만 목표가 어떻게 움직였는지를 써야 합니다)
+///
+///  ── 단일 구간이면 문구가 추가되지 않습니다 ──
+///   episode_total 이 1 이면 블록이 비어, 기존 프롬프트와 문자열이 동일합니다.
+///   따라서 분할이 일어나지 않은 세션은 결과가 회귀하지 않습니다.
+pub fn analytic_flow_prompt_scoped(
+    lang: &str,
+    records_json: &str,
+    episode_index: usize,
+    episode_total: usize,
+) -> String {
+    let episode_block = if episode_total > 1 {
+        format!(
+            "\n[EPISODE SCOPE]\n\
+             These records are ONE intent episode ({} of {}) inside a longer session on the same page.\n\
+             The session was split where the meaning of consecutive actions changed sharply and time also gapped.\n\
+             Describe ONLY what happened inside this episode.\n\
+             Do NOT speculate about what the user did before it started or after it ended.\n\
+             \"intent_evolution\" means how the goal moved WITHIN this episode, not across the whole session.\n",
+            episode_index + 1,
+            episode_total
+        )
+    } else {
+        String::new()
+    };
     let template = r###"[TASK]
 You are a User Behavior Analysis Expert. Below is a time-ordered list of ALREADY STRUCTURED user actions taken by ONE user. Synthesize them into a behavioural narrative.
-
 [CONTEXT]
-Output Language: {LANG}
-
+Output Language: {LANG}{EPISODE_BLOCK}
 [STRUCTURED ACTION RECORDS]
 {RECORDS}
-
 [RULES]
 1. Use ONLY the facts present in [STRUCTURED ACTION RECORDS]. Never invent a page, product or option that is not listed.
 2. Keep every proper noun, product name and number EXACTLY as printed in the records.
 3. "cross_action_flow": describe the overall path in order (what was viewed, what was compared, what was chosen).
 4. "intent_evolution": describe how the goal shifted from the first action to the last one.
 5. "consistent_preferences": describe the attributes the user repeatedly gravitated toward. Return an empty string when nothing repeats.
-
 [OUTPUT FORMAT]
 { "cross_action_flow": String, "intent_evolution": String, "consistent_preferences": String }
-
 [ACTION] RETURN JSON ONLY. NO EXPLANATION. NO COMMENTS IN JSON. /no_think"###;
-
     template
         .replace("{LANG}", lang)
+        .replace("{EPISODE_BLOCK}", &episode_block)
         .replace("{RECORDS}", records_json)
 }
 
@@ -1997,15 +2026,18 @@ You are a User Behavior Analyst. Answer the user's question using ONLY the retri
 2. Copy product names, option values, prices and numbers EXACTLY as printed in the records.
 3. Represent users as User A, User B, User C ... Never print the raw address / hash of a user.
 4. Write in {LANG}.
-5. Structure the answer as:
+5. The records are ordered NEWEST FIRST. Each record carries "days_ago", the number of days between that action and now.
+   Treat a smaller "days_ago" as more relevant to the present state, and say so when the answer depends on it.
+   Do NOT describe an old action as if it were current. When an old record is the only evidence, state how long ago it happened.
+6. Structure the answer as:
    - one short headline sentence that directly answers the question
    - a bullet list of the concrete supporting actions (what, where, when)
    - one closing sentence on the pattern or the recommended follow-up
-6. Do NOT output JSON. Output plain readable text (markdown bullets are allowed).
-7. FORBIDDEN OUTPUT SHAPES: your reply MUST NOT start with '{' or '['. It MUST NOT contain
+7. Do NOT output JSON. Output plain readable text (markdown bullets are allowed).
+8. FORBIDDEN OUTPUT SHAPES: your reply MUST NOT start with '{' or '['. It MUST NOT contain
    any key/value pair such as "headline": or "supporting_actions": or "closing":.
    It MUST NOT be wrapped in a code fence.
-8. The FIRST character of your reply MUST be a normal word character of {LANG}.
+9. The FIRST character of your reply MUST be a normal word character of {LANG}.
 
 [EXAMPLE OF A CORRECT REPLY SHAPE]
 <one headline sentence>

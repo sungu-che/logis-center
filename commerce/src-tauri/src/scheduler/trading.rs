@@ -1596,7 +1596,29 @@ pub async fn process_trading_task(
 
     emit_term("\n=======================================");
     emit_term(&format!("[TRADING] ⚙️ Task {} started trading extraction.", task.id));
-
+    // 🌟 [SDS SCOPE / 필수] 계측 스코프를 여기서 세웁니다.
+    //
+    //  ── 왜 여기여야 하는가 (실측 사고) ──
+    //   Phase 0 에서는 scheduler.rs::process_task 의 resolve_absolute_url 직후에
+    //   enter_scope 를 두었습니다. 그런데 process_task 는 그보다 훨씬 앞에서
+    //     if search_mode == "shipping" && (html_extraction || document_extraction) {
+    //         return process_trading_task(...).await;
+    //     }
+    //   로 이탈합니다. 즉 무역 경로는 enter_scope 에 영원히 도달하지 못합니다.
+    //   그 결과 current_scope() 가 None 이 되어 모든 record_* 가 즉시 반환하고,
+    //   DIRTY 가 false 로 남아 flush() 가 파일을 쓰지 않았습니다.
+    //   score_dynamics.json 이 생성되지 않은 유일한 원인입니다.
+    //
+    //  ── 1차 키를 'shipping' 으로 시작하는 이유 ──
+    //   이 시점에는 doc_type 을 모릅니다. STEP A 가 코드를 확정한 뒤
+    //   refine_primary('SA') 가 키를 교체하므로, 그 전 관측만 잠시 'shipping' 에
+    //   들어갔다가 이후 관측이 정확한 서식 스코프로 흘러갑니다.
+    crate::utils::score_dynamics::enter_scope(
+        &team_id,
+        crate::utils::score_dynamics::Track::Trading,
+        "shipping",
+        &task.cc,
+    );
     let payload = json!({
         "task_id": task.id,
         "task_type": task.r#type,
@@ -2456,6 +2478,7 @@ pub async fn process_trading_task(
     };
 
     emit_term(&format!("[TRADING STEP A] ✅ Document classified as: {} (group: {})", doc_type, best_group));
+    crate::utils::score_dynamics::refine_primary(&doc_type);
     emit_term("[TRADING STEP B] Running PLINKO field assignment before LLM...");
 
     // 🌟 [OTHER PARTIES SLOT] 스키마는 9개 카테고리인데 여기만 8개였습니다.
@@ -4209,7 +4232,12 @@ pub async fn process_trading_task(
     });
     let _ = app_handle.emit("extraction-progress", &payload_done);
     log_task_progress(app_handle, &task.id, &payload_done);
-
+    // 🌟 [SDS] 태스크 경계에서 관측을 디스크에 확정하고 스코프를 내립니다.
+    //    dirty 가 false 면 파일을 쓰지 않으므로 불필요한 I/O 가 없습니다.
+    //    이 호출이 있어야 score_dynamics.json 이 처음 생성됩니다.
+    emit_term(&format!("[TRADING] {}", crate::utils::score_dynamics::report()));
+    crate::utils::score_dynamics::flush();
+    crate::utils::score_dynamics::leave_scope();
     println!("[TRADING] Task {} completed. {} page(s) processed.", task.id, total_pages);
     Ok(())
 }

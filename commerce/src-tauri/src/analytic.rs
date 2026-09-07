@@ -334,7 +334,219 @@ pub fn count_pending_structuring_targets(
     count
 }
 
-/// 🌟 [STRUCTURING] draft(updated_at = 0) 행동 로그를 시맨틱 문장으로 확정합니다.
+// =====================================================================
+// 🌟 [U-1 / 의도 에피소드 분할]
+// ---------------------------------------------------------------------
+//  ── 무엇이 문제였나 ──
+//   흐름 리포트의 묶음 단위가 group_key = "{from}|{ref}" 즉 '한 사용자 × 한 페이지'
+//   입니다. 그런데 같은 페이지 안에서도 의도는 바뀝니다.
+//     10:02 카디건 클릭 / 10:03 색상 변경 / 10:04 코트 호버   ← 탐색·비교
+//     10:31 배송 조회   / 10:32 반품 정책 호버                ← 다른 의도
+//   현재는 5건이 한 흐름으로 합성되어 cross_action_flow 가
+//   "카디건을 보다가 배송을 조회했다" 는 하나의 서사로 뭉개지고,
+//   intent_evolution 이 전환점을 짚지 못합니다.
+//
+//  ── 문서 트랙과의 결정적 차이 ──
+//   문서 추출에서는 시간이 없어 순위·인덱스로 치환해야 했습니다.
+//   여기는 created_at_ts 가 실재하므로 '의미 거리' 와 '시간 간격' 이라는
+//   두 개의 독립 신호를 결합할 수 있습니다.
+//
+//  ── 왜 시간을 '증폭기' 로만 쓰는가 ──
+//   시간 간격이 단독으로 경계를 만들면, 사용자가 잠깐 자리를 비운 경우
+//   (Δt 큼, 의미 동일)를 잘라 버립니다. 그래서
+//     결합 거리 = 의미 거리 × (1 + 시간 z⁺)
+//   로 두어, 의미가 같으면 시간이 아무리 벌어져도 0 이 되게 합니다.
+//   z⁺ = max(0, z) 이므로 평균보다 짧은 간격은 증폭하지 않습니다.
+//
+//  ── 임계값에 상수를 쓰지 않는 방법 ──
+//   이 코드베이스의 확립된 패턴을 그대로 씁니다.
+//     trading.rs   CONTINUATION DRIFT : 격차 > 분포 표준편차
+//     scheduler.rs EVIDENCE DEDUP     : dedup_floor = μ + 3σ
+//     ai_utils.rs  T-2 TIE GATE       : 마진 < 꼬리 표준편차
+//   따라서 '인접 결합 거리 > 그 세션 분포의 μ + σ' 를 경계로 봅니다.
+//
+//  ── 추가 모델 비용 0 ──
+//   행동 문장 임베딩은 reindex_pending_embeddings 가 어차피 만드는 것과
+//   같은 텍스트입니다. 여기서 배치 1회로 미리 만들 뿐입니다.
+// =====================================================================
+
+/// 인접 행동의 결합 거리로 의도 에피소드 경계를 찾습니다.
+///
+///  ── 인자 ──
+///   records : 시간순 정렬된 행동 레코드. 각 원소는 "at" 키(epoch ms)를 가져야 합니다.
+///   embeds  : records 와 같은 길이의 행동 문장 임베딩
+///
+///  ── 반환 ──
+///   [start, end) 구간 목록. 분할하지 않으면 [(0, n)] 하나입니다.
+pub fn split_into_episodes(records: &[Value], embeds: &[Vec<f32>]) -> Vec<(usize, usize)> {
+    let n = records.len();
+    if n == 0 { return Vec::new(); }
+    // 인접 쌍이 2개 미만이면 분포를 추정할 수 없습니다.
+    // (경계 후보가 1개뿐이면 μ+σ 판정이 항상 거짓이 되어 무의미합니다)
+    if n < 4 || embeds.len() != n { return vec![(0, n)]; }
+
+    // ── ① 의미 거리 ──
+    let mut sem: Vec<f32> = Vec::with_capacity(n - 1);
+    for i in 0..(n - 1) {
+        let a = &embeds[i];
+        let b = &embeds[i + 1];
+        if a.iter().all(|x| *x == 0.0) || b.iter().all(|x| *x == 0.0) {
+            sem.push(0.0);
+            continue;
+        }
+        let cos = crate::utils::ai_utils::cosine_similarity(a, b);
+        sem.push((1.0 - cos).max(0.0));
+    }
+
+    // ── ② 시간 간격의 z 값 (양수만) ──
+    let ats: Vec<i64> = records
+        .iter()
+        .map(|r| r.get("at").and_then(|v| v.as_i64()).unwrap_or(0))
+        .collect();
+    let dts: Vec<f64> = (0..(n - 1))
+        .map(|i| (ats[i + 1] - ats[i]).max(0) as f64)
+        .collect();
+    let dt_mu = dts.iter().sum::<f64>() / (dts.len() as f64);
+    let dt_var = dts.iter().map(|d| (d - dt_mu) * (d - dt_mu)).sum::<f64>() / (dts.len() as f64);
+    let dt_sd = dt_var.max(0.0).sqrt();
+    let dt_z: Vec<f32> = dts
+        .iter()
+        .map(|d| {
+            if dt_sd <= 1e-9 { 0.0 } else { (((d - dt_mu) / dt_sd) as f32).max(0.0) }
+        })
+        .collect();
+
+    // ── ③ 결합 거리 ──
+    let d: Vec<f32> = (0..(n - 1)).map(|i| sem[i] * (1.0 + dt_z[i])).collect();
+
+    // ── ④ 경계 판정 : 격차 > 분포의 μ + σ ──
+    let d_mu = d.iter().sum::<f32>() / (d.len() as f32);
+    let d_var = d.iter().map(|x| (x - d_mu) * (x - d_mu)).sum::<f32>() / (d.len() as f32);
+    let d_sd = d_var.max(0.0).sqrt();
+    // 전부 같은 거리면(표준편차 0) 자를 근거가 없습니다.
+    if d_sd <= 1e-6 { return vec![(0, n)]; }
+    let cut_at = d_mu + d_sd;
+
+    let mut bounds: Vec<usize> = Vec::new();
+    for i in 0..(n - 1) {
+        if d[i] > cut_at { bounds.push(i + 1); }
+    }
+    if bounds.is_empty() { return vec![(0, n)]; }
+
+    // ── ⑤ 구간 조립 ──
+    let mut segs: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0usize;
+    for b in bounds.into_iter() {
+        if b > start { segs.push((start, b)); }
+        start = b;
+    }
+    if start < n { segs.push((start, n)); }
+
+    // ── ⑥ 단독 구간 병합 ──
+    //   흐름 리포트는 records.len() >= 2 를 요구합니다.
+    //   1건짜리 에피소드는 리포트가 되지 못하고 통째로 버려지므로,
+    //   더 가까운 이웃에 붙여 정보 유실을 막습니다.
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for seg in segs.into_iter() {
+        if seg.1 - seg.0 >= 2 {
+            merged.push(seg);
+            continue;
+        }
+        match merged.last_mut() {
+            Some(prev) => prev.1 = seg.1,
+            None => merged.push(seg),
+        }
+    }
+    // 첫 구간이 단독으로 남았고 뒤에 구간이 있으면 뒤에 붙입니다.
+    if merged.len() >= 2 && merged[0].1 - merged[0].0 < 2 {
+        let head = merged.remove(0);
+        merged[0].0 = head.0;
+    }
+    if merged.is_empty() { return vec![(0, n)]; }
+    merged
+}
+
+// =====================================================================
+// 🌟 [U-3 / 시간 감쇠 유사도 융합]
+// ---------------------------------------------------------------------
+//  ── 무엇이 문제였나 ──
+//   analytic 검색은 STAGE-4 계열에서 청크 코사인만 쌓고,
+//   STAGE-5 병합·정규화까지 시간이 단 한 번도 점수에 개입하지 않습니다.
+//   created_at 은 STAGE-6 리포트 레코드에 표시용으로만 실립니다.
+//
+//   행동 로그는 문서와 성격이 다릅니다.
+//     무역 문서   B/L 은 3개월이 지나도 유효합니다. 의미만이 관련성입니다.
+//     사용자 행동 1년 전 클릭은 대부분 무의미합니다. 시의성이 관련성의 일부입니다.
+//
+//  ── 기존 기간 필터로는 왜 부족한가 ──
+//   analytic_query_prompt 의 규칙 1번은
+//   "명시적 시간 표현이 없으면 time_intent 를 '' 로 반환하고 문맥으로 추측하지 말라"
+//   입니다. 이 규칙은 옳습니다. "가장 많이 클릭한게 뭐야?" 에 기간을 상상해
+//   넣으면 안 되기 때문입니다.
+//   그러나 그 결과 기간 조건이 없는 질의가 다수이고,
+//   그 경우 build_scope_filter 가 created_at 조건을 만들지 않아
+//   1년 전 행동과 어제 행동이 완전히 동등하게 경쟁합니다.
+//   즉 문제는 프롬프트가 아니라 '하드 컷 외에 시의성을 반영할 축이 없다' 는 구조입니다.
+//
+//  ── 감쇠 상수를 어떻게 없애는가 ──
+//   지수 감쇠 exp(−λΔt) 의 λ 는 그 자체가 매직 상수입니다.
+//   그래서 λ 를 직접 두지 않고 '반감기' 로 표현한 뒤,
+//   반감기를 회수 집합의 경과 시간 '중앙값' 에서 얻습니다.
+//     활발한 사이트 → 기록이 최근에 몰림 → 중앙값 작음 → 급격한 감쇠
+//     뜸한 사이트   → 기록이 넓게 퍼짐   → 중앙값 큼   → 완만한 감쇠
+//   중앙값 시점에서 가중치가 정확히 0.5 가 되므로
+//   회수 집합의 절반은 증폭되고 절반은 감쇠합니다.
+//   사이트마다 자동으로 다른 λ 가 나오고 새 상수가 생기지 않습니다.
+//
+//   이 발상은 기존 패턴과 같은 계보입니다.
+//     TITLE FLOOR  자기선언 분포의 평균
+//     dedup_floor  분포의 μ + 3σ
+//     U-3          경과 시간 분포의 중앙값
+//
+//  ── 명시적 기간이 있으면 감쇠를 끕니다 ──
+//   사용자가 '지난달' 을 지정했다면 그 구간 안에서는 최신이 더 중요하지 않습니다.
+//   이미 SQL 이 구간을 잘랐는데 그 안에서 또 감쇠를 걸면
+//   구간 앞부분이 부당하게 눌립니다.
+// =====================================================================
+
+/// 회수 집합의 경과 시간 분포에서 반감기(ms)를 유도합니다.
+///
+///  ── 반환 ──
+///   Some(반감기 ms) / 표본이 부족하거나 전부 동시각이면 None.
+///   None 이면 호출부는 감쇠를 적용하지 않습니다(현행 동작).
+pub fn derive_recency_half_life(ages_ms: &[i64]) -> Option<f64> {
+    let mut v: Vec<f64> = ages_ms
+        .iter()
+        .filter(|a| **a >= 0)
+        .map(|a| *a as f64)
+        .collect();
+    // 표본이 4건 미만이면 중앙값이 분포를 대표하지 못합니다.
+    if v.len() < 4 { return None; }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = v[v.len() / 2];
+    // 전 기록이 사실상 동시각이면 감쇠가 의미 없습니다.
+    if median <= 1000.0 { return None; }
+    Some(median)
+}
+
+/// 경과 시간에 대한 시간 감쇠 가중치를 산출합니다.
+///
+///  ── 성질 ──
+///   age = 0        → 1.0
+///   age = 반감기   → 0.5
+///   age → ∞        → 0 에 수렴하되 0 이 되지는 않습니다.
+///
+///  ── 왜 0 이 되면 안 되는가 ──
+///   가중치가 0 이면 오래된 기록이 검색 결과에서 완전히 사라집니다.
+///   그러나 '작년에 이 사용자가 무엇을 했는가' 는 여전히 유효한 질문이고,
+///   시간 필터가 없는 질의에서 답이 통째로 없어지면 리콜 손실입니다.
+///   감쇠는 '순위를 낮추는 것' 이지 '배제하는 것' 이 아닙니다.
+pub fn recency_weight(age_ms: i64, half_life_ms: f64) -> f32 {
+    if half_life_ms <= 0.0 { return 1.0; }
+    let a = age_ms.max(0) as f64;
+    let w = 0.5f64.powf(a / half_life_ms);
+    (w as f32).clamp(0.0, 1.0)
+}
 ///  반환값 = 구조화에 성공한 이벤트 건수
 pub async fn run_analytic_structuring(
     store: &VectorStore,
@@ -670,19 +882,144 @@ pub async fn run_analytic_structuring(
     // ── ⑤ 흐름 리포트(report) 합성 ──
     //    analytics-logis-center 의 cross_action_flow / intent_evolution /
     //    consistent_preferences 3축을 그대로 로컬에서 재현합니다.
+    //
+    // 🌟 [U-1] 묶음 단위를 '페이지' 에서 '의도 에피소드' 로 정제합니다.
+    //
+    //  ── 왜 여기서 임베딩을 만드는가 ──
+    //   구조화 루프 안에서는 action 문장이 아직 확정되지 않은 시점이 섞여 있고,
+    //   레코드마다 임베딩을 부르면 Qwen3.5 와 granite 사이를 왕복합니다.
+    //   전 그룹의 전 레코드를 한 배치로 처리하면 페이즈 전환이 최대 2회입니다.
+    //
+    //  ── 스왑이 0 이 될 수도 있습니다 ──
+    //   enter_embedding_phase 는 예산을 판정해, 여유가 있으면
+    //   Qwen3.5 를 유지한 채 granite(97M) 를 얹습니다(COEXIST).
+    //   여유가 없을 때만 스왑이 발생하며, 그 판정은 실측 기반입니다.
+    let mut episode_embeds: std::collections::HashMap<String, Vec<Vec<f32>>> =
+        std::collections::HashMap::new();
+    {
+        // 그룹별 행동 문장을 시간순으로 모읍니다.
+        let mut order: Vec<String> = Vec::new();
+        let mut texts: Vec<String> = Vec::new();
+        let mut spans: Vec<(String, usize, usize)> = Vec::new();
+        for (gk, recs) in flow_groups.iter() {
+            if recs.len() < 2 { continue; }
+            let mut sorted = recs.clone();
+            sorted.sort_by_key(|r| r.get("at").and_then(|v| v.as_i64()).unwrap_or(0));
+            let start = texts.len();
+            for r in sorted.iter() {
+                let a = r.get("action").and_then(|v| v.as_str()).unwrap_or("").trim();
+                let s = r.get("summary").and_then(|v| v.as_str()).unwrap_or("").trim();
+                let t = if !a.is_empty() {
+                    a.to_string()
+                } else if !s.is_empty() {
+                    s.to_string()
+                } else {
+                    " ".to_string()
+                };
+                texts.push(t);
+            }
+            spans.push((gk.clone(), start, texts.len()));
+            order.push(gk.clone());
+        }
+        if !texts.is_empty() {
+            match model.enter_embedding_phase("analytic episode split").await {
+                Ok(_) => {
+                    let embs = model
+                        .get_embedding_batch(texts.clone())
+                        .await
+                        .unwrap_or_else(|_| vec![vec![0.0; 384]; texts.len()]);
+                    for (gk, s, e) in spans.into_iter() {
+                        episode_embeds.insert(gk, embs[s..e].to_vec());
+                    }
+                    emit_term(&format!(
+                        "[ANALYTIC] 🧬 [EPISODE EMBED] 흐름 그룹 {}개 · 행동 {}건을 배치 1회로 임베딩했습니다. {}",
+                        order.len(),
+                        texts.len(),
+                        model.crossover_report()
+                    ));
+                    // 흐름 합성은 Qwen3.5 가 필요하므로 생성 페이즈로 되돌립니다.
+                    if let Err(e) = model
+                        .switch_to_generation(
+                            crate::model::ModelSize::Qwen3_5,
+                            Some(cancel.clone()),
+                            None,
+                            "analytic flow synthesis",
+                        )
+                        .await
+                    {
+                        emit_term(&format!(
+                            "[ANALYTIC] ⚠️ 흐름 합성용 생성 모델 복귀 실패({}). 에피소드 분할 없이 진행합니다.",
+                            e
+                        ));
+                        episode_embeds.clear();
+                    }
+                }
+                Err(e) => {
+                    emit_term(&format!(
+                        "[ANALYTIC] ⚠️ 임베딩 페이즈 진입 실패({}). 에피소드 분할 없이 페이지 단위로 합성합니다.",
+                        e
+                    ));
+                }
+            }
+        }
+    }
+
     for (group_key, mut records) in flow_groups.into_iter() {
         if cancel.load(Ordering::Relaxed) { break; }
         if records.len() < 2 { continue; }
-
         let env_doc = match flow_envelope.get(&group_key) { Some(d) => d.clone(), None => continue };
-
         records.sort_by_key(|r| r.get("at").and_then(|v| v.as_i64()).unwrap_or(0));
         if records.len() > 24 { records.truncate(24); }
 
-        let records_json = serde_json::to_string_pretty(&records).unwrap_or_else(|_| "[]".to_string());
-        let doc_lang = crate::utils::lang_utils::detect_document_language(&records_json);
-        let prompt = crate::prompts::analytic_flow_prompt(&doc_lang, &records_json);
+        // 🌟 [U-1] 의도 에피소드로 분할합니다.
+        //    임베딩이 없으면(진입 실패 등) 단일 구간이 되어 기존 동작과 동일합니다.
+        let segments: Vec<(usize, usize)> = match episode_embeds.get(&group_key) {
+            Some(embs) => {
+                let use_embs: Vec<Vec<f32>> = embs.iter().take(records.len()).cloned().collect();
+                if use_embs.len() == records.len() {
+                    split_into_episodes(&records, &use_embs)
+                } else {
+                    vec![(0, records.len())]
+                }
+            }
+            None => vec![(0, records.len())],
+        };
+        if segments.len() > 1 {
+            let spans: Vec<String> = segments
+                .iter()
+                .map(|(s, e)| {
+                    let first = records[*s]
+                        .get("action")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .chars()
+                        .take(28)
+                        .collect::<String>();
+                    format!("[{}..{}) \"{}\"", s, e, first)
+                })
+                .collect();
+            emit_term(&format!(
+                "  ✂️ [EPISODE SPLIT] '{}' 의 행동 {}건이 의도 에피소드 {}개로 분리되었습니다: {}",
+                group_key, records.len(), segments.len(), spans.join(" | ")
+            ));
+            crate::utils::score_dynamics::record_baseline(
+                "analytic.episodes_per_group",
+                segments.len() as f32,
+            );
+        }
 
+        for (ep_idx, (seg_start, seg_end)) in segments.iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) { break; }
+            let records: Vec<Value> = records[*seg_start..*seg_end].to_vec();
+            if records.len() < 2 { continue; }
+            let records_json = serde_json::to_string_pretty(&records).unwrap_or_else(|_| "[]".to_string());
+            let doc_lang = crate::utils::lang_utils::detect_document_language(&records_json);
+            let prompt = crate::prompts::analytic_flow_prompt_scoped(
+                &doc_lang,
+                &records_json,
+                ep_idx,
+                segments.len(),
+            );
         let params = crate::openai_types::ChatCompletionParameters {
             messages: vec![
                 crate::openai_types::ChatCompletionRequestMessage::User(
@@ -731,12 +1068,53 @@ pub async fn run_analytic_structuring(
         // 🌟 [DETERMINISTIC REPORT ID] 난수 대신 (사용자 + 페이지 + 일자) 기반 해시.
         //    같은 날 같은 페이지의 흐름은 새 문서를 만들지 않고 갱신되므로
         //    리포트가 무한히 불어나지 않습니다.
+        //
+        // 🌟 [U-1] 에피소드 인덱스를 키에 더합니다.
+        //
+        //  ── 왜 필요한가 ──
+        //   에피소드가 2개인데 키가 같으면 두 번째가 첫 번째를 덮어써
+        //   '탐색 → 이탈' 중 하나만 남습니다. 분할한 의미가 사라집니다.
+        //
+        //  ── 왜 여전히 결정론인가 ──
+        //   ep_idx 는 시간순 구간의 순번이므로, 같은 입력을 다시 처리하면
+        //   같은 번호가 나옵니다. 난수가 아니라 리포트가 불어나지 않습니다.
+        //
+        //  ── 단일 에피소드는 기존 키를 유지합니다 ──
+        //   ep_idx 가 0 이고 구간이 하나뿐이면 접미사를 붙이지 않아,
+        //   기존에 생성된 리포트 문서와 ID 가 그대로 이어집니다.
         let day_bucket = now_ts / 86_400_000;
+        let ep_suffix = if segments.len() > 1 {
+            format!("#ep{}", ep_idx)
+        } else {
+            String::new()
+        };
         let report_id = crate::utils::hash::hash_id(&format!(
-            "report{}{}{}",
-            env_doc.from, env_doc.r#ref, day_bucket
+            "report{}{}{}{}",
+            env_doc.from, env_doc.r#ref, day_bucket, ep_suffix
         ));
 
+        // 🌟 [U-1] 에피소드 메타를 데이터에 남깁니다.
+        //
+        //  ── episode_index / episode_total ──
+        //   '이 리포트가 그 페이지의 몇 번째 의도 구간인가' 를 검색과 진단에서
+        //   구분할 수 있게 합니다. 분할이 없었으면 0 / 1 이므로
+        //   기존 리포트와 의미가 동일합니다.
+        //
+        //  ── episode_started_at / episode_ended_at ──
+        //   구간의 실제 시간 범위입니다. 리포트 검색(STAGE-6)에서
+        //   기간 조건과 대조할 때 created_at(합성 시각)이 아니라
+        //   '행동이 일어난 시각' 으로 걸러야 정확합니다.
+        //
+        //  ⚠️ canonical.rs 의 kind_of 규칙상 '_at' 접미사는 수치(날짜)로,
+        //     'index' 는 수치로 확정되므로 별도 정규화가 필요 없습니다.
+        let ep_started = records
+            .first()
+            .and_then(|r| r.get("at").and_then(|v| v.as_i64()))
+            .unwrap_or(now_ts);
+        let ep_ended = records
+            .last()
+            .and_then(|r| r.get("at").and_then(|v| v.as_i64()))
+            .unwrap_or(now_ts);
         let report_data = json!({
             "id": report_id.clone(),
             "type": "report",
@@ -746,6 +1124,10 @@ pub async fn run_analytic_structuring(
             "consistent_preferences": preferences,
             "link": records.first().and_then(|r| r.get("link")).cloned().unwrap_or(json!("")),
             "origin": env_doc_origin(&env_doc),
+            "episode_index": ep_idx,
+            "episode_total": segments.len(),
+            "episode_started_at": ep_started,
+            "episode_ended_at": ep_ended,
             "text": report_text.clone(),
             "masked_text": report_text,
             "created_at": now_ts,
@@ -772,16 +1154,17 @@ pub async fn run_analytic_structuring(
             .await;
 
         emit_term(&format!(
-            "  📊 [ANALYTIC REPORT] id='{}' | 기록 {}건을 흐름 리포트로 합성했습니다.",
-            report_id, records.len()
+            "  📊 [ANALYTIC REPORT] id='{}'{} | 기록 {}건을 흐름 리포트로 합성했습니다.",
+            report_id,
+            if segments.len() > 1 { format!(" (에피소드 {}/{})", ep_idx + 1, segments.len()) } else { String::new() },
+            records.len()
         ));
+        } // for (ep_idx, (seg_start, seg_end)) in segments
     }
-
     emit_term(&format!(
         "[ANALYTIC] ✅ 구조화 완료: {}건. 로컬 임베딩 파이프라인이 이어서 벡터화합니다.",
         processed
     ));
-
     Ok(processed)
 }
 

@@ -183,6 +183,48 @@ fn current_scope() -> Option<Scope> {
     if s.is_empty() { None } else { Some(s) }
 }
 
+// 🌟 [UNSCOPED FALLBACK] 스코프가 없어도 관측을 버리지 않습니다.
+// ---------------------------------------------------------------------
+//  ── 왜 필요한가 (실측 사고) ──
+//   초기 설계는 스코프가 없으면 with_scope_mut 이 조용히 return 했습니다.
+//   그래서 enter_scope 배치를 한 군데라도 틀리면
+//     · 모든 record_* 가 아무 소리 없이 버려지고
+//     · DIRTY 가 false 로 남아 flush 가 파일을 쓰지 않으며
+//     · 로그에는 아무 흔적도 남지 않습니다.
+//   실제로 process_task 의 shipping/image 조기 return 을 놓쳐
+//   두 경로 모두 계측이 통째로 죽었는데 이를 알아챌 방법이 없었습니다.
+//   '실패가 보이지 않는 설계' 는 그 자체가 결함입니다.
+//
+//  ── 어떻게 고치는가 ──
+//   스코프가 없으면 'unscoped' 라는 명시적 스코프에 기록합니다.
+//   통계로서의 가치는 낮지만(서식별 격리가 안 됨),
+//     ① 파일이 생성되어 배선 성공을 즉시 확인할 수 있고
+//     ② 아래 경고 로그가 '어디서 스코프가 비었는지' 를 알려줍니다.
+//   즉 조용한 유실이 시끄러운 진단으로 바뀝니다.
+//
+//  ── 경고를 1회만 내는 이유 ──
+//   record_* 는 문서 1건에 수백 회 호출됩니다.
+//   매번 찍으면 로그가 묻히므로 프로세스당 1회만 알립니다.
+static UNSCOPED_WARNED: Lazy<RwLock<bool>> = Lazy::new(|| RwLock::new(false));
+
+fn effective_scope_key() -> (String, usize) {
+    match (current_scope(), current_track()) {
+        (Some(s), Some(t)) => (s.key_secondary(), t.ring_len()),
+        _ => {
+            let already = UNSCOPED_WARNED.read().map(|w| *w).unwrap_or(true);
+            if !already {
+                if let Ok(mut w) = UNSCOPED_WARNED.write() { *w = true; }
+                println!(
+                    "[SDS] ⚠️ 활성 스코프 없이 관측이 들어왔습니다. 'unscoped' 로 기록합니다. \
+                     enter_scope 호출부가 누락된 경로가 있습니다 — 통계는 남지만 서식별 격리가 되지 않습니다. \
+                     (이 경고는 프로세스당 1회만 출력됩니다)"
+                );
+            }
+            ("unscoped||".to_string(), 12usize)
+        }
+    }
+}
+
 fn current_track() -> Option<Track> {
     let s = current_scope()?;
     Some(match s.track_name.as_str() {
@@ -482,7 +524,20 @@ pub fn load(team: &str) {
         println!("[SDS] 🆕 저장된 통계가 없습니다. 냉간 시작합니다. (현행 판정 그대로)");
     }
     if let Ok(mut w) = SDS.write() { *w = fresh; }
-    if let Ok(mut d) = DIRTY.write() { *d = false; }
+    // 🌟 [SEED WRITE] 부팅 시점에 빈 파일을 즉시 만듭니다.
+    //
+    //  ── 왜 필요한가 ──
+    //   기존에는 flush 만 파일을 썼고, flush 는 dirty 일 때만 동작했습니다.
+    //   그래서 '파일이 없다' 가 다음 셋 중 무엇인지 구분할 수 없었습니다.
+    //     ① lib.rs 배선을 안 했다  ② enter_scope 를 못 탔다  ③ 아직 태스크가 안 끝났다
+    //   부팅 즉시 빈 파일을 쓰면 ①과 ②③이 즉시 갈립니다.
+    //   파일이 있는데 scopes 가 비어 있으면 ②③, 파일 자체가 없으면 ①입니다.
+    //
+    //  ── 비용 ──
+    //   수백 바이트 1회 쓰기입니다.
+    if let Ok(mut d) = DIRTY.write() { *d = true; }
+    flush();
+    println!("[SDS] 📍 통계 파일 경로: {}", sds_path().display());
 }
 
 /// 팀 식별자가 확정된 뒤(로그인 등) 호출합니다.
@@ -504,7 +559,13 @@ pub fn rebind_team(team: &str) {
 
 pub fn flush() {
     let dirty = DIRTY.read().map(|d| *d).unwrap_or(false);
-    if !dirty { return; }
+    if !dirty {
+        // 🌟 [진단] '쓸 것이 없어서 안 썼다' 를 명시합니다.
+        //    이 줄이 없으면 '호출은 됐는데 아무 일도 안 일어난' 상황과
+        //    '호출 자체가 안 된' 상황을 구분할 수 없습니다.
+        println!("[SDS] ⏭️ 새 관측이 없어 저장을 건너뜁니다. (dirty=false)");
+        return;
+    }
     let snapshot = match SDS.read() { Ok(s) => s.clone(), Err(_) => return };
     let mut snapshot = snapshot;
     snapshot.updated_at = chrono::Utc::now().timestamp_millis();
@@ -563,16 +624,44 @@ pub fn purge() {
 }
 
 fn with_scope_mut<F: FnOnce(&mut ScopeStat, usize)>(f: F) {
-    let (key, ring) = match (current_scope(), current_track()) {
-        (Some(s), Some(t)) => (s.key_secondary(), t.ring_len()),
-        _ => return,
-    };
+    // 🌟 [UNSCOPED FALLBACK] 스코프 유무와 무관하게 반드시 기록합니다.
+    let (key, ring) = effective_scope_key();
     if let Ok(mut w) = SDS.write() {
         let e = w.scopes.entry(key).or_insert_with(ScopeStat::default);
         f(e, ring);
         e.updated_at = chrono::Utc::now().timestamp_millis();
     }
     if let Ok(mut d) = DIRTY.write() { *d = true; }
+    // 🌟 [AUTO FLUSH] 관측이 일정량 쌓이면 태스크 종료를 기다리지 않고 기록합니다.
+    bump_and_maybe_flush();
+}
+
+// 🌟 [AUTO FLUSH] 태스크 끝까지 가야만 파일이 생기는 구조를 없앱니다.
+// ---------------------------------------------------------------------
+//  ── 왜 필요한가 ──
+//   기존에는 flush 지점이 태스크 말미 한 곳뿐이라
+//     · 이미지 1장이 크롭 10개 × Qwen3.5 로 수 분이 걸리는 동안 파일이 없고
+//     · 중간에 `?` 로 에러가 전파되거나 사용자가 취소하면 관측이 통째로 사라지며
+//     · 무엇보다 '지금 동작 중인가' 를 확인할 방법이 없었습니다.
+//
+//  ── 임계치가 매직 상수 아닌가 ──
+//   이 값은 판정에 쓰이지 않습니다. '몇 번마다 디스크에 쓸 것인가' 라는
+//   I/O 정책이며, 틀려도 통계나 추출 결과가 달라지지 않습니다.
+//   파일 크기가 수십 KB 수준이라 자주 써도 부담이 없습니다.
+static WRITE_TICK: Lazy<RwLock<u32>> = Lazy::new(|| RwLock::new(0));
+const AUTO_FLUSH_EVERY: u32 = 64;
+
+fn bump_and_maybe_flush() {
+    let should = {
+        match WRITE_TICK.write() {
+            Ok(mut t) => {
+                *t = t.wrapping_add(1);
+                *t % AUTO_FLUSH_EVERY == 0
+            }
+            Err(_) => false,
+        }
+    };
+    if should { flush(); }
 }
 
 // =====================================================================

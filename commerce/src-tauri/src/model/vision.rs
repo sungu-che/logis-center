@@ -40,6 +40,29 @@ impl crate::model::LogisModel {
 
         emit_term("\n=======================================");
         emit_term(&format!("[ENGINE] 🚀 Starting Image Extraction Pipeline for Task: {}", task_id));
+        // 🌟 [SDS SCOPE / 필수] 비전 경로의 계측 스코프를 세웁니다.
+        //
+        //  ── 왜 여기여야 하는가 ──
+        //   process_task 는 resolve_absolute_url 보다 앞에서
+        //     if task.r#type == "image_extraction" { ... return Ok(()); }
+        //   로 이탈합니다. 따라서 이 경로도 enter_scope 에 도달하지 못했고,
+        //   V-1 이 남기는 record_spatial / record_baseline("vision.spread_*") 과
+        //   classify_doc_type 의 record_decay("vision.doc_code") 가 전부 버려졌습니다.
+        //
+        //  ── team 을 빈 문자열로 두는 이유 ──
+        //   이 함수 시그니처에 team_id 가 없습니다. 스코프 키는
+        //   track|primary|secondary 로만 구성되고 team 은 진단용이므로,
+        //   SDS 가 로드 시점에 바인딩한 팀이 그대로 유지됩니다.
+        //
+        //  ── 1차 키는 STAGE-2 가 확정합니다 ──
+        //   지금은 doc_type 을 모르므로 'unknown' 으로 시작하고,
+        //   비전 코드가 확정되면 refine_primary 가 교체합니다.
+        crate::utils::score_dynamics::enter_scope(
+            "",
+            crate::utils::score_dynamics::Track::Vision,
+            "unknown",
+            &search_mode,
+        );
         emit_term("[STAGE-1] Preparing SigLIP2 Vision Encoder + Qwen3.5 (2B)...");
 
         let payload_load = json!({ "task_id": task_id.clone(), "category": "Loading Model", "summary": "Initializing Vision Core...", "spinner": "⠋" });
@@ -267,7 +290,16 @@ impl crate::model::LogisModel {
                 }
 
                 emit_term(&format!("✅ Document identified as: **{}** (group: {})", detected_type, verdict.group));
-
+                // 🌟 [SDS SCOPE] 확정 코드로 1차 키를 교체합니다.
+                //
+                //  ⚠️ 변수명 주의
+                //   이 시점에 존재하는 것은 detected_type 입니다.
+                //   doc_type 은 이 블록보다 한참 뒤(저장 구간)에서
+                //     let doc_type = if is_trade_doc { ... } else { "goods" };
+                //   로 처음 선언되므로, 여기서 참조하면 E0425 가 납니다.
+                //   trading.rs 의 STEP A 에는 그 위치에 doc_type 이 실제로 있어
+                //   같은 문장이 성립하지만, 이 파일에서는 성립하지 않습니다.
+                crate::utils::score_dynamics::refine_primary(&detected_type);
                 if detected_type == "TRACKING" {
                     emit_term("[STAGE-2] 📦 Fast-Tracking Parcel Label...");
                     // 🌟 [VRAM STAGE] 이 경로는 크롭 없이 전체 이미지를 Qwen3.5 에 바로 넘깁니다.
@@ -513,8 +545,12 @@ impl crate::model::LogisModel {
                 // 🛒 [Commerce 모드] SigLIP2 히트맵 + 정밀 크롭
                 // ============================================================
                 emit_term("[STAGE-2] 🛒 Commerce Mode: SigLIP2 Heatmap Pipeline...");
-
                 let commerce_page_type = "goods";
+                // 🌟 [SDS SCOPE] 커머스 경로도 1차 키를 확정합니다.
+                //    이 줄이 없으면 스코프가 'vision|unknown|' 에 머물러
+                //    상품 이미지와 무역 서식의 히트맵 확산도가 한 통계에 섞이고,
+                //    V-1 의 확산 게이트(중앙값+MAD) 기준선이 오염됩니다.
+                crate::utils::score_dynamics::refine_primary(commerce_page_type);
                 // 🌟 [SCOPED LOCK + LAZY TEXT] trade 분기와 동일한 셀프 데드락 방지 구조를
                 //    with_siglip_text 가 그대로 제공하며, 캐시 미스가 없으면 인코더를 올리지 않습니다.
                 let heatmaps = self
@@ -1216,9 +1252,35 @@ impl crate::model::LogisModel {
             crate::utils::logger::log_task_progress(app_handle, &task_id, &payload);
             
             crate::utils::sync_utils::notify_new_task();
-            
+
+            // 🌟 [SDS] 비전 태스크 경계에서 관측을 확정합니다.
+            //
+            //  ── 왜 함수 끝이 아니라 여기인가 ──
+            //   이 함수의 본문 마지막은
+            //     if let Ok(img) = image::open(...) { ... Ok(()) } else { Ok(()) }
+            //   이고, 이 if/else 자체가 함수의 꼬리 표현식(반환값)입니다.
+            //   그 뒤에 문장을 붙이면 if/else 가 '문장' 이 되어 값 타입이 ()
+            //   이어야 하는데 실제로는 Result<()> 라 E0308 로 컴파일이 깨지고,
+            //   설령 통과해도 위 분기에서 이미 반환되므로 도달하지 못합니다.
+            //   따라서 성공 분기의 Ok(()) '직전' 이 유일하게 올바른 위치입니다.
+            //
+            //  ── 취소·에러 경로를 덮지 못하는 것은 손실이 아닙니다 ──
+            //   본문 중간에 `return Ok(())`(사용자 취소) 와 `?`(에러 전파) 가 있어
+            //   그 경로는 이 지점을 지나지 않습니다. 그러나
+            //     · enter_scope 는 다음 태스크 진입 시 스코프를 덮어쓰고
+            //     · flush 를 놓친 관측은 DIRTY=true 로 메모리에 남아
+            //       다음 태스크의 flush 또는 unload_model / 앱 종료 flush 가 기록합니다.
+            //   즉 유실이 아니라 '지연' 이며, 그래서 Drop 가드를 도입하지 않습니다.
+            emit_term(&format!("[ENGINE] {}", crate::utils::score_dynamics::report()));
+            crate::utils::score_dynamics::flush();
+            crate::utils::score_dynamics::leave_scope();
+            emit_term(&format!("[ENGINE] ✅ Image extraction pipeline complete for Task: {}", task_id));
             Ok(())
         } else {
+            // 🌟 [SDS] 이미지 파일을 열지 못한 경로입니다.
+            //    관측이 하나도 없으므로 flush 는 불필요하고 스코프만 내립니다.
+            //    (flush 는 dirty 가 false 면 어차피 파일을 쓰지 않습니다)
+            crate::utils::score_dynamics::leave_scope();
             Ok(())
         }
     }

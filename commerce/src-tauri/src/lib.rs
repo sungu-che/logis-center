@@ -2411,6 +2411,102 @@ async fn ai_search_complex(
                 }
             }
 
+            // ── 5-A2: [U-3] 시간 감쇠 융합 ──
+            //
+            //  ── 왜 정규화 '직전' 인가 ──
+            //   정규화 이후에 곱하면 최댓값이 1.0 을 유지하지 못해
+            //   프론트엔드의 상대 비교가 흔들립니다.
+            //   정규화 이전에 곱하면 감쇠가 반영된 채로 다시 0~1 에 맞춰지므로
+            //   '상대 순위만 바뀌고 스케일 계약은 유지' 됩니다.
+            //
+            //  ── 왜 analytic 에만 적용하는가 ──
+            //   무역 서식은 시간이 지나도 유효합니다. B/L 은 늙지 않습니다.
+            //   커머스 상품도 마찬가지입니다.
+            //   시의성이 관련성의 일부인 것은 행동 로그뿐입니다.
+            //
+            //  ── 왜 명시적 기간이 있으면 끄는가 ──
+            //   사용자가 '지난달' 을 지정했다면 SQL 이 이미 구간을 잘랐습니다.
+            //   그 안에서 다시 감쇠를 걸면 구간 앞부분이 부당하게 눌립니다.
+            if search_mode == "analytic" && !merged_map.is_empty() {
+                let explicit_period = structured_query
+                    .get("started_at")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+                    > 0;
+                if explicit_period {
+                    emit_term("[AI-SEARCH] ⏱️ [RECENCY] 질의에 명시적 기간이 있어 시간 감쇠를 적용하지 않습니다. (구간은 이미 SQL 이 잘랐고, 그 안에서 앞부분을 누르면 부당합니다)");
+                } else if let Some(store) = store_opt.as_ref() {
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    // ① 회수 문서의 행동 시각을 모읍니다.
+                    //    report 문서는 U-1 이 남긴 episode_ended_at 이 실제 행동 시각이고,
+                    //    created_at 은 '합성 시각' 이라 시의성 판정에 쓰면 안 됩니다.
+                    let mut ages: Vec<(String, i64)> = Vec::new();
+                    for (id, _) in merged_map.iter() {
+                        if let Ok(Some(doc)) = store.get_item_by_id("items", id).await {
+                            let acted_at = serde_json::from_str::<Value>(&doc.json_data)
+                                .ok()
+                                .and_then(|d| {
+                                    d.get("episode_ended_at")
+                                        .and_then(|v| v.as_i64())
+                                        .or_else(|| d.get("created_at").and_then(|v| v.as_i64()))
+                                })
+                                .filter(|v| *v > 0)
+                                .unwrap_or(doc.created_at_ts);
+                            ages.push((id.clone(), (now_ms - acted_at).max(0)));
+                        }
+                    }
+                    let age_only: Vec<i64> = ages.iter().map(|(_, a)| *a).collect();
+                    match crate::analytic::derive_recency_half_life(&age_only) {
+                        Some(half_life) => {
+                            let hl_days = half_life / 86_400_000.0;
+                            emit_term(&format!(
+                                "[AI-SEARCH] ⏱️ [RECENCY DECAY] 회수 {}건의 경과 시간 중앙값에서 반감기를 유도했습니다: {:.2}일. (중앙값 시점에서 가중 0.5 → 절반은 증폭, 절반은 감쇠)",
+                                age_only.len(), hl_days
+                            ));
+                            crate::utils::score_dynamics::record_baseline(
+                                "analytic.recency_half_life_days",
+                                hl_days as f32,
+                            );
+                            let mut logged = 0usize;
+                            for (id, age) in ages.into_iter() {
+                                let w = crate::analytic::recency_weight(age, half_life);
+                                if let Some(item) = merged_map.get_mut(&id) {
+                                    let raw = item
+                                        .get("score")
+                                        .and_then(|v| v.as_f64())
+                                        .unwrap_or(0.0) as f32;
+                                    let decayed = raw * w;
+                                    item.as_object_mut()
+                                        .unwrap()
+                                        .insert("score".to_string(), json!(decayed));
+                                    item.as_object_mut()
+                                        .unwrap()
+                                        .insert("recency_weight".to_string(), json!(w));
+                                    item.as_object_mut().unwrap().insert(
+                                        "age_days".to_string(),
+                                        json!((age as f64 / 86_400_000.0 * 100.0).round() / 100.0),
+                                    );
+                                    if logged < 8 {
+                                        logged += 1;
+                                        emit_term(&format!(
+                                            "  ⏱️ [RECENCY] id={} | 경과 {:.2}일 | 가중 {:.4} | {:.4} → {:.4}",
+                                            id,
+                                            age as f64 / 86_400_000.0,
+                                            w,
+                                            raw,
+                                            decayed
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            emit_term("[AI-SEARCH] ⏱️ [RECENCY] 회수 건수가 부족하거나 전 기록이 사실상 동시각이라 반감기를 유도할 수 없습니다. 시간 감쇠를 적용하지 않습니다.");
+                        }
+                    }
+                }
+            }
+
             // ── 5-B: 점수 정규화 ──
             // 문서 매칭(primary)과 청크 매칭(chunk_match)의 점수 스케일이 다를 수 있으므로
             // 최대 점수 기준으로 0.0~1.0 에 정규화합니다.
@@ -2493,10 +2589,18 @@ async fn ai_search_complex(
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 let brief: String = matched_text.chars().take(48).collect();
-                println!("  [RANK {}] id={} | score={:.4} | type={} | match={} | property={} | matched='{}'",
+                // 🌟 [U-3] 시간 감쇠가 적용된 항목은 그 사실을 랭킹 로그에 함께 남깁니다.
+                //    '왜 이 결과가 위에 있는가' 를 사후에 재구성할 수 있어야 합니다.
+                let rec = item.get("recency_weight").and_then(|v| v.as_f64());
+                let age_d = item.get("age_days").and_then(|v| v.as_f64());
+                let rec_note = match (rec, age_d) {
+                    (Some(w), Some(a)) => format!(" | recency={:.4}({:.1}일)", w, a),
+                    _ => String::new(),
+                };
+                println!("  [RANK {}] id={} | score={:.4} | type={} | match={} | property={} | matched='{}'{}",
                     rank + 1, id, score, ctx,
                     if is_chunk { if is_alias { "alias" } else { "chunk" } } else { "doc" },
-                    prop, brief);
+                    prop, brief, rec_note);
             }
 
             all_results = ranked_results;
@@ -2551,10 +2655,21 @@ async fn ai_search_complex(
                                 .map(|dt| dt.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string())
                                 .unwrap_or_default();
 
+                            // 🌟 [U-3] 경과 일수를 함께 실어 모델이 시의성을 판단할 수 있게 합니다.
+                            //
+                            //  ── 왜 ISO 시각만으로는 부족한가 ──
+                            //   2B 모델은 "2026-03-15" 와 "오늘" 사이의 간격을
+                            //   안정적으로 계산하지 못합니다. 시스템 시각이 프롬프트에 있어도
+                            //   뺄셈을 틀립니다. 계산된 일수를 직접 주는 편이 확실합니다.
+                            let age_days = {
+                                let now = chrono::Utc::now().timestamp_millis();
+                                ((now - at).max(0) as f64 / 86_400_000.0 * 10.0).round() / 10.0
+                            };
                             records.push(json!({
                                 "user": doc.from,
                                 "type": doc.r#type,
                                 "at": at_iso,
+                                "days_ago": age_days,
                                 "link": d.get("link").and_then(|v| v.as_str()).unwrap_or(""),
                                 "action": action,
                                 "summary": summary,
@@ -2567,6 +2682,23 @@ async fn ai_search_complex(
                     }
                 }
 
+                // 🌟 [U-3] 회수 기록을 최신순으로 정렬해 프롬프트에 넣습니다.
+                //
+                //  ── 왜 필요한가 ──
+                //   STAGE-5 는 점수순으로 정렬되어 있어 시간이 뒤섞입니다.
+                //   그 상태로 넣으면 모델이 "최근 흐름" 을 물어도
+                //   목록 앞쪽(=점수 높은) 오래된 기록부터 서술합니다.
+                //   시간 감쇠가 순위에 반영되었더라도, 프롬프트 안의 '읽는 순서' 는
+                //   별개의 신호이므로 함께 맞춰야 합니다.
+                //
+                //  ── 점수 순서를 버리지 않습니다 ──
+                //   records 는 이미 상위 30건으로 잘린 상태이므로,
+                //   그 안에서 시간순으로 재배열해도 '관련성 높은 집합' 이라는 사실은 유지됩니다.
+                records.sort_by(|a, b| {
+                    let ta = a.get("at").and_then(|v| v.as_str()).unwrap_or("");
+                    let tb = b.get("at").and_then(|v| v.as_str()).unwrap_or("");
+                    tb.cmp(ta)
+                });
                 if !records.is_empty() {
                     let now_ms = chrono::Utc::now().timestamp_millis();
                     let current_iso = chrono::DateTime::from_timestamp_millis(now_ms)

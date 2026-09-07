@@ -1415,11 +1415,84 @@ pub fn build_column_heatmaps(
         };
         let grid_rows = grid.grid_rows.max(1);
 
+        // 🌟 [V-1 수정 / 과확산 선별] 전 카테고리 균일 적용을 철회합니다.
+        //
+        //  ── 실측 역효과 ──
+        //   균일 적용 결과: cargo(66→105) conditions(99→116) containers(71→103)
+        //   financials(106→115) items(45→115) logistics(70→113)
+        //   other_parties(109→123) parties(84→117)
+        //   10개 중 8개가 오히려 퍼졌고, 크롭 커버리지 손실이
+        //   header 1개에서 8개 카테고리로 확대되었습니다.
+        //
+        //  ── 왜 그렇게 되는가 ──
+        //   잔차 = v − row_mean − col_mean + μ 의 총합은 정확히 0 입니다.
+        //   따라서 양수 개수가 구조적으로 전체의 절반(252/2 ≈ 126)으로 수렴합니다.
+        //   실제 결과가 전부 103~133 에 몰린 것이 그 증거입니다.
+        //   즉 이 연산자는 모든 카테고리를 같은 확산도로 '균질화' 하며,
+        //   뾰족한 히트맵(items 45개)을 강제로 평평하게 만듭니다.
+        //   '좁은 히트맵은 행/열 효과가 작아 잔차 ≈ 원본' 이라는 제 전제가 틀렸습니다.
+        //
+        //  ── 교정 ──
+        //   '이 문서 안에서 유독 퍼진 카테고리' 에만 적용합니다.
+        //   기준은 카테고리별 활성 비율의 중앙값과 절대편차 중앙값(MAD)이며,
+        //   둘 다 이 문서의 분포에서 유도되므로 새 상수가 없습니다.
+        //   MAD 는 표준편차와 달리 극단값(settlement 240)에 끌려가지 않아
+        //   '나머지가 정상일 때 하나만 튄' 상황을 정확히 잡습니다.
+        let spread_gate: Option<f32> = {
+            let mut ratios: Vec<f32> = Vec::with_capacity(cats.len());
+            for ci in 0..cats.len() {
+                let hot = cat_raw[ci]
+                    .iter()
+                    .filter(|v| **v != f32::MIN && **v > 0.0)
+                    .count();
+                ratios.push(hot as f32 / n.max(1) as f32);
+            }
+            if ratios.len() < 3 {
+                None
+            } else {
+                let mut s = ratios.clone();
+                s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let med = s[s.len() / 2];
+                let mut dev: Vec<f32> = ratios.iter().map(|r| (r - med).abs()).collect();
+                dev.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let mad = dev[dev.len() / 2];
+                if mad <= 1e-6 {
+                    // 전 카테고리가 같은 확산도면 '유독 퍼진 것' 이 존재하지 않습니다.
+                    None
+                } else {
+                    Some(med + mad)
+                }
+            }
+        };
+        match spread_gate {
+            Some(g) => emit(&format!(
+                "    🧭 [SPATIAL RESIDUAL GATE] 이 문서의 카테고리 확산도 중앙값+MAD = {:.3} 를 넘는 카테고리에만 잔차화를 적용합니다. (균일 적용은 뾰족한 히트맵까지 평평하게 만듭니다)",
+                g
+            )),
+            None => emit(
+                "    ⏭️ [SPATIAL RESIDUAL SKIP] 카테고리 확산도가 고르거나 표본이 부족해 '유독 퍼진 카테고리' 를 특정할 수 없습니다. 잔차화를 건너뜁니다.",
+            ),
+        }
+
         let mut applied = 0usize;
         let mut reverted: Vec<String> = Vec::new();
+        let mut skipped: Vec<String> = Vec::new();
         let mut detail: Vec<String> = Vec::new();
 
         for ci in 0..cats.len() {
+            // 🌟 [V-1 수정] 게이트를 넘지 않는 카테고리는 원본을 그대로 둡니다.
+            let gate = match spread_gate { Some(g) => g, None => break };
+            {
+                let hot_now = cat_raw[ci]
+                    .iter()
+                    .filter(|v| **v != f32::MIN && **v > 0.0)
+                    .count();
+                let ratio_now = hot_now as f32 / n.max(1) as f32;
+                if ratio_now <= gate {
+                    skipped.push(format!("{}({:.0}%)", cats[ci], ratio_now * 100.0));
+                    continue;
+                }
+            }
             // ── 유효 패치만으로 전체/행/열 평균을 구합니다 ──
             let mut sum_all = 0.0f64;
             let mut cnt_all = 0usize;
@@ -1468,13 +1541,24 @@ pub fn build_column_heatmaps(
             }
             let hot_after = residual.iter().filter(|v| **v != f32::MIN && **v > 0.0).count();
 
-            // ── 리스크 R7 방어 ──
-            //   히트맵이 통째로 죽으면(양수 0) 잔차화를 되돌립니다.
-            //   '페이지 전면이 실제로 이 카테고리인 문서' 는 진짜 신호가
-            //   공간적으로 균일하므로 잔차가 0 이 되는 것이 정상입니다.
-            //   그 문서에서 히트맵을 없애면 크롭 자체가 불가능해집니다.
+            // ── 리스크 R7 방어 (강화) ──
+            //   ① 히트맵이 통째로 죽으면(양수 0) 되돌립니다.
+            //      '페이지 전면이 실제로 이 카테고리인 문서'(MSDS 전면 hazmat 등)는
+            //      진짜 신호가 공간적으로 균일하므로 잔차가 0 이 되는 것이 정상이고,
+            //      그 문서에서 히트맵을 없애면 크롭 자체가 불가능해집니다.
+            //
+            //   ② 🌟 [신규] 잔차화 후 오히려 퍼지면 되돌립니다.
+            //      실측에서 items(45→115) 처럼 2.6배 퍼지는 사례가 확인되었습니다.
+            //      잔차의 총합이 0 이라 양수가 전체의 절반으로 수렴하기 때문입니다.
+            //      V-1 의 목적은 '좁히는 것' 이므로, 넓어졌다면 그 자체가 실패입니다.
+            //      게이트를 통과한 카테고리에서도 이 일이 일어날 수 있으므로
+            //      최종 방어선으로 둡니다.
             if hot_after == 0 && hot_before > 0 {
-                reverted.push(format!("{}({}→0)", cats[ci], hot_before));
+                reverted.push(format!("{}({}→0 소멸)", cats[ci], hot_before));
+                continue;
+            }
+            if hot_after >= hot_before {
+                reverted.push(format!("{}({}→{} 확산)", cats[ci], hot_before, hot_after));
                 continue;
             }
 
@@ -1504,10 +1588,17 @@ pub fn build_column_heatmaps(
             grid_rows, grid_cols, applied,
             if detail.is_empty() { "-".to_string() } else { detail.join(" | ") }
         ));
+        if !skipped.is_empty() {
+            skipped.sort();
+            emit(&format!(
+                "    ⏭️ [SPATIAL RESIDUAL SKIP] 확산 게이트 이하라 원본을 유지한 카테고리 {}개: {} — 이미 뾰족한 히트맵을 잔차화하면 오히려 평평해집니다.",
+                skipped.len(), skipped.join(" | ")
+            ));
+        }
         if !reverted.is_empty() {
             reverted.sort();
             emit(&format!(
-                "    ↩️ [SPATIAL RESIDUAL REVERT] 잔차화 후 양수 패치가 0 이 된 카테고리를 원본으로 되돌렸습니다: {} — 페이지 전면이 실제로 그 카테고리인 문서(예: MSDS 전면 hazmat)에서 정상입니다.",
+                "    ↩️ [SPATIAL RESIDUAL REVERT] 잔차화 결과가 목적에 반해 원본으로 되돌린 카테고리: {} — '소멸' 은 페이지 전면이 실제로 그 카테고리인 경우(MSDS 전면 hazmat 등), '확산' 은 잔차 총합이 0 이라 양수가 절반으로 수렴한 경우입니다.",
                 reverted.join(" | ")
             ));
         }

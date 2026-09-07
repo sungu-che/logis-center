@@ -723,21 +723,55 @@ pub fn load(team: &str) {
     println!("[SDS] 📍 통계 파일 경로: {}", sds_path().display());
 }
 
+/// 🌟 [LOCAL TEAM] 로그인 전 로컬 작업이 귀속되는 기본 팀입니다.
+///
+///  ── 왜 상수가 아니라 함수인가 ──
+///   이 값은 model/vision.rs 와 스케줄러가 쓰는
+///     hash_id("0x0000000000000000000000000000000000000000")
+///   와 같은 규칙으로 유도됩니다. 결과 해시를 코드에 적어 두면 두 곳이 갈라지므로
+///   같은 해시 함수를 그대로 재사용합니다. 새 매직 상수가 아닙니다.
+fn local_default_team() -> String {
+    crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000")
+}
+
 /// 팀 식별자가 확정된 뒤(로그인 등) 호출합니다.
-/// 다른 팀의 통계였다면 폐기합니다. 기획 6-4 의 스코프 격리 정책입니다.
+///
+///  ── 무엇이 문제였나 (실측) ──
+///   커머스·트레이딩·비전에서 쌓은 관측은 전부 로컬 기본 팀에 귀속됩니다.
+///   그 뒤 OAuth 로그인이 실제 팀을 확정하면 이 함수가 '팀 전환' 으로 보고
+///   purge() 를 불러 통계를 통째로 지웠습니다.
+///   (실측: score_dynamics.json 의 team 이 바뀌면서 scopes 가 {} 로 비었음)
+///   기획 6-4 는 이 시점을 '폐기' 가 아니라 '마이그레이션' 으로 규정합니다.
+///
+///  ── 이관과 폐기를 가르는 기준 ──
+///   이전 팀이 로컬 기본 팀이면 그 관측은 '아직 주인이 정해지지 않은 내 작업' 이므로
+///   실제 팀으로 이관합니다. 그 외의 팀↔팀 전환은 남의 통계이므로 폐기합니다.
+///   스코프 키는 track|primary|secondary 로만 구성되어 team 을 포함하지 않으므로
+///   이관 시 키를 손댈 필요가 없습니다.
 pub fn rebind_team(team: &str) {
-    let need_reset = SDS
-        .read()
-        .ok()
-        .map(|s| !s.team.is_empty() && s.team != team)
-        .unwrap_or(false);
-    if need_reset {
-        println!("[SDS] 🔄 팀 전환 감지. 이전 팀 통계를 폐기하고 새 팀으로 재바인딩합니다.");
-        purge();
-        load(team);
-    } else if let Ok(mut w) = SDS.write() {
-        w.team = team.to_string();
+    let prev = SDS.read().ok().map(|s| s.team.clone()).unwrap_or_default();
+    if prev.is_empty() || prev == team {
+        if let Ok(mut w) = SDS.write() {
+            w.team = team.to_string();
+        }
+        return;
     }
+    if prev == local_default_team() {
+        let scopes = SDS.read().ok().map(|s| s.scopes.len()).unwrap_or(0);
+        if let Ok(mut w) = SDS.write() {
+            w.team = team.to_string();
+        }
+        if let Ok(mut d) = DIRTY.write() { *d = true; }
+        flush();
+        println!(
+            "[SDS] 🚚 [TEAM MIGRATE] 로컬 기본 팀의 스코프 {}개를 실제 팀 '{}' 로 이관했습니다. (기획 6-4: 로그인은 폐기가 아니라 마이그레이션입니다)",
+            scopes, team
+        );
+        return;
+    }
+    println!("[SDS] 🔄 팀 전환 감지. 이전 팀 통계를 폐기하고 새 팀으로 재바인딩합니다.");
+    purge();
+    load(team);
 }
 
 pub fn flush() {
@@ -786,6 +820,9 @@ pub fn flush() {
     match std::fs::write(&path, txt.as_bytes()) {
         Ok(_) => {
             if let Ok(mut d) = DIRTY.write() { *d = false; }
+            // 🌟 [DEBOUNCE v2] 저장에 성공했으므로 누적 관측 카운터를 0 으로 되돌립니다.
+            //    이 리셋이 없으면 카운터가 임계 이상으로 굳어 매 관측마다 파일을 씁니다.
+            if let Ok(mut t) = WRITE_TICK.write() { *t = 0; }
             println!("[SDS] 💾 점수 동역학 통계를 저장했습니다. ({}바이트)", txt.len());
         }
         Err(e) => println!("[SDS] ⚠️ 통계 저장 실패: {}", e),
@@ -850,27 +887,29 @@ const AUTO_FLUSH_EVERY: u32 = 8;
 const AUTO_FLUSH_MIN_GAP_MS: u128 = 5_000;
 
 fn bump_and_maybe_flush() {
-    // 🌟 [DEBOUNCE] 호출 횟수와 경과 시간을 모두 만족할 때만 씁니다.
+    // 🌟 [DEBOUNCE v2] 호출 횟수와 경과 시간을 모두 만족할 때만 씁니다.
     //
-    //  ── 실측 ──
-    //   한 문서 처리에서 [SDS] 💾 가 약 30회 발생했습니다.
-    //   record_field_seen 이 라벨 23개 × 필드 83개 ≈ 1900회 호출되고
-    //   AUTO_FLUSH_EVERY=64 이므로 산술적으로 맞지만,
-    //   매번 전체 파일을 직렬화하므로 낭비이고 로그를 덮습니다.
+    //  ── v1 의 결함 ──
+    //   v1 은 `*t % AUTO_FLUSH_EVERY == 0` 으로 판정했습니다.
+    //   그래서 8의 배수 시점에 시간 조건에 막히면 그 기회가 그대로 소멸하고,
+    //   다음 기회까지 다시 8회를 세야 했습니다. 커머스처럼 태스크당 관측이
+    //   수십 회뿐인 경로에서는 이 손실 한 번이 '태스크 내내 저장 0회' 로 이어져
+    //   스코프가 메모리에만 남습니다.
     //
-    //  ── 왜 시간 조건을 더하는가 ──
-    //   호출 횟수만으로는 문서 크기에 따라 빈도가 요동칩니다.
-    //   '최소 간격' 을 두면 문서가 크든 작든 I/O 가 일정합니다.
+    //  ── v2 ──
+    //   카운터를 '마지막 저장 이후 누적 관측 수' 로 바꿉니다.
+    //   시간 조건에 막히면 카운터가 유지되므로 다음 관측에서 즉시 재시도됩니다.
+    //   저장에 성공하면 flush() 안에서 0 으로 리셋합니다.
     //   이 값은 판정에 쓰이지 않는 I/O 정책이므로 틀려도 통계가 달라지지 않습니다.
-    //   유실 위험도 없습니다. 태스크 종료 시 flush 가 반드시 한 번 더 돕니다.
     let tick_ok = match WRITE_TICK.write() {
         Ok(mut t) => {
-            *t = t.wrapping_add(1);
-            *t % AUTO_FLUSH_EVERY == 0
+            *t = t.saturating_add(1);
+            *t >= AUTO_FLUSH_EVERY
         }
         Err(_) => false,
     };
     if !tick_ok { return; }
+
     let time_ok = match LAST_FLUSH.read() {
         Ok(g) => match *g {
             Some(inst) => inst.elapsed().as_millis() >= AUTO_FLUSH_MIN_GAP_MS,
@@ -879,6 +918,7 @@ fn bump_and_maybe_flush() {
         Err(_) => false,
     };
     if !time_ok { return; }
+
     if let Ok(mut g) = LAST_FLUSH.write() { *g = Some(std::time::Instant::now()); }
     flush();
 }
@@ -1206,8 +1246,18 @@ pub fn report() -> String {
     let decay_obs: u64 = store.scopes.values().flat_map(|s| s.decay.values()).map(|d| d.margin.n).sum();
     let field_obs: u64 = store.scopes.values().flat_map(|s| s.field.values()).map(|f| f.seen).sum();
     let confusion_obs: u64 = store.scopes.values().flat_map(|s| s.confusion.values()).map(|c| c.ties).sum();
+    // 🌟 [진단 보강] 기존 리포트는 baseline / decay / field / confusion 네 축만 셌습니다.
+    //    그래서 '비전은 도는데 category·spatial 이 안 쌓인다', 'analytic 은 아예 0건이다'
+    //    같은 배선 누락이 리포트만 봐서는 드러나지 않았습니다.
+    //    (실측: 비전 태스크가 spatial 20건을 쌓았는데 리포트는 "베이스라인 5 감쇠 1 필드 2")
+    //    기획 6-1 의 레코드군을 전부 세어, 리포트 한 줄로 배선 구멍을 특정할 수 있게 합니다.
+    let category_obs: u64 = store.scopes.values().flat_map(|s| s.category.values()).map(|c| c.realized_max.n).sum();
+    let spatial_obs: u64 = store.scopes.values().flat_map(|s| s.spatial.values()).map(|s| s.active_ratio.n).sum();
+    let transition_obs: u64 = store.scopes.values().flat_map(|s| s.transition.values()).sum();
+    let axis_obs: u64 = store.scopes.values().flat_map(|s| s.axis_variance.values()).map(|w| w.n).sum();
     format!(
-        "[SDS REPORT] 스코프 {}개 | 베이스라인 관측 {} | 감쇠 관측 {} | 필드 관측 {} | 혼동 관측 {} | (Phase 0: 판정 미개입)",
-        scopes, baseline_obs, decay_obs, field_obs, confusion_obs
+        "[SDS REPORT] 스코프 {}개 | 베이스라인 {} | 감쇠 {} | 축분산 {} | 필드 {} | 혼동 {} | 카테고리 {} | 공간 {} | 전이 {} | (Phase 0: 판정 미개입)",
+        scopes, baseline_obs, decay_obs, axis_obs, field_obs, confusion_obs,
+        category_obs, spatial_obs, transition_obs
     )
 }

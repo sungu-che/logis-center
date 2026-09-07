@@ -2488,6 +2488,17 @@ pub async fn process_task(
             }
             println!("[Scheduler] Classified is_detail as: {} (Form: {:.4}, List: {:.4})", is_detail, form_final, list_final);
             emit_term(&format!("  ✅ Determined Detail Page: {}", is_detail));
+            crate::utils::score_dynamics::record_baseline("commerce.list_final", list_final);
+            crate::utils::score_dynamics::record_baseline("commerce.form_final", form_final);
+            crate::utils::score_dynamics::record_baseline("commerce.detail_margin", (form_final - list_final).abs());
+            crate::utils::score_dynamics::record_decay("commerce.detail_axis", &[list_final.max(form_final), list_final.min(form_final)]);
+            if !page_type.is_empty() {
+                crate::utils::score_dynamics::refine_primary(&format!(
+                    "{}:{}",
+                    page_type,
+                    if is_detail { "detail" } else { "list" }
+                ));
+            }
         }
     }
 
@@ -4205,6 +4216,24 @@ pub async fn process_task(
                     }
                 }
 
+                {
+                    for (f_i, (fname, _, _, _)) in fields.iter().enumerate() {
+                        if field_is_analytic[f_i] { continue; }
+                        crate::utils::score_dynamics::record_field_seen(fname);
+                    }
+                    for l in 0..item_lines_ref.len() {
+                        let mut col: Vec<f32> = Vec::new();
+                        for f_i in 0..fields.len() {
+                            if field_is_analytic[f_i] { continue; }
+                            let s = vector_raw_matrix[f_i][l];
+                            if s < 0.0 { continue; }
+                            col.push(s);
+                        }
+                        if col.len() >= 2 {
+                            crate::utils::score_dynamics::record_decay("commerce.item_row", &col);
+                        }
+                    }
+                }
                 for (f_i, (fname, _, _, _)) in fields.iter().enumerate() {
                     match vector_assignment[f_i] {
                         Some((l, contrast, margin)) => {
@@ -4214,22 +4243,40 @@ pub async fn process_task(
                                 line_enriched_texts[l].as_str()
                             };
                             emit_term(&format!("    🔗 [EXCLUSIVE ASSIGN] '{}' ({:?}) ← Line {} | RawSim: {:.4} | Contrast: {:+.4} | Margin: {:+.4} | \"{}\"", fname, field_formats[f_i], l + 1, vector_raw_matrix[f_i][l], contrast, margin, shown));
-                            // 🌟 [SDS 계측] 배정 마진 분포를 쌓습니다.
-                            //
-                            //  ── 실측 오배정 ──
-                            //   'title'      ← "상품명 > 카테고리 | 패션의류/잡화/뷰티" (+0.0769)
-                            //   'color'      ← "관리 | 수정"                          (+0.0393)
-                            //   'sale_price' ← "1 | 13"                               (+0.0075)
-                            //   전부 틀렸는데 마진이 양수라 통과했습니다.
-                            //   커머스에는 exclusive_assign 의 고정 마진(0.005)만 있고
-                            //   트레이딩의 T-2 잡음 마진 게이트가 없습니다.
-                            //   이 분포가 쌓여야 잡음 마진 기준선을 유도해 이식할 수 있습니다.
                             crate::utils::score_dynamics::record_field_assigned(fname, margin);
+                            let mut rival_name = String::new();
+                            let mut rival_score = f32::MIN;
+                            for (g_i, (gname, _, _, _)) in fields.iter().enumerate() {
+                                if g_i == f_i { continue; }
+                                if field_is_analytic[g_i] { continue; }
+                                let s = vector_raw_matrix[g_i][l];
+                                if s < 0.0 { continue; }
+                                if s > rival_score {
+                                    rival_score = s;
+                                    rival_name = gname.clone();
+                                }
+                            }
+                            if !rival_name.is_empty() {
+                                let own = vector_raw_matrix[f_i][l];
+                                crate::utils::score_dynamics::record_confusion(
+                                    fname,
+                                    &rival_name,
+                                    (own - rival_score).abs(),
+                                );
+                            }
                         },
                         None => {
                             if !field_is_analytic[f_i] {
                                 let cand_cnt = vector_raw_matrix[f_i].iter().filter(|&&v| v >= 0.0).count();
                                 emit_term(&format!("    ⚪ [UNASSIGNED] '{}' ({:?}) | 형식 통과 후보 {}개 | 벡터 힌트 미주입", fname, field_formats[f_i], cand_cnt));
+                                if cand_cnt == 0 {
+                                    crate::utils::score_dynamics::record_field_reject(
+                                        fname,
+                                        crate::utils::score_dynamics::GateKind::Format,
+                                    );
+                                } else {
+                                    crate::utils::score_dynamics::record_near_miss(fname);
+                                }
                             }
                         }
                     }
@@ -4349,28 +4396,16 @@ pub async fn process_task(
                         FieldFormat::Date | FieldFormat::TrackingCode | FieldFormat::Numeric | FieldFormat::Identifier | FieldFormat::Link
                     );
                     if !field_is_analytic[f_idx] && strict_format_field && !has_vector_match {
-                        
-                        //
-                        
-                        
-                        
-                        
-                        
-                        
-                        
-                        
-                        //
-                        
-                        
-                        
-                        
-                        
                         let leftover: Vec<usize> = (0..item_lines_ref.len())
                             .filter(|&l| vector_raw_matrix[f_idx][l] >= 0.0)
                             .filter(|&l| !vector_assignment.iter().any(|a| matches!(a, Some((al, _, _)) if *al == l)))
                             .collect();
                         if leftover.is_empty() {
                             emit_term(&format!("    ⛔ [FORMAT SKIP] Field: '{}' ({:?}) | 형식 게이트를 통과한 후보 셀이 이 아이템에 하나도 없습니다. LLM 호출 없이 빈 값으로 확정.", field_name, field_format));
+                            crate::utils::score_dynamics::record_field_reject(
+                                &field_name,
+                                crate::utils::score_dynamics::GateKind::Format,
+                            );
                             continue;
                         }
                         let mut pick: Option<(usize, f32, f32)> = None;
@@ -4402,9 +4437,15 @@ pub async fn process_task(
                                 has_vector_match = true;
                                 vector_assignment[f_idx] = Some((l, own, gap));
                                 emit_term(&format!("    ♻️ [SECOND CHANCE ASSIGN] '{}' ({:?}) ← Line {} | RawSim: {:.4} | 경쟁 필드 대비 우위: {:+.4} | 남은 후보 {}개 중 선택", field_name, field_format, l + 1, own, gap, leftover.len()));
+                                crate::utils::score_dynamics::record_field_assigned(&field_name, gap);
+                                crate::utils::score_dynamics::record_baseline("commerce.second_chance_gap", gap);
                             }
                             None => {
                                 emit_term(&format!("    ⛔ [FORMAT SKIP] Field: '{}' ({:?}) | 형식 통과 후보 {}개가 모두 경쟁 필드에 더 가까워 배정을 포기합니다. (잘못 채우는 것보다 공란이 안전합니다)", field_name, field_format, leftover.len()));
+                                crate::utils::score_dynamics::record_field_reject(
+                                    &field_name,
+                                    crate::utils::score_dynamics::GateKind::Prejudice,
+                                );
                                 continue;
                             }
                         }
@@ -4701,6 +4742,11 @@ pub async fn process_task(
                                             );
                                             if strict_post && !extracted_str.is_empty() && !value_matches_format(key_fmt, &extracted_str) {
                                                 emit_term(&format!("    🚫 [FORMAT REJECT] '{}' ({:?}) 에 형식 불일치 값 '{}' 반환. 폐기 후 재시도합니다.", k, key_fmt, extracted_str));
+                                                crate::utils::score_dynamics::record_field_seen(k);
+                                                crate::utils::score_dynamics::record_field_reject(
+                                                    k,
+                                                    crate::utils::score_dynamics::GateKind::Format,
+                                                );
                                                 requires_retry = true;
                                                 extracted_values_for_retry.push(extracted_str.clone());
                                                 continue;
@@ -4767,11 +4813,18 @@ pub async fn process_task(
 
                                 if requires_retry {
                                     miss_counter += 1;
+                                    crate::utils::score_dynamics::record_baseline("commerce.llm_retry", miss_counter as f32);
                                     if miss_counter > 3 {
                                         emit_term(&format!("    ⏭️ Skipping field {} due to persistent hallucination or empty value.", field_name_clone));
+                                        crate::utils::score_dynamics::record_field_seen(&field_name_clone);
+                                        crate::utils::score_dynamics::record_field_reject(
+                                            &field_name_clone,
+                                            crate::utils::score_dynamics::GateKind::Enum,
+                                        );
                                         break; 
                                     }
                                     emit_term(&format!("    ⚠️ Hallucination or empty value detected for field {}. Retrying... ({}/3)", field_name_clone, miss_counter));
+                                    crate::utils::score_dynamics::record_near_miss(&field_name_clone);
                                     for ex_str in extracted_values_for_retry {
                                         ignore_list.push(ex_str.clone());
                                         ignore_list.push(format!(" {}", ex_str));
@@ -6256,15 +6309,62 @@ pub async fn process_task(
                 }
             }
 
+            {
+                for (f_i, (fname, _, _, _)) in fields.iter().enumerate() {
+                    if field_is_analytic[f_i] { continue; }
+                    crate::utils::score_dynamics::record_field_seen(fname);
+                }
+                for l in 0..pug_lines_ref.len() {
+                    let mut col: Vec<f32> = Vec::new();
+                    for f_i in 0..fields.len() {
+                        if field_is_analytic[f_i] { continue; }
+                        let s = vector_raw_matrix[f_i][l];
+                        if s < 0.0 { continue; }
+                        col.push(s);
+                    }
+                    if col.len() >= 2 {
+                        crate::utils::score_dynamics::record_decay("commerce.detail_row", &col);
+                    }
+                }
+            }
             for (f_i, (fname, _, _, _)) in fields.iter().enumerate() {
                 match vector_assignment[f_i] {
                     Some((l, contrast, margin)) => {
                         emit_term(&format!("  🔗 [EXCLUSIVE ASSIGN] '{}' ({:?}) ← Line {} | RawSim: {:.4} | Contrast: {:+.4} | Margin: {:+.4} | \"{}\"", fname, field_formats[f_i], l + 1, vector_raw_matrix[f_i][l], contrast, margin, pug_lines_ref[l].trim()));
+                        crate::utils::score_dynamics::record_field_assigned(fname, margin);
+                        let mut rival_name = String::new();
+                        let mut rival_score = f32::MIN;
+                        for (g_i, (gname, _, _, _)) in fields.iter().enumerate() {
+                            if g_i == f_i { continue; }
+                            if field_is_analytic[g_i] { continue; }
+                            let s = vector_raw_matrix[g_i][l];
+                            if s < 0.0 { continue; }
+                            if s > rival_score {
+                                rival_score = s;
+                                rival_name = gname.clone();
+                            }
+                        }
+                        if !rival_name.is_empty() {
+                            let own = vector_raw_matrix[f_i][l];
+                            crate::utils::score_dynamics::record_confusion(
+                                fname,
+                                &rival_name,
+                                (own - rival_score).abs(),
+                            );
+                        }
                     },
                     None => {
                         if !field_is_analytic[f_i] {
                             let cand_cnt = vector_raw_matrix[f_i].iter().filter(|&&v| v >= 0.0).count();
                             emit_term(&format!("  ⚪ [UNASSIGNED] '{}' ({:?}) | 형식 통과 후보 {}개 | 벡터 힌트 미주입", fname, field_formats[f_i], cand_cnt));
+                            if cand_cnt == 0 {
+                                crate::utils::score_dynamics::record_field_reject(
+                                    fname,
+                                    crate::utils::score_dynamics::GateKind::Format,
+                                );
+                            } else {
+                                crate::utils::score_dynamics::record_near_miss(fname);
+                            }
                         }
                     }
                 }
@@ -6395,6 +6495,10 @@ pub async fn process_task(
                 );
                 if !field_is_analytic[idx] && strict_format_field && !has_vector_match {
                     emit_term(&format!("  ⛔ [FORMAT SKIP] Field: '{}' ({:?}) | 형식에 맞는 후보 셀이 문서에 존재하지 않습니다. LLM 호출 없이 빈 값으로 확정.", field_name, field_format));
+                    crate::utils::score_dynamics::record_field_reject(
+                        &field_name,
+                        crate::utils::score_dynamics::GateKind::Format,
+                    );
                     continue;
                 }
 
@@ -6662,6 +6766,11 @@ pub async fn process_task(
                                         );
                                         if strict_post && !extracted_str.is_empty() && !value_matches_format(key_fmt, &extracted_str) {
                                             emit_term(&format!("  🚫 [FORMAT REJECT] '{}' ({:?}) 에 형식 불일치 값 '{}' 반환. 폐기 후 재시도합니다.", k, key_fmt, extracted_str));
+                                            crate::utils::score_dynamics::record_field_seen(k);
+                                            crate::utils::score_dynamics::record_field_reject(
+                                                k,
+                                                crate::utils::score_dynamics::GateKind::Format,
+                                            );
                                             requires_retry = true;
                                             extracted_values_for_retry.push(extracted_str.clone());
                                             continue;
@@ -6729,11 +6838,18 @@ pub async fn process_task(
 
                             if requires_retry {
                                 miss_counter += 1;
+                                crate::utils::score_dynamics::record_baseline("commerce.llm_retry", miss_counter as f32);
                                 if miss_counter > 3 {
                                     emit_term(&format!("  ⏭️ Skipping field {} due to persistent hallucination or empty value.", field_name_clone));
+                                    crate::utils::score_dynamics::record_field_seen(&field_name_clone);
+                                    crate::utils::score_dynamics::record_field_reject(
+                                        &field_name_clone,
+                                        crate::utils::score_dynamics::GateKind::Enum,
+                                    );
                                     break; 
                                 }
                                 emit_term(&format!("  ⚠️ Hallucination or empty value detected for field {}. Retrying... ({}/3)", field_name_clone, miss_counter));
+                                crate::utils::score_dynamics::record_near_miss(&field_name_clone);
                                 for ex_str in extracted_values_for_retry {
                                     ignore_list.push(ex_str.clone());
                                     ignore_list.push(format!(" {}", ex_str));

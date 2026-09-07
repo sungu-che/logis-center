@@ -1544,6 +1544,9 @@ async fn extract_continuation_page(
             "    ✨ [CONTINUATION ASSIGN] Label '{}' → Field '{}' (cat: {}) | Score: {:+.4} | Margin: {:+.4} | Line {} | Value: \"{}\"",
             labels[h], fname, cat, own, margin, lines[h] + 1, vals[h]
         ));
+        crate::utils::score_dynamics::record_field_seen(&fname);
+        crate::utils::score_dynamics::record_field_assigned(&fname, margin);
+        crate::utils::score_dynamics::record_baseline("trading.continuation_margin", margin);
     }
     // 🌟 [COUNT] 행 필드는 위 루프에서 이미 assigned 에 반영되었습니다. 여기서 다시 더하지 않습니다.
     if !item_row.is_empty() {
@@ -1953,6 +1956,24 @@ pub async fn process_trading_task(
             if verdict.self_id_top == f32::MIN { "없음".to_string() } else { format!("{:+.4}", verdict.self_id_top) },
             if verdict.is_standalone { "독립 문서" } else { "앞 문서의 연속" }
         ));
+        {
+            if verdict.title_top != f32::MIN {
+                crate::utils::score_dynamics::record_baseline("trading.continuation_title_top", verdict.title_top);
+            }
+            if verdict.self_id_top != f32::MIN {
+                crate::utils::score_dynamics::record_baseline("trading.continuation_selfid_top", verdict.self_id_top);
+            }
+            crate::utils::score_dynamics::record_baseline(
+                "trading.continuation_standalone",
+                if verdict.is_standalone { 1.0 } else { 0.0 },
+            );
+            let a = if verdict.title_top == f32::MIN { 0.0 } else { verdict.title_top };
+            let b = if verdict.self_id_top == f32::MIN { 0.0 } else { verdict.self_id_top };
+            crate::utils::score_dynamics::record_decay(
+                "trading.page_identity",
+                &[a.max(b), a.min(b)],
+            );
+        }
         if !verdict.is_standalone {
             let prev_type = page_results.last().map(|(t, _, _)| t.clone()).unwrap_or_default();
             let prev_lang = page_results.last().map(|(_, l, _)| l.clone()).unwrap_or_else(|| doc_lang.clone());
@@ -3509,6 +3530,69 @@ pub async fn process_trading_task(
             for f in t_field_names.iter() {
                 if !present.contains(f) { absent_fields.insert(f.clone()); }
             }
+            // 🌟 [SDS / T-1 → 기획 T-4 입력] 카테고리별 실현 최댓값과 실효 필드 수
+            //
+            //  ── 무엇이 문제였나 (실측) ──
+            //   이 게이트는 (필드 × 증거) 행렬 net 을 이미 만들어 두고
+            //   카테고리 argmax 분포를 세는데, 그 값이 전부 emit_term 문자열로만
+            //   소비되고 통계로 가지 않았습니다.
+            //   그래서 trading 스코프의 category 가 {} 로 비어 있고,
+            //   기획 T-4 의 N_eff 캘리브레이션은 입력이 없어 착수 자체가 불가능했습니다.
+            //   같은 관측을 비전 경로(vision_encoder.rs)는 이미 남기고 있습니다.
+            //
+            //  ── 왜 '실현 최댓값' 인가 ──
+            //   CATEGORY-NEUTRAL 은 gumbel_expected_z(N) 으로 카테고리 크기 편향을
+            //   보정하는데, 이때 N 을 '스키마상 필드 수' 로 가정합니다.
+            //   그런데 같은 카테고리의 필드들은 동의어로 상관되어 있어
+            //   실효 드로잉 수 N_eff < N 입니다.
+            //   실현 최댓값의 분포를 쌓아 두면 그 분포에서 N_eff 를 역산할 수 있고,
+            //   구조가 아니라 실측이 보정치를 정하게 됩니다.
+            //
+            //  ── n_fields 를 keys 기준으로 세는 이유 ──
+            //   t_field_names 에는 라벨 뱅크가 비어 임베딩이 만들어지지 않은 필드도 있습니다.
+            //   그런 필드는 이 행렬에 열로 존재하지 않으므로 드로잉에 참여하지 않았습니다.
+            //   실제로 경쟁한 키만 세야 N 과 실현 최댓값의 짝이 맞습니다.
+            //
+            //  ── Phase 0 원칙 ──
+            //   present / absent_fields 판정에는 전혀 손대지 않습니다. 관측만 추가합니다.
+            {
+                let mut sds_cat_fields: std::collections::HashMap<String, std::collections::HashSet<String>> =
+                    std::collections::HashMap::new();
+                let mut sds_cat_max: std::collections::HashMap<String, f32> =
+                    std::collections::HashMap::new();
+                for ki in 0..keys.len() {
+                    let c = key_cat[ki].clone();
+                    if c == "-" { continue; }
+                    sds_cat_fields.entry(c.clone()).or_default().insert(keys[ki].clone());
+                    let mut m = f32::MIN;
+                    for ei in 0..evidence.len() {
+                        let v = net[ki][ei];
+                        if v == f32::MIN { continue; }
+                        if v > m { m = v; }
+                    }
+                    if m == f32::MIN { continue; }
+                    let e = sds_cat_max.entry(c).or_insert(f32::MIN);
+                    if m > *e { *e = m; }
+                }
+                for (c, m) in sds_cat_max.iter() {
+                    let n = sds_cat_fields.get(c).map(|s| s.len()).unwrap_or(0);
+                    if n == 0 { continue; }
+                    crate::utils::score_dynamics::record_category_max(c, n, *m);
+                }
+                // 게이트 자체의 규모도 남깁니다.
+                // 증거가 몇 개일 때 부재 판정이 얼마나 나오는지가
+                // '이 게이트가 과도하게 필드를 잘라내는가' 의 유일한 근거입니다.
+                crate::utils::score_dynamics::record_baseline(
+                    "trading.presence_evidence",
+                    evidence.len() as f32,
+                );
+                if !t_field_names.is_empty() {
+                    crate::utils::score_dynamics::record_baseline(
+                        "trading.presence_absent_ratio",
+                        absent_fields.len() as f32 / t_field_names.len() as f32,
+                    );
+                }
+            }
             let mut hit_summary: Vec<String> = cat_hits.iter()
                 .map(|(c, n)| format!("{}({})", c, n)).collect();
             hit_summary.sort();
@@ -3661,11 +3745,21 @@ pub async fn process_trading_task(
             
             if let Some(obj) = tile_json.as_object_mut() {
                 let ks: Vec<String> = obj.keys().cloned().collect();
+                let mut protected = 0usize;
                 for k in ks {
                     if assigned_fields.contains_key(&k) {
                         obj.remove(&k);
                         emit_term(&format!("    🛡️ [PLINKO PROTECT] '{}' 는 결정론 확정값을 유지하고 LLM 결과를 폐기합니다.", k));
+                        crate::utils::score_dynamics::record_field_seen(&k);
+                        crate::utils::score_dynamics::record_near_miss(&k);
+                        protected += 1;
                     }
+                }
+                if protected > 0 {
+                    crate::utils::score_dynamics::record_baseline(
+                        "trading.llm_override_blocked",
+                        protected as f32,
+                    );
                 }
             }
             if !absent_fields.is_empty() {

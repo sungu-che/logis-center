@@ -267,6 +267,29 @@ pub fn verify_claims_v2(
         }
         let (lg, il, bl) = legibility.count_in_bbox(c.bbox, orig_w, orig_h);
         let accepted = lg > 0;
+        // 🌟 [SDS / V-4 입력] 출처 영역의 판독성 구성입니다.
+        //
+        //  ── 왜 남기는가 ──
+        //   기획 V-4 는 '흐린 패치의 낮은 코사인' 과 '선명한 패치의 낮은 코사인' 을
+        //   같은 값으로 취급하는 문제를 지적합니다. 그 판정을 하려면
+        //   '이 값의 출처가 얼마나 읽을 만했는가' 라는 분포가 있어야 하는데,
+        //   지금은 이 삼분값이 로그로만 흘러가고 통계에 남지 않았습니다.
+        //
+        //  ── 폐기 여부와 무관하게 남기는 이유 ──
+        //   accepted 인 값의 출처 품질까지 있어야 '판독성이 낮을수록
+        //   접지가 실패하는가' 를 상관으로 확인할 수 있습니다.
+        //   폐기 건만 모으면 분포가 한쪽 꼬리만 남습니다.
+        {
+            let total = (lg + il + bl).max(1) as f32;
+            crate::utils::score_dynamics::record_baseline(
+                "vision.source_legible_ratio",
+                lg as f32 / total,
+            );
+            crate::utils::score_dynamics::record_baseline(
+                "vision.source_blank_ratio",
+                bl as f32 / total,
+            );
+        }
         if !accepted {
             rejected += 1;
             emit(&format!(
@@ -285,6 +308,23 @@ pub fn verify_claims_v2(
             accepted,
             reason: if accepted { String::new() } else { "출처 영역에 읽을 내용이 없음".to_string() },
         });
+    }
+    {
+        let mut ratios: Vec<f32> = Vec::new();
+        for c in claims {
+            let (lg, il, bl) = legibility.count_in_bbox(c.bbox, orig_w, orig_h);
+            let total = (lg + il + bl).max(1) as f32;
+            ratios.push(lg as f32 / total);
+        }
+        if ratios.len() >= 2 {
+            crate::utils::score_dynamics::record_decay("vision.grounding", &ratios);
+        }
+        if !ratios.is_empty() {
+            crate::utils::score_dynamics::record_baseline(
+                "vision.grounding_reject_ratio",
+                rejected as f32 / claims.len().max(1) as f32,
+            );
+        }
     }
     emit(&format!(
         "  ✅ [VALUE GROUNDING v2] 검증 {}건 | 유지 {} | 폐기 {}",

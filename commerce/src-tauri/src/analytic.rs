@@ -723,6 +723,37 @@ pub async fn run_analytic_structuring(
         target_pug = model.truncate_pug_context(&target_pug, true, 1200, None).await;
         related_pug = model.truncate_pug_context(&related_pug, true, 2400, None).await;
 
+        // 🌟 [SDS SCOPE / analytic]
+        //
+        //  ── 무엇이 문제였나 (실측) ──
+        //   이 함수에는 enter_scope 가 한 번도 없었습니다. 그래서
+        //   U-1 이 이미 호출하고 있는 record_baseline("analytic.episodes_per_group") 조차
+        //   'unscoped' 로 떨어지거나 버려졌고, score_dynamics.json 의 scopes 가 {} 였습니다.
+        //
+        //  ── 왜 함수 진입부가 아니라 여기인가 ──
+        //   run_analytic_structuring 은 서로 다른 사이트(cc)·페이지(ref)의 이벤트를
+        //   한 번에 순회합니다. 진입부에서 한 번만 세우면 모든 사이트의 관측이
+        //   한 스코프에 뭉쳐, 기획 2-3 이 정한 analytic 1차 스코프(cc)가 무의미해집니다.
+        //   enter_scope 는 단순 덮어쓰기라 refine_primary 처럼 이관이 일어나지 않으므로
+        //   문서마다 갈아끼워도 이전 스코프의 관측이 오염되지 않습니다.
+        crate::utils::score_dynamics::enter_scope(
+            "",
+            crate::utils::score_dynamics::Track::Analytic,
+            &doc.cc,
+            &doc.r#ref,
+        );
+        // 🌟 [Phase 0 관측] PUG 접기 결과의 구조 밀도입니다.
+        //    '요약이 실패하는 문서는 애초에 읽을 라인이 없었다' 를 나중에 확인하기 위한 사실이며,
+        //    판정에는 전혀 쓰이지 않습니다.
+        crate::utils::score_dynamics::record_baseline(
+            "analytic.pug_lines",
+            target_pug.lines().filter(|l| !l.trim().is_empty()).count() as f32,
+        );
+        crate::utils::score_dynamics::record_baseline(
+            "analytic.related_pug_lines",
+            related_pug.lines().filter(|l| !l.trim().is_empty()).count() as f32,
+        );
+
         emit_term(&format!(
             "  🧩 [SEMANTIC PUG] id='{}' | type='{}' | link='{}'\n{}",
             doc.id, doc.r#type, link, target_pug.trim()
@@ -784,6 +815,16 @@ pub async fn run_analytic_structuring(
             .unwrap_or_default();
 
         if action.is_empty() && summary.is_empty() {
+            // 🌟 [SDS] LLM 이 값을 만들지 못한 사실은 판정과 독립된 신호입니다.
+            //    기획 T-3 의 '거절 트레이스' 와 같은 계보이며, 학습 특이도의 입력이 됩니다.
+            //    GateKind::Format 을 재사용하는 이유는 merge.rs 와 동일합니다.
+            //    전용 종류를 추가하면 열거형이 늘어 파일 스키마가 바뀌고
+            //    SDS_RECIPE 세대 무효화가 필요해지므로 기존 축을 씁니다.
+            crate::utils::score_dynamics::record_field_seen("action");
+            crate::utils::score_dynamics::record_field_reject(
+                "action",
+                crate::utils::score_dynamics::GateKind::Format,
+            );
             emit_term(&format!(
                 "  ⚠️ [ANALYTIC EMPTY] id='{}' 요약 결과가 비어 있어 이번 라운드에서는 확정하지 않습니다.",
                 doc.id
@@ -860,11 +901,28 @@ pub async fn run_analytic_structuring(
             )
             .await;
 
+        // 🌟 [SDS / analytic 구조화 관측]
+        //  Phase 0 이므로 판정에는 전혀 개입하지 않고 사실만 남깁니다.
+        //   · action_len   : 행동 문장의 길이. 너무 짧으면 요약 실패의 전조입니다.
+        //   · relate_count : 관련 요소 수. U-1 에피소드 분할의 문맥 밀도 지표입니다.
+        //   · field(action): 위 EMPTY 분기와 짝을 이루는 분모입니다.
+        //     이 분모가 없으면 learned_specificity 가 '거절률 100%' 라는 거짓값을 냅니다.
+        //     (실측: 비전 트랙이 정확히 그 상태입니다 — seen == reject, assigned == 0)
+        crate::utils::score_dynamics::record_baseline(
+            "analytic.action_len",
+            action.chars().count() as f32,
+        );
+        crate::utils::score_dynamics::record_baseline(
+            "analytic.relate_count",
+            relate.len() as f32,
+        );
+        crate::utils::score_dynamics::record_field_seen("action");
+        crate::utils::score_dynamics::record_field_assigned("action", 0.0);
+
         emit_term(&format!(
             "  ✅ [ANALYTIC STRUCTURED] id='{}' | action=\"{}\" | relate={}건",
             doc.id, action, relate.len()
         ));
-
         processed += 1;
 
         let group_key = format!("{}|{}", doc.from, doc.r#ref);
@@ -970,6 +1028,36 @@ pub async fn run_analytic_structuring(
         let env_doc = match flow_envelope.get(&group_key) { Some(d) => d.clone(), None => continue };
         records.sort_by_key(|r| r.get("at").and_then(|v| v.as_i64()).unwrap_or(0));
         if records.len() > 24 { records.truncate(24); }
+
+        // 🌟 [SDS SCOPE / analytic 흐름]
+        //  문서 루프에서 마지막으로 세운 스코프가 이 그룹의 것이라는 보장이 없습니다.
+        //  flow_groups 는 HashMap 이라 순회 순서가 문서 처리 순서와 무관합니다.
+        //  그룹의 봉투 문서로 스코프를 다시 확정합니다.
+        crate::utils::score_dynamics::enter_scope(
+            "",
+            crate::utils::score_dynamics::Track::Analytic,
+            &env_doc.cc,
+            &env_doc.r#ref,
+        );
+        crate::utils::score_dynamics::record_baseline(
+            "analytic.flow_records",
+            records.len() as f32,
+        );
+        // 🌟 [U-2 입력] 이벤트 타입 전이입니다.
+        //  기획 U-2 의 1차 마르코프 전이 사전은 record_transition 이 유일한 입력인데,
+        //  현재 코드베이스 어디에서도 이 함수가 호출되지 않아 영원히 냉간 상태였습니다.
+        //  (실측: 전 스코프의 transition 이 {} )
+        //  검색 경로의 도메인 전이와 키가 섞이지 않도록 'evt:' 접두어를 붙입니다.
+        //  transition_prior 는 "from>" 접두 매칭으로 분모를 세므로 접두어가 있어도 동작합니다.
+        for w in records.windows(2) {
+            let a = w[0].get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let b = w[1].get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if a.is_empty() || b.is_empty() { continue; }
+            crate::utils::score_dynamics::record_transition(
+                &format!("evt:{}", a),
+                &format!("evt:{}", b),
+            );
+        }
 
         // 🌟 [U-1] 의도 에피소드로 분할합니다.
         //    임베딩이 없으면(진입 실패 등) 단일 구간이 되어 기존 동작과 동일합니다.
@@ -1115,6 +1203,14 @@ pub async fn run_analytic_structuring(
             .last()
             .and_then(|r| r.get("at").and_then(|v| v.as_i64()))
             .unwrap_or(now_ts);
+        // 🌟 [SDS / U-1 관측] 에피소드의 실제 시간 폭입니다.
+        //  기획 U-3 의 시간 감쇠 반감기는 '경과 시간 분포의 중앙값' 에서 유도되는데,
+        //  그 분포를 만들 관측이 지금까지 한 건도 없었습니다.
+        //  여기서 쌓아 두면 U-3 착수 시점에 λ 를 상수 없이 확정할 수 있습니다.
+        crate::utils::score_dynamics::record_baseline(
+            "analytic.episode_span_ms",
+            (ep_ended - ep_started).max(0) as f32,
+        );
         let report_data = json!({
             "id": report_id.clone(),
             "type": "report",
@@ -1161,10 +1257,26 @@ pub async fn run_analytic_structuring(
         ));
         } // for (ep_idx, (seg_start, seg_end)) in segments
     }
+    // 🌟 [SDS] 구조화 태스크 경계에서 관측을 확정합니다.
+    //
+    //  ── 왜 여기인가 ──
+    //   이 함수는 process_analytic_task 와 스케줄러 폴링 양쪽에서 호출되는데,
+    //   폴링 경로에는 태스크 종료 훅이 없습니다. 함수 자신이 경계를 책임집니다.
+    //
+    //  ── 중간 return 을 덮지 못하지만 유실은 아닙니다 ──
+    //   위쪽 조기 return(대상 0건 / 사전 필터 통과 0건 / 모델 확보 실패)은
+    //   enter_scope 이전이라 남길 관측 자체가 없고,
+    //   cancel·busy break 는 루프를 빠져나와 이 지점을 지나갑니다.
+    //   설령 놓치더라도 DIRTY=true 로 메모리에 남아 다음 flush 가 기록합니다.
+    emit_term(&format!("[ANALYTIC] {}", crate::utils::score_dynamics::report()));
+    crate::utils::score_dynamics::flush();
+    crate::utils::score_dynamics::leave_scope();
+
     emit_term(&format!(
         "[ANALYTIC] ✅ 구조화 완료: {}건. 로컬 임베딩 파이프라인이 이어서 벡터화합니다.",
         processed
     ));
+
     Ok(processed)
 }
 
@@ -2020,6 +2132,21 @@ pub async fn parse_analytic_search_query(
         "[ANALYTIC-QUERY] ✅ 파싱 결과: {}",
         serde_json::to_string(&out).unwrap_or_default()
     ));
+
+    // 🌟 [SDS] 검색 경로는 enter_scope 만 있고 해제가 없었습니다.
+    //
+    //  ── 왜 위험한가 ──
+    //   스코프가 살아 있는 채로 함수를 빠져나가면, 이어서 돌아가는
+    //   백그라운드 인덱싱·구조화의 관측이 'analytic|query|' 로 잘못 귀속됩니다.
+    //   Track 이 Analytic 으로 굳으면 Track::min_obs() 도 analytic 기준(40/15/0)이 적용되어
+    //   커머스 통계가 영원히 발동 임계에 도달하지 못합니다.
+    //
+    //  ── 중간 `?` 조기 반환은 덮지 못합니다 ──
+    //   secure_vram_relay 실패는 에러 경로라 여기에 도달하지 않지만,
+    //   그 경우 다음 태스크의 enter_scope 가 스코프를 덮어쓰므로 오염이 1회로 끝납니다.
+    emit_term(&format!("[ANALYTIC-QUERY] {}", crate::utils::score_dynamics::report()));
+    crate::utils::score_dynamics::flush();
+    crate::utils::score_dynamics::leave_scope();
 
     Ok(out)
 }

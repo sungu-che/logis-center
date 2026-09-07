@@ -61,7 +61,7 @@ impl crate::model::LogisModel {
             "",
             crate::utils::score_dynamics::Track::Vision,
             "unknown",
-            &search_mode,
+            "",
         );
         emit_term("[STAGE-1] Preparing SigLIP2 Vision Encoder + Qwen3.5 (2B)...");
 
@@ -439,24 +439,26 @@ impl crate::model::LogisModel {
                             return Ok(());
                         }
 
-                        // 🌟 [EMPTY CROP SKIP] 출처 영역에 읽을 것이 없으면 Qwen 호출 자체를 생략합니다.
-                        //    실측: insurance 타일은 판독 가능 패치 0/10 인데 2048x512 로 2회 호출되어
-                        //    "Apr-19-2022" 를 지어냈습니다. 확대는 빈 영역에 정보를 만들지 못합니다.
                         let (lg_cnt, _il_cnt, _bl_cnt) =
                             legibility.count_in_bbox(plan.bbox, grid.orig_width, grid.orig_height);
-
+                        crate::utils::score_dynamics::record_baseline(
+                            "vision.crop_legible_patches",
+                            lg_cnt as f32,
+                        );
                         if lg_cnt == 0 {
                             emit_term(&format!(
                                 "    🚫 [EMPTY CROP SKIP] '{}' 는 판독 가능 패치가 0개입니다. Qwen 호출을 생략합니다.",
                                 plan.category
                             ));
+                            crate::utils::score_dynamics::record_baseline("vision.empty_crop_skip", 1.0);
                             continue;
                         }
+                        crate::utils::score_dynamics::record_baseline("vision.empty_crop_skip", 0.0);
 
-                        // 🌟 [TILE DECISION] 점수 기준으로만 분할합니다. 무조건 쪼개지 않습니다.
                         let (tile_count, _why) = crate::models::siglip2::vision_crop::decide_tile_count(
                             plan, &heatmaps, &grid, &legibility, &emit_term
                         );
+                        crate::utils::score_dynamics::record_baseline("vision.tile_count", tile_count as f32);
                         let tiles = crate::models::siglip2::vision_crop::plan_overlap_tiles(
                             plan.bbox, tile_count, 0.25
                         );
@@ -526,13 +528,41 @@ impl crate::model::LogisModel {
 
                             // 🌟 병합 '전' 에 이 타일이 주장한 값을 출처 bbox 와 함께 기록합니다.
                             //    STEP 6 이 이 목록으로 접지 검증을 수행합니다.
+                            {
+                                let mut filled = 0usize;
+                                let mut total = 0usize;
+                                let mut count_obj = |o: &serde_json::Map<String, Value>,
+                                                     filled: &mut usize,
+                                                     total: &mut usize| {
+                                    for (_, v) in o.iter() {
+                                        *total += 1;
+                                        let empty = v.is_null()
+                                            || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false);
+                                        if !empty { *filled += 1; }
+                                    }
+                                };
+                                if let Some(o) = tile_json.as_object() {
+                                    count_obj(o, &mut filled, &mut total);
+                                } else if let Some(a) = tile_json.as_array() {
+                                    for e in a.iter() {
+                                        if let Some(o) = e.as_object() {
+                                            count_obj(o, &mut filled, &mut total);
+                                        }
+                                    }
+                                }
+                                if total > 0 {
+                                    crate::utils::score_dynamics::record_baseline(
+                                        "vision.crop_yield",
+                                        filled as f32 / total as f32,
+                                    );
+                                }
+                            }
                             record_grounding_claims(
                                 &mut grounding_claims,
                                 &plan.category,
                                 &tile_json,
                                 tile.bbox,
                             );
-
                             merge_extracted(&mut final_data_map, &plan.category, &tile_json, &emit_term);
                         }
                     }

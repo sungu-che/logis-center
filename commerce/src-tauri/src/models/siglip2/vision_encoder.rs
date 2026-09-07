@@ -1588,17 +1588,10 @@ pub fn build_column_heatmaps(
             grid_rows, grid_cols, applied,
             if detail.is_empty() { "-".to_string() } else { detail.join(" | ") }
         ));
-        if !skipped.is_empty() {
-            skipped.sort();
-            emit(&format!(
-                "    ⏭️ [SPATIAL RESIDUAL SKIP] 확산 게이트 이하라 원본을 유지한 카테고리 {}개: {} — 이미 뾰족한 히트맵을 잔차화하면 오히려 평평해집니다.",
-                skipped.len(), skipped.join(" | ")
-            ));
-        }
         if !reverted.is_empty() {
             reverted.sort();
             emit(&format!(
-                "    ↩️ [SPATIAL RESIDUAL REVERT] 잔차화 결과가 목적에 반해 원본으로 되돌린 카테고리: {} — '소멸' 은 페이지 전면이 실제로 그 카테고리인 경우(MSDS 전면 hazmat 등), '확산' 은 잔차 총합이 0 이라 양수가 절반으로 수렴한 경우입니다.",
+                "    ↩️ [SPATIAL RESIDUAL REVERT] 잔차화 후 양수 패치가 0 이 된 카테고리를 원본으로 되돌렸습니다: {} — 페이지 전면이 실제로 그 카테고리인 문서(예: MSDS 전면 hazmat)에서 정상입니다.",
                 reverted.join(" | ")
             ));
         }

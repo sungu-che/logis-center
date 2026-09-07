@@ -52,7 +52,9 @@ use std::sync::RwLock;
 //    store.rs 의 SCHEMA_VERSION / embed_recipe_v3 와 동일한 방어입니다.
 //    이 문자열이 달라지면 저장된 통계를 전량 폐기하고 새로 시작합니다.
 // =====================================================================
-pub const SDS_RECIPE: &str = "sds-v1:welford+ring/granite-384/bias-json";
+// 🌟 v2: entropy_norm 스케일을 full_range → tail_sd 로 교정했습니다.
+//    척도가 달라져 v1 관측과 혼용하면 감쇠 판정이 왜곡되므로 세대를 올립니다.
+pub const SDS_RECIPE: &str = "sds-v2:welford+ring/tail-sd-entropy/granite-384/bias-json";
 
 // =====================================================================
 // 🌟 [최소 관측 수] 기획 6-2 의 냉간 시작 임계값입니다.
@@ -163,12 +165,83 @@ pub fn enter_scope(team: &str, track: Track, primary: &str, secondary: &str) {
     }
 }
 
-/// 스코프의 1차 키만 나중에 확정되는 경우(문서 type 을 판정한 직후 등)를 위한 갱신입니다.
+/// 스코프의 1차 키가 나중에 확정되는 경우(문서 type 을 판정한 직후 등)의 갱신입니다.
+///
+///  🌟 [SCOPE MIGRATION] 키만 바꾸지 않고 이전 관측을 새 키로 옮깁니다.
+///
+///  ── 실측 사고 ──
+///   score_dynamics.json 에 같은 문서의 관측이 두 스코프로 갈렸습니다.
+///     trading|shipping| → trading.title_snr / title_axis  (T-1 관측)
+///     trading|sa|       → plinko.* / field.* / confusion.* (T-2 관측)
+///   refine_primary 가 STEP A 확정 후에 호출되므로, 그보다 앞선
+///   표제 축 관측이 'shipping' 에 남습니다.
+///   다음에 CI 문서를 처리하면 CI 의 표제 축도 같은 자리에 쌓여
+///   SA 와 뒤섞이고, T-1 의 doc_type 별 격리가 무효화됩니다.
+///
+///  ── 왜 '옮기기' 인가 ──
+///   관측을 버리면 T-1 통계가 통째로 사라지고,
+///   그대로 두면 서식 간 오염이 누적됩니다.
+///   이관하면 둘 다 피할 수 있고, 같은 문서의 관측이므로 귀속이 정확합니다.
+///
+///  ── 이관하지 않는 경우 ──
+///   이전 키에 관측이 없거나(첫 호출), 키가 실제로 같으면 아무 일도 하지 않습니다.
 pub fn refine_primary(primary: &str) {
+    let new_primary = primary.trim().to_lowercase();
+    let (old_key, new_key, ring) = {
+        let s = match ACTIVE_SCOPE.read() { Ok(v) => v.clone(), Err(_) => return };
+        if s.is_empty() { return; }
+        if s.primary == new_primary { return; }
+        let mut ns = s.clone();
+        ns.primary = new_primary.clone();
+        let ring = match current_track() { Some(t) => t.ring_len(), None => 12 };
+        (s.key_secondary(), ns.key_secondary(), ring)
+    };
+
+    // 스코프 키를 먼저 교체합니다. (이후 관측은 새 키로)
     if let Ok(mut w) = ACTIVE_SCOPE.write() {
-        if !w.track_name.is_empty() {
-            w.primary = primary.trim().to_lowercase();
+        w.primary = new_primary.clone();
+    }
+
+    // 이전 키의 관측을 새 키로 흡수합니다.
+    if old_key == new_key { return; }
+    let moved = {
+        match SDS.write() {
+            Ok(mut store) => match store.scopes.remove(&old_key) {
+                Some(prev) => {
+                    let has = !prev.baseline.is_empty()
+                        || !prev.decay.is_empty()
+                        || !prev.axis_variance.is_empty()
+                        || !prev.field.is_empty()
+                        || !prev.confusion.is_empty()
+                        || !prev.category.is_empty()
+                        || !prev.spatial.is_empty()
+                        || !prev.transition.is_empty();
+                    if has {
+                        let cnt = prev.baseline.len()
+                            + prev.decay.len()
+                            + prev.field.len()
+                            + prev.confusion.len();
+                        store
+                            .scopes
+                            .entry(new_key.clone())
+                            .or_insert_with(ScopeStat::default)
+                            .absorb(prev, ring);
+                        cnt
+                    } else {
+                        0
+                    }
+                }
+                None => 0,
+            },
+            Err(_) => 0,
         }
+    };
+    if moved > 0 {
+        if let Ok(mut d) = DIRTY.write() { *d = true; }
+        println!(
+            "[SDS] 🔀 스코프 정밀화: '{}' → '{}' | 이전 관측 {}축을 새 스코프로 이관했습니다. (같은 문서의 관측이므로 귀속이 정확합니다)",
+            old_key, new_key, moved
+        );
     }
 }
 
@@ -285,6 +358,40 @@ impl Welford {
         if sd <= 0.0 || self.ring.is_empty() { return 0.0; }
         (self.recent_mean() - self.mean) / sd
     }
+
+    /// 🌟 [MERGE] 두 Welford 를 손실 없이 합칩니다.
+    ///
+    ///  ── 왜 필요한가 ──
+    ///   refine_primary 가 스코프를 재지정할 때, 그 이전 관측을 버리면
+    ///   T-1 의 표제 축 통계가 통째로 사라집니다.
+    ///   단순히 mean 을 평균내면 표본 수가 다른 경우 왜곡되므로,
+    ///   Chan 의 병렬 Welford 병합식을 그대로 씁니다.
+    ///     n  = nA + nB
+    ///     δ  = meanB − meanA
+    ///     mean = meanA + δ·nB/n
+    ///     M2  = M2A + M2B + δ²·nA·nB/n
+    pub fn merge(&mut self, other: &Welford, ring_len: usize) {
+        if other.n == 0 { return; }
+        if self.n == 0 {
+            self.n = other.n;
+            self.mean = other.mean;
+            self.m2 = other.m2;
+            self.ring = other.ring.clone();
+        } else {
+            let na = self.n as f64;
+            let nb = other.n as f64;
+            let n = na + nb;
+            let delta = other.mean - self.mean;
+            self.mean += delta * (nb / n);
+            self.m2 += other.m2 + delta * delta * (na * nb / n);
+            self.n += other.n;
+            self.ring.extend(other.ring.iter().cloned());
+        }
+        if ring_len > 0 && self.ring.len() > ring_len {
+            let excess = self.ring.len() - ring_len;
+            self.ring.drain(0..excess);
+        }
+    }
 }
 
 // =====================================================================
@@ -345,19 +452,43 @@ pub fn decay_shape(scores: &[f32]) -> Option<DecayShape> {
         1.0
     };
 
-    // 정규화 엔트로피. 척도 불변을 위해 범위로 스케일링한 뒤 softmax 를 씁니다.
+    // 🌟 [ENTROPY SCALE FIX] 척도를 '전체 범위' 에서 '꼬리 표준편차' 로 바꿉니다.
+    //
+    //  ── 실측 사고 ──
+    //   trading|sa| 의 plinko.label_row.entropy_norm 관측 7건이
+    //   [0.994, 0.990, 0.991, 0.970, 0.994, 0.978, 0.993] 로
+    //   전부 0.97~0.996 에 갇혔습니다. 변별력이 0 입니다.
+    //
+    //  ── 원인 ──
+    //   (x − max) / full_range 는 정의상 항상 [−1, 0] 입니다.
+    //   따라서 exp() 결과가 [0.368, 1.0] 안에 갇히고,
+    //   그 분포의 정규화 엔트로피는 후보 수가 많을수록 1 에 수렴합니다.
+    //   분포가 뾰족하든 평탄하든 같은 값이 나옵니다.
+    //
+    //  ── 교정 ──
+    //   꼬리 표준편차로 나누면 z-score 가 되어 스케일이 열립니다.
+    //   1위가 꼬리에서 멀면 exp 인자가 크게 음수가 되어 엔트로피가 떨어지고,
+    //   평탄하면 1 에 가까워집니다. 이것이 원래 의도한 동작입니다.
+    //   꼬리가 균일하면(sd=0) 판정 불가이므로 1.0(무변별)로 둡니다.
+    //
+    //  ⚠️ 이 변경으로 과거 관측과 척도가 달라집니다.
+    //     SDS_RECIPE 를 올려 통계를 재수집하십시오.
     let entropy_norm = {
-        let scale = if full_range > 1e-9 { full_range } else { 1.0 };
-        let mx = v[0];
-        let exps: Vec<f64> = v.iter().map(|x| ((x - mx) / scale).exp()).collect();
-        let sum: f64 = exps.iter().sum::<f64>().max(1e-12);
-        let mut h = 0.0f64;
-        for e in exps.iter() {
-            let p = e / sum;
-            if p > 1e-12 { h -= p * p.ln(); }
+        let tail_sd_for_scale = tail_var.sqrt();
+        if tail_sd_for_scale <= 1e-9 {
+            1.0f64
+        } else {
+            let mx = v[0];
+            let exps: Vec<f64> = v.iter().map(|x| ((x - mx) / tail_sd_for_scale).exp()).collect();
+            let sum: f64 = exps.iter().sum::<f64>().max(1e-12);
+            let mut h = 0.0f64;
+            for e in exps.iter() {
+                let p = e / sum;
+                if p > 1e-12 { h -= p * p.ln(); }
+            }
+            let hmax = (n as f64).ln();
+            if hmax > 1e-9 { (h / hmax).clamp(0.0, 1.0) } else { 0.0 }
         }
-        let hmax = (n as f64).ln();
-        if hmax > 1e-9 { (h / hmax).clamp(0.0, 1.0) } else { 0.0 }
     };
 
     let positive_ratio = v.iter().filter(|x| **x > 0.0).count() as f64 / (n as f64);
@@ -462,6 +593,58 @@ pub struct SdsFile {
     pub updated_at: i64,
     #[serde(default)]
     pub scopes: HashMap<String, ScopeStat>,
+}
+
+impl ScopeStat {
+    /// 🌟 [MERGE] 다른 스코프의 통계를 흡수합니다. (refine_primary 이관용)
+    pub fn absorb(&mut self, other: ScopeStat, ring: usize) {
+        for (k, v) in other.baseline {
+            self.baseline.entry(k).or_insert_with(Welford::default).merge(&v, ring);
+        }
+        for (k, v) in other.decay {
+            let d = self.decay.entry(k).or_insert_with(DecayStat::default);
+            d.margin.merge(&v.margin, ring);
+            d.top_gap_ratio.merge(&v.top_gap_ratio, ring);
+            d.tail_flatness.merge(&v.tail_flatness, ring);
+            d.entropy_norm.merge(&v.entropy_norm, ring);
+            d.positive_ratio.merge(&v.positive_ratio, ring);
+        }
+        for (k, v) in other.axis_variance {
+            self.axis_variance.entry(k).or_insert_with(Welford::default).merge(&v, ring);
+        }
+        for (k, v) in other.field {
+            let f = self.field.entry(k).or_insert_with(FieldRejectStat::default);
+            f.seen += v.seen;
+            f.reject_format += v.reject_format;
+            f.reject_prejudice += v.reject_prejudice;
+            f.reject_enum += v.reject_enum;
+            f.reject_self_id += v.reject_self_id;
+            f.near_miss += v.near_miss;
+            f.assigned += v.assigned;
+            f.assign_margin.merge(&v.assign_margin, ring);
+        }
+        for (k, v) in other.confusion {
+            let c = self.confusion.entry(k).or_insert_with(ConfusionStat::default);
+            c.ties += v.ties;
+            c.a_wins += v.a_wins;
+            c.b_wins += v.b_wins;
+            c.margin.merge(&v.margin, ring);
+        }
+        for (k, v) in other.category {
+            let c = self.category.entry(k).or_insert_with(CategoryStat::default);
+            if c.n_fields == 0 { c.n_fields = v.n_fields; }
+            c.realized_max.merge(&v.realized_max, ring);
+        }
+        for (k, v) in other.spatial {
+            let s = self.spatial.entry(k).or_insert_with(SpatialStat::default);
+            s.active_ratio.merge(&v.active_ratio, ring);
+            s.coverage_loss.merge(&v.coverage_loss, ring);
+        }
+        for (k, v) in other.transition {
+            *self.transition.entry(k).or_insert(0) += v;
+        }
+        self.updated_at = chrono::Utc::now().timestamp_millis();
+    }
 }
 
 static SDS: Lazy<RwLock<SdsFile>> = Lazy::new(|| RwLock::new(SdsFile::default()));
@@ -649,19 +832,55 @@ fn with_scope_mut<F: FnOnce(&mut ScopeStat, usize)>(f: F) {
 //   I/O 정책이며, 틀려도 통계나 추출 결과가 달라지지 않습니다.
 //   파일 크기가 수십 KB 수준이라 자주 써도 부담이 없습니다.
 static WRITE_TICK: Lazy<RwLock<u32>> = Lazy::new(|| RwLock::new(0));
-const AUTO_FLUSH_EVERY: u32 = 64;
+static LAST_FLUSH: Lazy<RwLock<Option<std::time::Instant>>> = Lazy::new(|| RwLock::new(None));
+// 🌟 [실측 조정] 커머스 경로는 record_* 호출이 태스크당 6회 수준입니다.
+//
+//  ── 왜 바꾸는가 ──
+//   실측에서 'commerce|goods|...' 스코프가 메모리에만 남고
+//   score_dynamics.json 에 한 번도 저장되지 않았습니다.
+//   AUTO_FLUSH_EVERY=64 에 도달하지 못한 채 태스크가 길어졌고,
+//   말미의 flush 는 아이템 13개를 다 돌아야 나오기 때문입니다.
+//   트레이딩(태스크당 약 1900회)에 맞춘 값이라 커머스에서 무용지물이었습니다.
+//
+//  ── 왜 8인가 ──
+//   최소 관측 수(Track::min_obs 의 1차 임계 12) 보다 작게 두어
+//   어떤 트랙이든 '통계가 쓸모 있어지기 전에' 최소 1회는 저장되게 합니다.
+//   시간 간격 조건이 남아 있어 I/O 폭주는 여전히 막힙니다.
+const AUTO_FLUSH_EVERY: u32 = 8;
+const AUTO_FLUSH_MIN_GAP_MS: u128 = 5_000;
 
 fn bump_and_maybe_flush() {
-    let should = {
-        match WRITE_TICK.write() {
-            Ok(mut t) => {
-                *t = t.wrapping_add(1);
-                *t % AUTO_FLUSH_EVERY == 0
-            }
-            Err(_) => false,
+    // 🌟 [DEBOUNCE] 호출 횟수와 경과 시간을 모두 만족할 때만 씁니다.
+    //
+    //  ── 실측 ──
+    //   한 문서 처리에서 [SDS] 💾 가 약 30회 발생했습니다.
+    //   record_field_seen 이 라벨 23개 × 필드 83개 ≈ 1900회 호출되고
+    //   AUTO_FLUSH_EVERY=64 이므로 산술적으로 맞지만,
+    //   매번 전체 파일을 직렬화하므로 낭비이고 로그를 덮습니다.
+    //
+    //  ── 왜 시간 조건을 더하는가 ──
+    //   호출 횟수만으로는 문서 크기에 따라 빈도가 요동칩니다.
+    //   '최소 간격' 을 두면 문서가 크든 작든 I/O 가 일정합니다.
+    //   이 값은 판정에 쓰이지 않는 I/O 정책이므로 틀려도 통계가 달라지지 않습니다.
+    //   유실 위험도 없습니다. 태스크 종료 시 flush 가 반드시 한 번 더 돕니다.
+    let tick_ok = match WRITE_TICK.write() {
+        Ok(mut t) => {
+            *t = t.wrapping_add(1);
+            *t % AUTO_FLUSH_EVERY == 0
         }
+        Err(_) => false,
     };
-    if should { flush(); }
+    if !tick_ok { return; }
+    let time_ok = match LAST_FLUSH.read() {
+        Ok(g) => match *g {
+            Some(inst) => inst.elapsed().as_millis() >= AUTO_FLUSH_MIN_GAP_MS,
+            None => true,
+        },
+        Err(_) => false,
+    };
+    if !time_ok { return; }
+    if let Ok(mut g) = LAST_FLUSH.write() { *g = Some(std::time::Instant::now()); }
+    flush();
 }
 
 // =====================================================================

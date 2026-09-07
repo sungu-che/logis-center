@@ -420,8 +420,33 @@ pub fn apply_grounding_verdicts(
             "  🗑️ [GROUNDING APPLY] [{}] '{}' = \"{}\" 제거 | {}",
             r.category, r.field, r.value, r.reason
         ));
+        // 🌟 [SDS 계측 / 비전] 접지 검증 폐기를 필드 거절 트레이스로 남깁니다.
+        //
+        //  ── 왜 이 지점뿐인가 ──
+        //   이미지 경로에는 FORMAT / PREJUDICE / ENUM / SELF-ID 게이트가 없습니다.
+        //   크롭을 Qwen3.5 에 넘기고 받은 값을 그대로 병합하므로,
+        //   '이 필드가 무엇 때문에 실패하는가' 를 알 수 있는 판정은
+        //   STEP 6 의 접지 검증 하나뿐입니다.
+        //   실제로 score_dynamics.json 의 vision 스코프는 field.* 가 0건입니다.
+        //
+        //  ── 실측 ──
+        //   [parties] recipient_name = "BUYER (IF NOT CONSIGNEE)"
+        //   [other_parties] party_name = "SIGNATORY COMPANY"
+        //   둘 다 인쇄 라벨을 값으로 읽은 사고입니다.
+        //   같은 필드에서 반복되는지 누적해야
+        //   '이 서식의 이 축은 라벨과 값이 구조적으로 겹친다' 를 알 수 있습니다.
+        //
+        //  ── GateKind::Format 을 재사용하는 이유 ──
+        //   접지 실패는 '값의 형태가 그 필드일 수 없다' 는 판정이라
+        //   의미상 형식 게이트에 가장 가깝습니다.
+        //   전용 종류를 추가하면 열거형이 늘어 파일 스키마가 바뀌고
+        //   SDS_RECIPE 세대 무효화가 필요해지므로 기존 축을 씁니다.
+        crate::utils::score_dynamics::record_field_seen(&r.field);
+        crate::utils::score_dynamics::record_field_reject(
+            &r.field,
+            crate::utils::score_dynamics::GateKind::Format,
+        );
     }
-
     emit(&format!(
         "  ✅ [GROUNDING APPLY] 폐기 {}건 | 데이터 지점 {}곳에서 제거",
         rejected.len(),

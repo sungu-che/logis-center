@@ -1441,6 +1441,33 @@ pub async fn process_task(
                         "  👑 [TITLE ANCHOR SELECTED] '{}' (Score: {:+.4} | BodyEcho: {}회)",
                         doc_title, best_score, echo_count[best_idx]
                     ));
+                    // 🌟 [SDS 계측] 타이틀 후보 점수 배열의 감쇠 형상을 남깁니다.
+                    //
+                    //  ── 실측 ──
+                    //   후보 점수가 [-3.4836, +1.0986, +3.1986, -0.8135] 이었습니다.
+                    //   1위와 2위의 마진은 +2.10 으로 승자독식형이지만
+                    //   '관리자 페이지'(-3.4836) 같은 극단 음수가 섞여 꼬리가 매우 두껍습니다.
+                    //   이 형상이 사이트마다 어떻게 다른지는 지금 아무 데도 기록되지 않습니다.
+                    //
+                    //  ── 왜 재계산인가 ──
+                    //   위 루프의 cand_score 는 지역 변수라 배열로 남지 않습니다.
+                    //   z 배열 세 개가 그대로 살아 있으므로 같은 식으로 복원합니다.
+                    //   (z_contrast - z_chrome + z_echo 는 판정에 쓴 식과 동일합니다)
+                    //   임베딩이 0 인 후보는 판정에서도 제외되었으므로 여기서도 뺍니다.
+                    {
+                        let arr: Vec<f32> = (0..title_candidates.len())
+                            .filter(|&i| !cand_embs[i].iter().all(|&v| v == 0.0))
+                            .map(|i| z_contrast[i] - z_chrome[i] + z_echo[i])
+                            .collect();
+                        if arr.len() >= 2 {
+                            crate::utils::score_dynamics::record_decay("commerce.title_anchor", &arr);
+                        }
+                        crate::utils::score_dynamics::record_baseline("commerce.title_score", best_score);
+                        crate::utils::score_dynamics::record_baseline(
+                            "commerce.title_chrome",
+                            raw_chrome[best_idx],
+                        );
+                    }
                 }
             }
 
@@ -3585,12 +3612,28 @@ pub async fn process_task(
                 for f in 0..hdr_field_names.len() {
                     for h in 0..unique_headers.len() {
                         if header_embs[h].iter().all(|&v| v == 0.0) { continue; }
+                        // 🌟 [SDS 계측] 이 필드가 이 헤더와 경쟁했다는 사실 자체를 남깁니다.
+                        //
+                        //  ── 왜 필요한가 ──
+                        //   score_dynamics.json 에서 field.* 관측은 트레이딩 경로가 전부입니다.
+                        //   커머스 0건, 비전 0건이라 T-3(학습형 prejudice)를 이 두 트랙으로
+                        //   확장할 근거가 없습니다. seen 이 있어야 거절률이 비율로 읽힙니다.
+                        crate::utils::score_dynamics::record_field_seen(&hdr_field_names[f]);
                         let own = weighted_max_pool_sim(&header_embs[h], &hdr_label_embs[f], &hdr_label_weights[f]);
-                        if own < hdr_abs_floor { continue; }
+                        if own < hdr_abs_floor {
+                            // 라벨 자체가 약해서 탈락한 경우입니다. 편견과 구분해 둡니다.
+                            crate::utils::score_dynamics::record_near_miss(&hdr_field_names[f]);
+                            continue;
+                        }
                         let prej = if hdr_prej_embs[f].is_empty() { 0.0 } else { max_pool_sim(&header_embs[h], &hdr_prej_embs[f]) };
                         let score = own - prej;
                         if score < hdr_score_floor {
                             emit_term(&format!("    🚫 [HEADER PREJUDICE DROP] '{}' → '{}' | LabelMaxPool: {:.4} | PrejMaxPool: {:.4} | Score: {:+.4} < {:.2}", unique_headers[h], hdr_field_names[f], own, prej, score, hdr_score_floor));
+                            // 🌟 [SDS 계측] 라벨은 충분했는데 편견이 이겨서 탈락한 경우입니다.
+                            crate::utils::score_dynamics::record_field_reject(
+                                &hdr_field_names[f],
+                                crate::utils::score_dynamics::GateKind::Prejudice,
+                            );
                             continue;
                         }
                         hdr_matrix[f][h] = score;
@@ -3603,6 +3646,16 @@ pub async fn process_task(
                         Some((h, score, margin)) => {
                             header_to_field_map.insert(unique_headers[*h].clone(), hdr_field_names[f].clone());
                             emit_term(&format!("    ✨ [HEADER COSINE MAP] Header '{}' → Field '{}' | Score: {:+.4} | Margin: {:+.4}", unique_headers[*h], hdr_field_names[f], score, margin));
+                            // 🌟 [SDS 계측] 헤더 확정 마진을 남깁니다.
+                            //
+                            //  ── 실측 ──
+                            //   확정 3건의 마진이 +0.0538 / +0.0829 / +0.0330 이었습니다.
+                            //   고정 임계 hdr_margin = 0.03 바로 위입니다.
+                            //   이 상수가 이 사이트에서 적절한지는 분포를 봐야 알 수 있습니다.
+                            crate::utils::score_dynamics::record_field_assigned(
+                                &hdr_field_names[f],
+                                *margin,
+                            );
                         },
                         None => {
                             emit_term(&format!("    ⚪ [HEADER UNMAPPED] Field '{}' | 확정 가능한 헤더 없음. 값 라인 벡터 매칭으로 폴백합니다.", hdr_field_names[f]));
@@ -4161,6 +4214,17 @@ pub async fn process_task(
                                 line_enriched_texts[l].as_str()
                             };
                             emit_term(&format!("    🔗 [EXCLUSIVE ASSIGN] '{}' ({:?}) ← Line {} | RawSim: {:.4} | Contrast: {:+.4} | Margin: {:+.4} | \"{}\"", fname, field_formats[f_i], l + 1, vector_raw_matrix[f_i][l], contrast, margin, shown));
+                            // 🌟 [SDS 계측] 배정 마진 분포를 쌓습니다.
+                            //
+                            //  ── 실측 오배정 ──
+                            //   'title'      ← "상품명 > 카테고리 | 패션의류/잡화/뷰티" (+0.0769)
+                            //   'color'      ← "관리 | 수정"                          (+0.0393)
+                            //   'sale_price' ← "1 | 13"                               (+0.0075)
+                            //   전부 틀렸는데 마진이 양수라 통과했습니다.
+                            //   커머스에는 exclusive_assign 의 고정 마진(0.005)만 있고
+                            //   트레이딩의 T-2 잡음 마진 게이트가 없습니다.
+                            //   이 분포가 쌓여야 잡음 마진 기준선을 유도해 이식할 수 있습니다.
+                            crate::utils::score_dynamics::record_field_assigned(fname, margin);
                         },
                         None => {
                             if !field_is_analytic[f_i] {
@@ -4867,6 +4931,15 @@ pub async fn process_task(
                         model.get_free_vram_mb()
                     ));
                 }
+                // 🌟 [SDS] 아이템 경계에서 관측을 확정합니다.
+                //
+                //  ── 왜 필요한가 ──
+                //   아이템 13개 × 필드 14개는 수 분이 걸립니다.
+                //   태스크 말미의 flush 는 전부 끝나야 나오므로,
+                //   중간에 취소되거나 앱이 멈추면 그동안의 관측이 전부 사라집니다.
+                //   아이템 경계는 자연스러운 커밋 지점이고,
+                //   dirty 가 아니거나 최소 간격(5초) 미만이면 실제 쓰기는 생략됩니다.
+                crate::utils::score_dynamics::flush();
             }
             
             {

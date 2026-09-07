@@ -1034,6 +1034,22 @@ pub fn plan_crops(
                         per_cat[ci].0, (1.0 - coverage) * 100.0
                     ));
                 }
+                // 🌟 [SDS 계측] 커버리지 손실률을 남깁니다.
+                //
+                //  ── 실측 ──
+                //   score_dynamics.json 의 spatial[*].coverage_loss 가 전부 n=0 입니다.
+                //   Phase 0 에서 record_coverage_loss 를 정의만 하고
+                //   호출부를 넣지 않았기 때문입니다.
+                //   이 값이 없으면 V-2(크롭 재수립)의 기대 밴드를 유도할 수 없습니다.
+                //
+                //  ── 왜 경고 조건 밖인가 ──
+                //   경고(coverage < 0.70)만 기록하면 '손실이 적은 정상 케이스' 가
+                //   표본에서 빠져 분포가 한쪽으로 치우칩니다.
+                //   V-2 는 '이 서식의 통상 손실률' 을 알아야 하므로 전량 기록합니다.
+                crate::utils::score_dynamics::record_coverage_loss(
+                    &per_cat[ci].0,
+                    1.0 - coverage,
+                );
             }
         }
 

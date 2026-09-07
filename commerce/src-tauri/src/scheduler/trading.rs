@@ -1613,12 +1613,77 @@ pub async fn process_trading_task(
     //   이 시점에는 doc_type 을 모릅니다. STEP A 가 코드를 확정한 뒤
     //   refine_primary('SA') 가 키를 교체하므로, 그 전 관측만 잠시 'shipping' 에
     //   들어갔다가 이후 관측이 정확한 서식 스코프로 흘러갑니다.
-    crate::utils::score_dynamics::enter_scope(
-        &team_id,
-        crate::utils::score_dynamics::Track::Trading,
-        "shipping",
-        &task.cc,
-    );
+    // 🌟 [2차 스코프] task.cc 는 이 시점에 비어 있습니다.
+    //
+    //  ── 실측 ──
+    //   score_dynamics.json 의 키가 'trading|sa|' 로 secondary 가 공백이었습니다.
+    //   로그의 cc='0xa276...' 는 파이프라인 후반의 [TRADING ENVELOPE] 에서
+    //   산출되는 값이라 진입 시점에는 존재하지 않습니다.
+    //   그 결과 key_secondary() 와 key_primary() 가 같아져
+    //   폴백 3단이 1단으로 붕괴하고, ASE 가 1차 임계(12건)가 아니라
+    //   2차 임계(30건)를 요구하게 됩니다.
+    //
+    //  ── 대체 축 ──
+    //   문서의 출처(파일명 또는 도메인)를 2차 키로 씁니다.
+    //   같은 벤더가 보낸 서식은 레이아웃이 같으므로
+    //   '발행처별 격리' 라는 기획 2-3 의 의도와도 일치합니다.
+    //   추출할 수 없으면 빈 문자열로 두고 1차 스코프만 씁니다.
+    {
+        // 🌟 [위치 의존성 제거] task_data 대신 task.data_json 을 그 자리에서 파싱합니다.
+        //
+        //  ── 왜 이렇게 바꾸는가 ──
+        //   task_data 는 이 함수의 더 아래에서
+        //     let mut task_data: Value = serde_json::from_str(&task.data_json)...
+        //   로 선언됩니다. 그보다 앞에서 참조하면 E0425 가 납니다.
+        //   블록을 아래로 옮겨도 되지만, 그러면 이 코드가 다시 '특정 줄 아래' 라는
+        //   위치 조건에 묶입니다. 실제로 그 조건을 세 번 연속으로 틀렸습니다.
+        //   여기서 직접 파싱하면 함수 어느 지점에 두어도 컴파일되고 동작합니다.
+        //
+        //  ── 비용 ──
+        //   태스크당 JSON 파싱 1회입니다. data_json 은 수 KB 수준이고
+        //   이 함수는 문서 1건에 한 번만 실행되므로 무시할 수 있습니다.
+        //
+        //  ── 2차 스코프를 origin 으로 두는 이유 ──
+        //   task.cc 는 이 시점에 비어 있습니다.
+        //   (로그의 cc='0xa276...' 는 후반의 [TRADING ENVELOPE] 산출값입니다)
+        //   그대로 두면 key_secondary() 와 key_primary() 가 같아져
+        //   폴백 3단이 1단으로 붕괴합니다.
+        //   같은 벤더가 보낸 서식은 레이아웃이 같으므로 발행처를 2차 키로 씁니다.
+        let scope_src: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
+        let origin_key = scope_src
+            .get("origin")
+            .or_else(|| scope_src.get("domain"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                scope_src
+                    .get("image_path")
+                    .and_then(|v| v.as_str())
+                    .and_then(|p| {
+                        std::path::Path::new(p)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .map(|s| s.to_string())
+                    })
+            })
+            .map(|s| {
+                // 파일명 뒤의 페이지/일련 번호는 제거해 같은 벤더가 한 스코프로 모이게 합니다.
+                // 예) "Shipping_Advice_Part14" → "Shipping_Advice_Part"
+                s.chars()
+                    .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-' || *c == '.')
+                    .collect::<String>()
+                    .trim_end_matches(|c: char| c.is_ascii_digit() || c == '_' || c == '-')
+                    .to_string()
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| task.cc.clone());
+        crate::utils::score_dynamics::enter_scope(
+            &team_id,
+            crate::utils::score_dynamics::Track::Trading,
+            "shipping",
+            &origin_key,
+        );
+    }
     let payload = json!({
         "task_id": task.id,
         "task_type": task.r#type,

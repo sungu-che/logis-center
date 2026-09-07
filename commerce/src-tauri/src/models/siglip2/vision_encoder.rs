@@ -882,6 +882,23 @@ pub fn classify_doc_type(
             positive_count,
             c_scores.len()
         ));
+        // 🌟 [SDS 계측] 55개 코드 점수 배열 전체의 감쇠 형상을 남깁니다.
+        //
+        //  ── 왜 마진만으로는 부족한가 ──
+        //   실측 `마진 +0.0434 | 양수 점수 코드: 55/55` 는
+        //   '1·2위가 붙었다' 가 아니라 '55개 코드 전부가 살아남았다',
+        //   즉 분포 자체에 변별력이 없다는 뜻입니다.
+        //   그런데 현재 판정은 1·2위 마진만 보고 LLM 재판정 여부를 정합니다.
+        //   entropy_norm 과 positive_ratio 를 쌓아 두면 Phase 3 의 V-3 에서
+        //   '1위가 감쇠 곡선의 이상치인가' 로 판정 축을 바꿀 수 있습니다.
+        //
+        //  ── 스코프가 없으면 조용히 무시됩니다 ──
+        //   이 함수는 순수 함수라 team_id 를 갖지 않습니다.
+        //   호출부(model/vision.rs)가 enter_scope 로 세운 전역 스코프를 읽으며,
+        //   세워지지 않았으면 record_decay 가 즉시 반환합니다.
+        let arr: Vec<f32> = c_scores.iter().map(|(_, s)| *s).collect();
+        crate::utils::score_dynamics::record_decay("vision.doc_code", &arr);
+        crate::utils::score_dynamics::record_baseline("vision.code_margin", code_margin);
     }
 
     // 🌟 [TITLE AXIS NMS INTEGRATION] 상단 밴드 전문 점수를 바디 점수와 합성합니다.
@@ -1341,6 +1358,160 @@ pub fn build_column_heatmaps(
             cat_raw[ci][i] -= mean;
         }
     }
+    // =====================================================================
+    // 🌟 [V-1 / 공간 베이스필드 잔차화]
+    // ---------------------------------------------------------------------
+    //  ── 무엇이 남아 있었나 ──
+    //   실측: 🔥 [HEATMAP] header | 활성 패치 249/252 (98.8%)
+    //         ⚠️ [HEATMAP FULL PAGE RISK] 'insurance' 활성 패치 214/252 (85%)
+    //
+    //   ① CATEGORY-NEUTRAL 과 ② 카테고리 축 센터링은 둘 다 '카테고리 축' 을
+    //   따라 작동합니다. ②가 제거하는 것은 '어떤 패치가 모든 카테고리에서 높은가'
+    //   입니다. 그런데 위 증상은 정반대로 '어떤 카테고리가 모든 패치에서 높은가'
+    //   이므로, ②는 이 편향을 구조적으로 건드리지 못합니다.
+    //   오히려 그 카테고리가 패치마다 평균을 끌어올려 다른 카테고리를 음수로 밀어냅니다.
+    //   즉 공간 축(패치 간) 보정이 통째로 비어 있었습니다.
+    //
+    //  ── 제거되지 않던 성분 ──
+    //   표 괘선의 가로 확산      → 행 방향으로 균일
+    //   컬럼 구조의 세로 확산    → 열 방향으로 균일
+    //   워터마크·배경 톤         → 전역 균일
+    //   스캔 잉크 편치           → 저주파 그라디언트
+    //   header 앵커('문서번호·발행일·참조번호')가 표 격자 전반과 약하게 공명하는데,
+    //   그 공명이 행/열 방향으로 퍼져 있어 249/252 가 나옵니다.
+    //
+    //  ── 왜 double centering 인가 ──
+    //   새 알고리즘이 아닙니다. ai_utils::double_center_matrix 가
+    //   라벨×필드 행렬에서 뱅크 크기 편향을 제거하려고 쓰는 바로 그 연산자를
+    //   패치 격자(행×열)에 그대로 적용하는 것입니다.
+    //     관측 = 전체 평균 + 행 효과 + 열 효과 + 잔차
+    //   워터마크는 μ, 괘선 가로 확산은 행 효과, 컬럼 확산은 열 효과로 분해되고,
+    //   '실제 필드 블록' 만 잔차로 남습니다.
+    //   TS 로 치면 차분(differencing) 에 대응하는 공간 자기회귀 잔차화입니다.
+    //
+    //  ── 왜 적용 대상을 고르는 임계값이 없는가 ──
+    //   이 연산자는 자기적응적입니다.
+    //     이미 좁은 히트맵(containers 30/252) → 행/열 효과가 작음 → 잔차 ≈ 원본
+    //     페이지를 덮는 히트맵(header 249/252) → 행/열 효과가 큼 → 대량 제거
+    //   따라서 전 카테고리에 균일 적용하면 되고, 새 상수가 생기지 않습니다.
+    //
+    //  ── 리스크 R7 방어 ──
+    //   MSDS 처럼 페이지 전면이 실제로 hazmat 인 문서는 진짜 신호가 공간적으로
+    //   균일하므로 잔차가 0 이 됩니다. 그 경우 히트맵이 통째로 죽습니다.
+    //   방어는 임계값이 아니라 이진 사실로 둡니다.
+    //     '잔차화 후 양수 패치가 하나도 없는데 원본에는 있었다' → 되돌림
+    //   상수 없이 '히트맵이 죽었다' 는 관측만으로 판정합니다.
+    // =====================================================================
+    {
+        // 격자 열 수는 grid.rc() 로 역산합니다. PatchGrid 의 내부 필드에
+        // 의존하지 않기 위해서이며, NaFlex 로 종횡비가 달라져도 안전합니다.
+        let grid_cols = {
+            let mut mx = 0usize;
+            for i in 0..n {
+                let (_, c) = grid.rc(i);
+                if c > mx { mx = c; }
+            }
+            mx + 1
+        };
+        let grid_rows = grid.grid_rows.max(1);
+
+        let mut applied = 0usize;
+        let mut reverted: Vec<String> = Vec::new();
+        let mut detail: Vec<String> = Vec::new();
+
+        for ci in 0..cats.len() {
+            // ── 유효 패치만으로 전체/행/열 평균을 구합니다 ──
+            let mut sum_all = 0.0f64;
+            let mut cnt_all = 0usize;
+            let mut row_sum = vec![0.0f64; grid_rows];
+            let mut row_cnt = vec![0usize; grid_rows];
+            let mut col_sum = vec![0.0f64; grid_cols];
+            let mut col_cnt = vec![0usize; grid_cols];
+
+            for i in 0..n {
+                let v = cat_raw[ci][i];
+                if v == f32::MIN || !v.is_finite() { continue; }
+                let (r, c) = grid.rc(i);
+                if r >= grid_rows || c >= grid_cols { continue; }
+                sum_all += v as f64;
+                cnt_all += 1;
+                row_sum[r] += v as f64;
+                row_cnt[r] += 1;
+                col_sum[c] += v as f64;
+                col_cnt[c] += 1;
+            }
+            // 격자 구조가 성립하지 않으면(패치가 너무 적음) 잔차화를 건너뜁니다.
+            if cnt_all < 4 || grid_rows < 2 || grid_cols < 2 { continue; }
+
+            let mu = (sum_all / cnt_all as f64) as f32;
+            let row_mean: Vec<f32> = (0..grid_rows)
+                .map(|r| if row_cnt[r] == 0 { mu } else { (row_sum[r] / row_cnt[r] as f64) as f32 })
+                .collect();
+            let col_mean: Vec<f32> = (0..grid_cols)
+                .map(|c| if col_cnt[c] == 0 { mu } else { (col_sum[c] / col_cnt[c] as f64) as f32 })
+                .collect();
+
+            // ── 잔차 산출. 원본은 되돌림에 대비해 보존합니다 ──
+            let before = cat_raw[ci].clone();
+            let hot_before = before.iter().filter(|v| **v != f32::MIN && **v > 0.0).count();
+
+            let mut residual = before.clone();
+            for i in 0..n {
+                let v = before[i];
+                if v == f32::MIN || !v.is_finite() { continue; }
+                let (r, c) = grid.rc(i);
+                if r >= grid_rows || c >= grid_cols { continue; }
+                // 관측 = μ + 행효과 + 열효과 + 잔차
+                //      = μ + (row_mean[r] − μ) + (col_mean[c] − μ) + 잔차
+                // 따라서 잔차 = v − row_mean[r] − col_mean[c] + μ
+                residual[i] = v - row_mean[r] - col_mean[c] + mu;
+            }
+            let hot_after = residual.iter().filter(|v| **v != f32::MIN && **v > 0.0).count();
+
+            // ── 리스크 R7 방어 ──
+            //   히트맵이 통째로 죽으면(양수 0) 잔차화를 되돌립니다.
+            //   '페이지 전면이 실제로 이 카테고리인 문서' 는 진짜 신호가
+            //   공간적으로 균일하므로 잔차가 0 이 되는 것이 정상입니다.
+            //   그 문서에서 히트맵을 없애면 크롭 자체가 불가능해집니다.
+            if hot_after == 0 && hot_before > 0 {
+                reverted.push(format!("{}({}→0)", cats[ci], hot_before));
+                continue;
+            }
+
+            cat_raw[ci] = residual;
+            applied += 1;
+            detail.push(format!(
+                "{}({}→{})",
+                cats[ci], hot_before, hot_after
+            ));
+
+            // 🌟 [SDS 계측] 잔차화 전후 확산도를 남깁니다.
+            //    'V-1 이 실제로 확산을 줄였는가' 가 수용 기준이고,
+            //    doc_type 별로 얼마나 줄었는지가 Phase 2 의 크롭 재수립(V-2) 입력입니다.
+            crate::utils::score_dynamics::record_baseline(
+                &format!("vision.spread_before.{}", cats[ci]),
+                hot_before as f32 / n.max(1) as f32,
+            );
+            crate::utils::score_dynamics::record_baseline(
+                &format!("vision.spread_after.{}", cats[ci]),
+                hot_after as f32 / n.max(1) as f32,
+            );
+        }
+
+        detail.sort();
+        emit(&format!(
+            "    🧭 [SPATIAL RESIDUAL] 공간 베이스필드(전역 톤 + 행 확산 + 열 확산)를 분해해 잔차만 남겼습니다. 격자 {}행×{}열 | 적용 {}개 카테고리 | 활성 패치 변화: {}",
+            grid_rows, grid_cols, applied,
+            if detail.is_empty() { "-".to_string() } else { detail.join(" | ") }
+        ));
+        if !reverted.is_empty() {
+            reverted.sort();
+            emit(&format!(
+                "    ↩️ [SPATIAL RESIDUAL REVERT] 잔차화 후 양수 패치가 0 이 된 카테고리를 원본으로 되돌렸습니다: {} — 페이지 전면이 실제로 그 카테고리인 문서(예: MSDS 전면 hazmat)에서 정상입니다.",
+                reverted.join(" | ")
+            ));
+        }
+    }
     // ── ③ 결과 반영. top_field 는 최종 봉우리 패치의 argmax 필드입니다. ──
     let mut positive_by_cat: HashMap<String, usize> = HashMap::new();
     for (ci, c) in cats.iter().enumerate() {
@@ -1383,7 +1554,11 @@ pub fn build_column_heatmaps(
     }
 
     let mut out: Vec<CategoryHeatmap> = Vec::with_capacity(cats.len());
-    for c in cats.iter() {
+    // 🌟 [정정] 카테고리 인덱스를 되살립니다.
+    //    cat_fields[ci] 는 ① 필드 수 보정 블록이 이미 쓰는 '이 카테고리의 앵커 필드 수' 이며,
+    //    CATEGORY-NEUTRAL 이 가정한 드로잉 수 N 그 자체입니다.
+    //    N_eff 캘리브레이션(기획 T-4)의 입력이 되므로 그대로 넘겨야 합니다.
+    for (ci, c) in cats.iter().enumerate() {
         let scores = cat_scores.remove(c).unwrap_or_else(|| vec![f32::MIN; n]);
         let (top_field, top_score) = cat_top
             .remove(c)
@@ -1423,6 +1598,20 @@ pub fn build_column_heatmaps(
             if top_field.is_empty() { "-" } else { &top_field },
             top_score
         ));
+        // 🌟 [SDS 계측] 카테고리별 히트맵 확산도를 남깁니다.
+        //
+        //  ── 표적 증상 ──
+        //   실측 `활성 패치 249/252`(98.8%), `FULL PAGE RISK 85%`.
+        //   score_patches_bank_neutral 이 기준선 패치의 μ_k 와 카테고리 센터링만
+        //   차감하므로, 페이지 전역 베이스필드(워터마크·표 괘선 확산·잉크 편치·
+        //   로고 반향)가 제거되지 않아 히트맵이 페이지를 통째로 덮습니다.
+        //
+        //  ── 이 관측이 Phase 1 에서 쓰이는 방식 ──
+        //   V-1 공간 잔차화를 적용한 뒤 이 값이 실제로 내려갔는지가 수용 기준이고,
+        //   잔차화가 정상 신호까지 지운 경우(리스크 R7)를 감지해
+        //   원본 히트맵으로 폴백하는 판정의 기준선이 됩니다.
+        crate::utils::score_dynamics::record_spatial(c, hot, n);
+        crate::utils::score_dynamics::record_category_max(c, cat_fields[ci], top_score);
 
         // 🌟 [LOG] 히트맵 분포 + 잘림 체크
         emit(&format!(

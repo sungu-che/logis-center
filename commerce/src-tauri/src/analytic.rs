@@ -1244,7 +1244,15 @@ pub async fn parse_analytic_search_query(
 
     emit_term("\n[ANALYTIC-QUERY] 🔍 행동 로그 질의 파싱 시작");
     emit_term(&format!("  질의: \"{}\"", query));
-
+    // 🌟 [SDS SCOPE] 검색 경로는 process_task 를 거치지 않으므로 자체 스코프를 세웁니다.
+    //    팀 식별자는 이 함수 시그니처에 없으므로 SDS 가 로드 시점에 바인딩한
+    //    팀을 그대로 사용합니다(빈 문자열을 넘기면 기존 바인딩이 유지됩니다).
+    crate::utils::score_dynamics::enter_scope(
+        "",
+        crate::utils::score_dynamics::Track::Analytic,
+        "query",
+        "",
+    );
     let now_ms = chrono::Utc::now().timestamp_millis();
     let current_iso = chrono::DateTime::from_timestamp_millis(now_ms)
         .map(|dt| dt.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string())
@@ -1471,6 +1479,16 @@ pub async fn parse_analytic_search_query(
     //   vec_events: Vec<(String, f32)> 를 채우고 있으므로
     //   여기서 그 결과를 그대로 소비합니다.
     let mut event_types: Vec<String> = Vec::new();
+    // 🌟 [SDS 계측] 이벤트 타입 판정의 own / 차항 배열을 각각 모읍니다.
+    //
+    //  ── 왜 두 축을 분리해 모으는가 ──
+    //   논의 4회차의 통합결론 1번이 "bias 단독 트레이스는 리콜 게이트,
+    //   bias−prejudice 트레이스는 정밀도 게이트로 역할을 분리하라" 였습니다.
+    //   그 분리(T-9)를 Phase 2 에서 실행하려면
+    //   두 축의 분포가 실제로 다른 형상을 갖는지가 먼저 관측되어야 합니다.
+    //   지금은 score = own - prej 하나로 합쳐져 있어 확인할 방법이 없습니다.
+    let mut sds_own: Vec<f32> = Vec::new();
+    let mut sds_net: Vec<f32> = Vec::new();
     for event_type in crate::analytic::ANALYTIC_SEARCH_TYPES.iter() {
         let anchor_phrases = crate::analytic::event_type_anchor_phrases(event_type);
         let prej_phrases = crate::analytic::event_type_prejudice_phrases(event_type);
@@ -1490,9 +1508,16 @@ pub async fn parse_analytic_search_query(
             "  🎯 [EVENT NMS] '{}' | own: {:.4} | prej: {:.4} | score: {:+.4}",
             event_type, own, prej, score
         ));
+        sds_own.push(own);
+        sds_net.push(score);
         if score > 0.0 {
             event_types.push(event_type.to_string());
         }
+    }
+    // 🌟 [SDS 계측] 두 축의 감쇠 형상을 별도 축으로 남깁니다.
+    if sds_own.len() >= 2 {
+        crate::utils::score_dynamics::record_decay("analytic.event.bias_only", &sds_own);
+        crate::utils::score_dynamics::record_decay("analytic.event.net", &sds_net);
     }
     // report 는 합성 문서이므로 항상 포함
     if !event_types.iter().any(|t| t == "report") {

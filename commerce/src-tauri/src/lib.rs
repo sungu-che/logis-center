@@ -6,6 +6,10 @@ pub use utils::bias_schema;
 pub use utils::json_parse;
 pub use utils::nl_convert;
 pub use utils::time_guide;
+// 🌟 [SCORE DYNAMICS] 점수를 신호로 취급하는 관측·통계 계층.
+//    bias.json 이 정적 사전이라면 이것은 동적 사전입니다.
+//    Phase 0 에서는 계측과 영속화만 수행하고 판정에는 개입하지 않습니다.
+pub use utils::score_dynamics;
 mod logic;
 mod scheduler;
 pub mod analytic;
@@ -186,6 +190,10 @@ async fn unload_model(state: State<'_, AppState>) -> Result<String, String> {
         }
         *model_guard = None;
     }
+    // 🌟 [SDS FLUSH] 언로드는 세션 경계이므로 관측을 디스크에 확정합니다.
+    //    dirty 플래그가 false 면 파일을 쓰지 않으므로 불필요한 I/O 가 없습니다.
+    println!("[UNLOAD] {}", crate::utils::score_dynamics::report());
+    crate::utils::score_dynamics::flush();
     
     {
         let mut store_guard = state.store.lock().await;
@@ -3003,6 +3011,16 @@ async fn initialize_hub(
                 Err(e) => println!("[HUB] Migration warning: {}", e),
             }
         }
+        // 🌟 [SDS REBIND] 통계 스코프를 실제 팀으로 재바인딩합니다.
+        //
+        //  ── 왜 필요한가 ──
+        //   부팅 시점에는 로그인 전이라 ZERO_ADDRESS 기반 팀으로 로드됩니다.
+        //   그 상태로 쌓인 통계를 다른 팀에 그대로 적용하면
+        //   기획 6-4 의 스코프 격리 원칙을 위반합니다.
+        //   migrate_team_identity 가 LanceDB 문서를 이전하는 것과 같은 시점에
+        //   통계도 정리합니다. 단 문서와 달리 통계는 '이전' 이 아니라 '폐기' 입니다.
+        //   ZERO 팀에서 쌓인 분포가 실제 팀의 문서 분포와 같다는 보장이 없기 때문입니다.
+        crate::utils::score_dynamics::rebind_team(&new_team_id);
         match store.initialize_user_profiles(&address, &email, &flag).await {
             Ok(_) => Ok(format!("Hub initialized for address: {}", address)),
             Err(e) => Err(format!("Initialization failed: {}", e)),
@@ -3722,6 +3740,12 @@ async fn delete_all_models() -> Result<String, String> {
 async fn reset_lancedb(
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    // 🌟 [SDS PURGE] 팩토리 리셋은 '판정 근거를 포함한 전량 초기화' 입니다.
+    //    문서를 지우면서 그 문서들에서 유도한 통계를 남기면
+    //    존재하지 않는 데이터의 분포로 판정하게 됩니다.
+    //    또한 이 삭제가 기획 8-2 의 롤백 수단입니다.
+    //    (코드 롤백 없이 파일 삭제만으로 적응 이전 동작으로 복귀)
+    crate::utils::score_dynamics::purge();
     let mut store_guard = state.store.lock().await;
     if let Some(db) = store_guard.as_ref() {
         db.reset_database().await.map_err(|e| e.to_string())?;
@@ -4003,6 +4027,21 @@ pub fn run() {
                     //    대상이 0건이면 조회 1회로 끝나므로 매 시작마다 돌아도 부담이 없고,
                     //    교정된 문서는 embed 마커가 제거되어 reindex 가 자동으로 재인덱싱합니다.
                     let _ = s.migrate_mode_by_type().await;
+                    // 🌟 [SDS LOAD] 점수 동역학 통계를 세션 시작 시 1회 불러옵니다.
+                    //
+                    //  ── 왜 여기인가 ──
+                    //   VectorStore 초기화와 같은 블록이어야 '데이터 계층이 준비되는 시점'
+                    //   이라는 의미가 코드 배치로 드러납니다.
+                    //   이 시점에는 아직 로그인 전이라 팀이 ZERO_ADDRESS 기반일 수 있고,
+                    //   initialize_hub 가 실제 팀을 확정하면 rebind_team 이 재바인딩합니다.
+                    //
+                    //  ── 파일이 없으면 ──
+                    //   냉간 시작 로그만 남기고 빈 통계로 출발합니다.
+                    //   ASE 는 관측 부족으로 None 을 돌려주므로 판정은 현행 그대로입니다.
+                    let zero_team = crate::utils::hash::hash_id(
+                        "0x0000000000000000000000000000000000000000"
+                    );
+                    crate::utils::score_dynamics::load(&zero_team);
                     
                     let error_status = crate::logic::parse_status("error");
                     
@@ -4171,7 +4210,12 @@ pub fn run() {
         .run(|_app_handle, event| {
             if let tauri::RunEvent::Exit = event {
                 println!("[APP] Application exiting. Shutting down browser...");
-
+                // 🌟 [SDS FLUSH] 종료 경로에서도 관측을 확정합니다.
+                //    언로드를 거치지 않고 창을 닫는 경로가 존재하므로
+                //    두 지점 모두에 flush 가 있어야 관측이 유실되지 않습니다.
+                //    flush 는 dirty 일 때만 파일을 쓰므로 중복 호출이 무해합니다.
+                println!("[APP] {}", crate::utils::score_dynamics::report());
+                crate::utils::score_dynamics::flush();
                 // 1. 전역 브라우저 상태를 즉시 stopped으로 고정
                 if let Ok(mut state) = crate::CURRENT_BROWSER_STATE.write() {
                     *state = "stopped".to_string();

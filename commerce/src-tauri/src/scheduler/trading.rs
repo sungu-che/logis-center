@@ -92,14 +92,13 @@ fn collect_title_candidates(pug: &str, band_ratio: f32) -> Vec<TitleCandidate> {
     if out.len() > 24 { out.truncate(24); }
     out
 }
-
-pub(crate) async fn resolve_title_values(
+pub(crate) async fn resolve_title_values_weighted(
     model: &LogisModel,
     light_pug: &str,
     band_ratio: f32,
     emit_term: &(dyn Fn(&str) + Send + Sync),
     verbose: bool,
-) -> Vec<String> {
+) -> Vec<(String, f32)> {
     let cands = collect_title_candidates(light_pug, band_ratio);
     if verbose {
         emit_term(&format!("  🪪 [TITLE CANDIDATES] 상단 밴드 표제 후보 {}개 수집", cands.len()));
@@ -165,14 +164,16 @@ pub(crate) async fn resolve_title_values(
     }
     // ── 값 축 ──
     let mut headless: Vec<String> = Vec::new();
-    let mut kept: Vec<String> = Vec::new();
+    // 🌟 [T-1] (값, 가중치) 로 승격합니다.
+    //    라벨 축을 통과한 후보는 바닥 판정을 거치지 않으므로 항상 1.0 입니다.
+    let mut kept: Vec<(String, f32)> = Vec::new();
     for c in cands.iter() {
         if c.label.trim().is_empty() {
             if !headless.iter().any(|e| e == &c.value) { headless.push(c.value.clone()); }
             continue;
         }
         if label_is_title.get(&humanize(&c.label)).copied().unwrap_or(false) {
-            if !kept.iter().any(|e| e == &c.value) { kept.push(c.value.clone()); }
+            if !kept.iter().any(|(e, _)| e == &c.value) { kept.push((c.value.clone(), 1.0)); }
         }
     }
     if !headless.is_empty() {
@@ -200,6 +201,40 @@ pub(crate) async fn resolve_title_values(
                 ts_all.iter().filter(|s| **s > f32::MIN).count(), floor
             ));
         }
+        // 🌟 [SDS 계측] 표제 바닥과 자기선언 점수 분포를 관측으로 남깁니다.
+        //
+        //  ── 표적 사고 ──
+        //   SA 문서에서 'document_type: Shipping Advice' 가 이 바닥(0.5457)에
+        //   미달해 탈락했고, 그 결과 제목 축 정보가 0 으로 수렴했습니다.
+        //   문제는 '점수가 낮다' 가 아니라 '탈락시켜 0 으로 만든다' 는 구조입니다.
+        //   Phase 1 의 역분산 융합은 이 바닥을 '탈락 임계값' 에서
+        //   '저가중 전환점' 으로 바꾸는데, 그러려면 바닥과 점수 분포가
+        //   이 서식에서 통상 어느 대역인지가 먼저 관측되어야 합니다.
+        //
+        //  ── 감쇠 곡선도 함께 남기는 이유 ──
+        //   후보가 [6.28, 2.42, 2.03, 2.02] 처럼 승자독식이면 제목 축을 신뢰해야 하고,
+        //   [0.49, 0.52, 0.47] 처럼 평탄하면 감쇠시켜야 합니다.
+        //   그 판정에 필요한 형상 통계가 record_decay 한 번에 압축됩니다.
+        {
+            crate::utils::score_dynamics::record_baseline("title_axis.floor", floor);
+            let live: Vec<f32> = ts_all.iter().cloned().filter(|s| *s > f32::MIN).collect();
+            if live.len() >= 2 {
+                crate::utils::score_dynamics::record_decay("title_axis.self_declared", &live);
+            }
+        }
+        // 🌟 [T-1] 바닥 미달 후보의 가중치를 유도할 분포 범위를 미리 구합니다.
+        //    min-max 정규화이므로 이 문서의 분포에서만 유도되며 새 상수가 없습니다.
+        let (ts_min, ts_max) = {
+            let v: Vec<f32> = ts_all.iter().cloned().filter(|s| *s > f32::MIN).collect();
+            if v.is_empty() {
+                (0.0f32, 0.0f32)
+            } else {
+                let mn = v.iter().cloned().fold(f32::MAX, f32::min);
+                let mx = v.iter().cloned().fold(f32::MIN, f32::max);
+                (mn, mx)
+            }
+        };
+        let mut weak_admitted = 0usize;
         for (i, v) in headless.iter().enumerate() {
             if ts_all[i] == f32::MIN { continue; }
             let ts = ts_all[i];
@@ -208,34 +243,94 @@ pub(crate) async fn resolve_title_values(
             let ch = crate::utils::ai_utils::cosine_similarity(&he[i], &anchors[4]);
             let ac = crate::utils::ai_utils::cosine_similarity(&he[i], &anchors[5]);
             let rival = rw.max(is).max(ch).max(ac);
-            if ts > rival && ts >= floor {
-                if !kept.iter().any(|e| e == v) { kept.push(v.clone()); }
-            } else if verbose {
-                let why = if ts <= ch {
-                    "사이트 껍데기"
-                } else if ts <= ac {
-                    "UI 액션"
-                } else if ts <= is {
-                    "품목 속성"
-                } else if ts <= rw {
-                    "행 구분자"
-                } else {
-                    "바닥 미달"
-                };
-                emit_term(&format!(
-                    "     🧹 [HEADLESS DROP] '{}' | 자기선언 {:.4} vs 행구분자 {:.4} vs 품목속성 {:.4} vs 껍데기 {:.4} vs 액션 {:.4} | 바닥 {:.4} → {} (표제 아님)",
-                    v, ts, rw, is, ch, ac, floor, why
-                ));
+
+            // 🌟 [T-1 / 배타 판정은 유지] 경쟁 5축이 이기면 이것은 표제가 아닙니다.
+            //    이 탈락은 정당하므로 완화하지 않습니다.
+            if ts <= rival {
+                if verbose {
+                    let why = if ts <= ch {
+                        "사이트 껍데기"
+                    } else if ts <= ac {
+                        "UI 액션"
+                    } else if ts <= is {
+                        "품목 속성"
+                    } else {
+                        "행 구분자"
+                    };
+                    emit_term(&format!(
+                        "     🧹 [HEADLESS DROP] '{}' | 자기선언 {:.4} vs 행구분자 {:.4} vs 품목속성 {:.4} vs 껍데기 {:.4} vs 액션 {:.4} | 바닥 {:.4} → {} (표제 아님)",
+                        v, ts, rw, is, ch, ac, floor, why
+                    ));
+                }
+                continue;
             }
+
+            // 🌟 [T-1 / 바닥은 저가중 전환점] 바닥 이상이면 가중치 1.0 으로
+            //    기존 동작과 산술적으로 동일합니다. 미만이면 백분위로 감쇠해 생존합니다.
+            let w = if ts >= floor {
+                1.0f32
+            } else {
+                let span = (ts_max - ts_min).max(1e-6);
+                ((ts - ts_min) / span).clamp(0.0, 1.0)
+            };
+            if w < 1.0 {
+                weak_admitted += 1;
+                if verbose {
+                    emit_term(&format!(
+                        "     🪶 [HEADLESS WEAK-KEEP] '{}' | 자기선언 {:.4} < 바닥 {:.4} 이지만 경쟁 5축({:.4})을 이겼습니다. 탈락 대신 가중치 {:.3} 로 생존시킵니다. (탈락시키면 이 축의 정보가 0 으로 수렴합니다)",
+                        v, ts, floor, rival, w
+                    ));
+                }
+            }
+            if !kept.iter().any(|(e, _)| e == v) { kept.push((v.clone(), w)); }
+        }
+        if verbose && weak_admitted > 0 {
+            emit_term(&format!(
+                "     🪶 [WEAK ADMIT] 바닥 미달이지만 배타 판정을 통과한 후보 {}개를 저가중으로 편입했습니다.",
+                weak_admitted
+            ));
         }
     }
     if verbose {
+        let shown: Vec<String> = kept
+            .iter()
+            .take(8)
+            .map(|(v, w)| format!("{}(w{:.2})", v, w))
+            .collect();
         emit_term(&format!(
             "  🪪 [TITLE AXIS] 표제 후보 값 {}개: {:?}",
-            kept.len(), kept.iter().take(8).collect::<Vec<_>>()
+            kept.len(), shown
         ));
     }
     kept
+}
+
+// =====================================================================
+// 🌟 [BACK-COMPAT] 기존 시그니처를 그대로 유지하는 래퍼입니다.
+// ---------------------------------------------------------------------
+//  ── 왜 남기는가 ──
+//   호출부가 Vec<String> 을 전제로 작성되어 있고, 가중치를 소비하지 않는
+//   경로(페이지 연속성 판정 등)까지 시그니처를 바꾸면 회귀 범위가 넓어집니다.
+//   이 래퍼는 가중치 1.0(바닥 이상)만 통과시키므로
+//   기존 호출부는 T-1 이전과 바이트 단위로 동일한 결과를 받습니다.
+//
+//  ⚠️ 새 코드에서 표제 축 점수를 산출할 때는 반드시
+//     resolve_title_values_weighted 를 쓰십시오.
+//     이 래퍼를 쓰면 SA 형 사고가 그대로 재현됩니다.
+// =====================================================================
+pub(crate) async fn resolve_title_values(
+    model: &LogisModel,
+    light_pug: &str,
+    band_ratio: f32,
+    emit_term: &(dyn Fn(&str) + Send + Sync),
+    verbose: bool,
+) -> Vec<String> {
+    resolve_title_values_weighted(model, light_pug, band_ratio, emit_term, verbose)
+        .await
+        .into_iter()
+        .filter(|(_, w)| *w >= 1.0)
+        .map(|(v, _)| v)
+        .collect()
 }
 
 struct PageIdentityVerdict {
@@ -283,10 +378,35 @@ pub async fn probe_trade_document(
     } else {
         emit_term("  ⚪ [TRADE STRUCTURE] 국제 표준 포맷 증거가 없습니다. (Incoterms / HS / 컨테이너 / AWB / B-L / 서식코드 문서번호)");
     }
-    let values = resolve_title_values(model, light_pug, 0.30, emit_term, true).await;
-    if values.is_empty() {
+    // 🌟 [T-1] 가중치를 보존한 채 표제 후보를 받습니다.
+    //
+    //  ── 왜 이 경로가 표적인가 ──
+    //   SA-2026-0828 에서 'document_type: Shipping Advice' 가 바닥 미달로
+    //   탈락한 결과, 남은 3개 후보만으로 채점되어
+    //   마진 +0.0308 (잡음대 0.5334) 의 코인플립이 발생했습니다.
+    //   여기서 약가중군을 합류시키면 그 후보가 서식 전문 'shipping advice' 와
+    //   거의 완전 일치하므로 SA 코드의 점수가 정상 수준으로 회복됩니다.
+    //
+    //  ── 임베딩 비용 증가 없음 ──
+    //   values 전체를 한 번에 배치 임베딩한 뒤 슬라이스로 나눕니다.
+    //   bank_neutral_key_scores 를 두 번 호출하지만 그것은 순수 산술입니다.
+    let weighted = resolve_title_values_weighted(model, light_pug, 0.30, emit_term, true).await;
+    if weighted.is_empty() {
         emit_term("  ⚪ [MODE PROBE] 자기 종류를 선언하는 표제가 없습니다. 커머스 판정을 유지합니다.");
         return None;
+    }
+    let values: Vec<String> = weighted.iter().map(|(v, _)| v.clone()).collect();
+    let title_weights: Vec<f32> = weighted.iter().map(|(_, w)| *w).collect();
+    let weak_weight_max = title_weights
+        .iter()
+        .cloned()
+        .filter(|w| *w < 1.0)
+        .fold(0.0f32, f32::max);
+    if weak_weight_max > 0.0 {
+        emit_term(&format!(
+            "  🪶 [TITLE WEAK AXIS] 저가중 표제 후보가 존재합니다. 최대 가중치 {:.3} 로 본 채점에 합류시킵니다. (탈락시키면 표제 축이 0 으로 수렴해 구조 증거 하나에만 의존하게 됩니다)",
+            weak_weight_max
+        ));
     }
     let val_embs = model.get_embedding_batch(values.clone()).await
         .unwrap_or_else(|_| vec![vec![0.0; 384]; values.len()]);
@@ -558,6 +678,35 @@ pub async fn probe_trade_document(
         if z <= 0.0 { 0.0 } else { (std::f32::consts::PI / 6.0f32.sqrt()) / z }
     };
     let noise_band = evt_sd(trade_draws).max(evt_sd(commerce_draws));
+    crate::utils::score_dynamics::record_baseline("mode_probe.noise_band", noise_band);
+    crate::utils::score_dynamics::record_baseline("mode_probe.margin", margin);
+    crate::utils::score_dynamics::record_baseline("mode_probe.net_sd", net_sd);
+    crate::utils::score_dynamics::record_baseline("mode_probe.title_cos", title_cos);
+    crate::utils::score_dynamics::record_baseline("mode_probe.chrome_cos", chrome_cos);
+    {
+        let mut trade_row: Vec<f32> = Vec::new();
+        for (ki, k) in keys.iter().enumerate() {
+            if is_commerce(k) { continue; }
+            let mut best = f32::MIN;
+            for qi in 0..q {
+                let v = net[ki][qi];
+                if v == f32::MIN { continue; }
+                if v > best { best = v; }
+            }
+            if best > f32::MIN { trade_row.push(best); }
+        }
+        if let Some(snr) = crate::utils::ai_utils::axis_snr(&trade_row) {
+            emit_term(&format!(
+                "  📐 [MODE PROBE / AXIS SNR] 무역 코드 축 SNR {:.4} | 저가중 표제 합류 {} | 마진 {:+.4} (잡음대 {:.4})",
+                snr,
+                if weak_weight_max > 0.0 { "예" } else { "아니오" },
+                margin, noise_band
+            ));
+            crate::utils::score_dynamics::record_baseline("mode_probe.axis_snr", snr);
+            crate::utils::score_dynamics::record_decay("mode_probe.trade_codes", &trade_row);
+        }
+    }
+
     if margin < noise_band && !has_marker {
         emit_term(&format!(
             "  🛒 [THIN MARGIN] 진영 마진 {:+.4} 가 극값 잡음대 {:.4} 미만이고 국제 표준 포맷 증거도 없습니다. 리라우트하지 않습니다.",
@@ -573,6 +722,9 @@ pub async fn probe_trade_document(
         "  ✅ [MODE PROBE CONFIRMED] '{}' | 보정 {:+.4} | 마진 {:+.4} (잡음대 {:.4}) | 근거 표제 \"{}\" (전문 {:.4} vs 껍데기 {:.4}) | 구조 증거 {:?}",
         best_trade.0, trade_score, margin, noise_band, evidence_value, title_cos, chrome_cos, markers
     ));
+    // 🌟 [SDS 계측] 확정된 코드로 1차 스코프를 정밀화합니다.
+    //    이 시점 이후의 모든 관측은 'trading|CI|' 처럼 서식별로 격리됩니다.
+    crate::utils::score_dynamics::refine_primary(&best_trade.0);
     Some(TradeRerouteVerdict {
         code: best_trade.0,
         title,
@@ -1303,7 +1455,37 @@ async fn extract_continuation_page(
         }
     }
     let centered = crate::utils::ai_utils::double_center_matrix(&matrix);
-    let assign = crate::utils::ai_utils::exclusive_assign_by_score(&centered, 0.0, 0.0);
+    // 🌟 [T-2] 배열 행 배정에도 잡음 마진 게이트를 적용합니다.
+    //
+    //  ── 실측 표적 ──
+    //   SR-2026-0820 의 line_items 에서
+    //     unit: "6.0"        ← B200 의 volume 6.0 이 유출
+    //     total_price: 15    ← 전체 volume 15.0 이 유출
+    //   두 사고 모두 '순수 수치 셀' 이 여러 수치 필드와 비슷한 점수를 내는
+    //   평탄 분포에서 발생했습니다. 즉 Flat 동률이며,
+    //   지금은 마진 임계 0.0 이라 그대로 확정됩니다.
+    //
+    //  ── 배열 행에서는 혼동 사전을 쓰지 않습니다 ──
+    //   행 내부 필드는 unit / quantity / total_price 처럼 수치 축이 몰려 있어,
+    //   같은 쌍이 반복 충돌하는 것이 '역사적 승자가 있다' 는 뜻이 아니라
+    //   '구조적으로 구분 불가' 라는 뜻입니다.
+    //   따라서 동률은 종류를 불문하고 보류하고 LLM 에 맡깁니다.
+    let (assign, arr_diags) = crate::utils::ai_utils::exclusive_assign_by_score_adaptive(
+        &centered,
+        0.0,
+        0.0,
+        |_f: usize, _rival: usize, _kind: crate::utils::ai_utils::TieKind| -> bool { false },
+    );
+    for d in arr_diags.iter() {
+        if d.tie == crate::utils::ai_utils::TieKind::Decisive { continue; }
+        let fname = f_names.get(d.field).cloned().unwrap_or_default();
+        let rname = f_names.get(d.rival).cloned().unwrap_or_default();
+        emit_term(&format!(
+            "    ⚖️ [ARRAY TIE HOLD] '{}' vs '{}' | 마진 {:+.4} < 잡음 마진 {:.4} ({:?}) → 보류. 수치 축이 몰린 행에서는 결정론으로 가릴 근거가 없습니다.",
+            fname, rname, d.margin, d.noise_margin, d.tie
+        ));
+        crate::utils::score_dynamics::record_confusion(&fname, &rname, d.margin);
+    }
     use crate::logic::trade_field_category;
     let mut assigned = 0usize;
     let mut item_row = serde_json::Map::new();
@@ -1876,7 +2058,22 @@ pub async fn process_trading_task(
                     if keep { "표제 후보 유지" } else { "참조 라벨 → 제외" }
                 ));
             }
+            // 🌟 [T-1] 값 축 후보를 강가중군과 약가중군으로 나눕니다.
+            //
+            //  ── 왜 나누는가 ──
+            //   bank_neutral_key_scores 는 뱅크 중립화(행/열 센터링)를 내부에서
+            //   수행합니다. 강한 값과 약한 값을 한 배열에 섞으면 약한 값이
+            //   기준선을 끌어내려, 정작 정확한 후보의 대비까지 깎입니다.
+            //   따라서 각각 독립적으로 채점한 뒤 가중 합성해야
+            //   '약한 후보를 살리되 강한 후보를 해치지 않는다' 가 성립합니다.
+            //
+            //  ── 이 함수의 로컬 판정을 그대로 두는 이유 ──
+            //   여기의 label_is_title / cands 는 resolve_title_values_weighted 와
+            //   별개로 이 스코프에서 이미 산출되어 있습니다.
+            //   그 판정을 버리고 함수를 다시 부르면 임베딩이 중복되므로,
+            //   가중치만 동일 규칙으로 여기서 유도합니다.
             let mut value_texts: Vec<String> = Vec::new();
+            let mut value_is_headless: Vec<bool> = Vec::new();
             for c in cands.iter() {
                 let keep = if c.label.trim().is_empty() {
                     true
@@ -1886,6 +2083,7 @@ pub async fn process_trading_task(
                 if !keep { continue; }
                 if !value_texts.iter().any(|e| e == &c.value) {
                     value_texts.push(c.value.clone());
+                    value_is_headless.push(c.label.trim().is_empty());
                 }
             }
             if value_texts.is_empty() {
@@ -1926,11 +2124,106 @@ pub async fn process_trading_task(
                     .map(|(c, k, p)| (c.clone(), k.clone(), t_emb(p))).collect();
                 let t_prej_bank: Vec<(String, String, Vec<f32>)> = t_prej.iter()
                     .map(|(c, k, p)| (c.clone(), k.clone(), t_emb(p))).collect();
-                title_scores = crate::utils::ai_utils::bank_neutral_key_scores(
-                    &val_embs, &t_bias_bank, &t_prej_bank,
-                );
+                // 🌟 [T-1] 라벨 없는 후보의 바닥 판정을 여기서도 가중치로 전환합니다.
+                //
+                //  ── 판정 근거는 resolve_title_values_weighted 와 동일합니다 ──
+                //   자기선언 앵커와의 코사인 분포에서 평균을 바닥으로 삼고,
+                //   미달분은 min-max 백분위를 가중치로 부여합니다.
+                //   새 상수를 만들지 않기 위해 두 곳이 같은 규칙을 씁니다.
+                let title_anchor_emb = model
+                    .get_embedding(TRADE_TITLE_LABEL_ANCHOR.to_string())
+                    .await
+                    .unwrap_or_else(|_| vec![0.0f32; 384]);
+                let mut self_decl: Vec<f32> = Vec::with_capacity(value_texts.len());
+                for (vi, _) in value_texts.iter().enumerate() {
+                    if val_embs[vi].iter().all(|&x| x == 0.0) {
+                        self_decl.push(f32::MIN);
+                    } else {
+                        self_decl.push(crate::utils::ai_utils::cosine_similarity(
+                            &val_embs[vi], &title_anchor_emb,
+                        ));
+                    }
+                }
+                let live: Vec<f32> = self_decl.iter().cloned().filter(|s| *s > f32::MIN).collect();
+                let t_floor = if live.len() < 4 {
+                    0.0f32
+                } else {
+                    live.iter().sum::<f32>() / (live.len() as f32)
+                };
+                let (t_min, t_max) = if live.is_empty() {
+                    (0.0f32, 0.0f32)
+                } else {
+                    (
+                        live.iter().cloned().fold(f32::MAX, f32::min),
+                        live.iter().cloned().fold(f32::MIN, f32::max),
+                    )
+                };
+
+                let mut strong_embs: Vec<Vec<f32>> = Vec::new();
+                let mut weak_embs: Vec<Vec<f32>> = Vec::new();
+                let mut weak_w_max = 0.0f32;
+                let mut weak_names: Vec<String> = Vec::new();
+                for (vi, v) in value_texts.iter().enumerate() {
+                    // 라벨이 표제로 확정된 후보는 바닥 판정 대상이 아니므로 항상 강가중입니다.
+                    if !value_is_headless[vi] || self_decl[vi] == f32::MIN || self_decl[vi] >= t_floor {
+                        strong_embs.push(val_embs[vi].clone());
+                        continue;
+                    }
+                    let span = (t_max - t_min).max(1e-6);
+                    let w = ((self_decl[vi] - t_min) / span).clamp(0.0, 1.0);
+                    if w > weak_w_max { weak_w_max = w; }
+                    weak_embs.push(val_embs[vi].clone());
+                    weak_names.push(format!("{}(w{:.2})", v, w));
+                }
+
+                if !strong_embs.is_empty() {
+                    title_scores = crate::utils::ai_utils::bank_neutral_key_scores(
+                        &strong_embs, &t_bias_bank, &t_prej_bank,
+                    );
+                }
+                // 🌟 [T-1 / 약가중 합성] 약가중군을 독립 채점한 뒤 가중 합산합니다.
+                //
+                //  ── 실측 표적 ──
+                //   SA 문서에서 'Shipping Advice' 가 이 경로로 되살아납니다.
+                //   그 값은 TRADE_DOC_TITLES 의 ("SA", "shipping advice") 와
+                //   사실상 동일 문자열이므로 약가중이어도 SA 코드 점수를
+                //   본문 축이 뒤집을 수 없는 수준으로 끌어올립니다.
+                if !weak_embs.is_empty() && weak_w_max > 0.0 {
+                    let weak_scores = crate::utils::ai_utils::bank_neutral_key_scores(
+                        &weak_embs, &t_bias_bank, &t_prej_bank,
+                    );
+                    emit_term(&format!(
+                        "  🪶 [TITLE WEAK MERGE] 바닥({:.4}) 미달 후보 {}개를 가중치 {:.3} 로 표제 축에 합류시킵니다: {:?}",
+                        t_floor, weak_embs.len(), weak_w_max,
+                        weak_names.iter().take(6).collect::<Vec<_>>()
+                    ));
+                    if title_scores.is_empty() {
+                        title_scores = weak_scores
+                            .into_iter()
+                            .map(|(c, s)| (c, s * weak_w_max))
+                            .collect();
+                    } else {
+                        for (c, s) in weak_scores.into_iter() {
+                            match title_scores.iter_mut().find(|(tc, _)| *tc == c) {
+                                Some(slot) => slot.1 += s * weak_w_max,
+                                None => title_scores.push((c, s * weak_w_max)),
+                            }
+                        }
+                    }
+                    title_scores.sort_by(|a, b| {
+                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
                 for (c, s) in title_scores.iter().take(6) {
                     emit_term(&format!("     📐 [TITLE AXIS] {} | Score: {:+.4}", c, s));
+                }
+                // 🌟 [SDS 계측] 표제 축의 감쇠 곡선과 바닥을 남깁니다.
+                {
+                    let arr: Vec<f32> = title_scores.iter().map(|(_, s)| *s).collect();
+                    if arr.len() >= 2 {
+                        crate::utils::score_dynamics::record_decay("trading.title_axis", &arr);
+                    }
+                    crate::utils::score_dynamics::record_baseline("trading.title_floor", t_floor);
                 }
             }
         }
@@ -1990,17 +2283,67 @@ pub async fn process_trading_task(
         code_scores.push((codes[0].to_string(), 0.0));
     }
     if !title_scores.is_empty() {
+        // 🌟 [T-1 / 역분산 융합] 고정 가중치 2.0 을 축 SNR 비율로 스케일링합니다.
+        //
+        //  ── 2.0 의 출처와 한계 ──
+        //   기존 주석: "실측 제목 축 마진(1.3076)이 바디 축 최대 왜곡(약 1.1)보다
+        //   커지도록 한 값". 즉 특정 문서 한 건에서 유도한 상수입니다.
+        //   제목 축이 그 문서보다 약한 문서에서는 과대 가중이 되고,
+        //   그 결과 약한 표제가 본문 축의 정당한 판정을 뒤엎을 수 있습니다.
+        //
+        //  ── 왜 SNR 비율인가 ──
+        //   두 축의 점수는 척도가 다릅니다(본문은 bank-neutral surprisal,
+        //   제목은 bank-neutral title). 절대값 비교가 불가능하므로
+        //   각 축 내부에서 무차원량을 뽑아야 합니다.
+        //     신호 = 1위 − 꼬리 중앙값
+        //     잡음 = 꼬리(2위 이하) 표준편차
+        //   두 SNR 의 비율은 척도 불변이며, 제목 축이 본문 축만큼 변별력이
+        //   있을 때 1.0 이 됩니다.
+        //
+        //  ── 왜 상한을 1.0 으로 두는가 ──
+        //   이것은 튜닝 상수가 아니라 안전 규칙입니다.
+        //   '기존 동작(2.0)을 초과하지 않는다' 를 보장하면
+        //   제목 축이 강한 문서(SR, CI)에서 회귀가 구조적으로 불가능해집니다.
+        //   즉 이 변경은 '제목 축이 약할 때만 감쇠' 라는 단방향입니다.
+        //
+        //  ── SNR 을 구할 수 없으면 ──
+        //   axis_snr 이 None(후보 3개 미만 또는 꼬리 균일)이면
+        //   기존 상수 2.0 을 그대로 씁니다. 냉간 시작 원칙과 동일한 폴백입니다.
+        let title_weight = {
+            let t_arr: Vec<f32> = title_scores.iter().map(|(_, s)| *s).collect();
+            let b_arr: Vec<f32> = code_scores.iter().map(|(_, s)| *s).collect();
+            match (
+                crate::utils::ai_utils::axis_snr(&t_arr),
+                crate::utils::ai_utils::axis_snr(&b_arr),
+            ) {
+                (Some(t_snr), Some(b_snr)) if b_snr > 1e-6 => {
+                    let ratio = (t_snr / b_snr).clamp(0.0, 1.0);
+                    emit_term(&format!(
+                        "  📐 [TITLE AXIS CONFIDENCE] 제목 축 SNR {:.4} / 본문 축 SNR {:.4} = 비율 {:.4} → 융합 가중치 {:.4} (상한 2.0)",
+                        t_snr, b_snr, ratio, 2.0 * ratio
+                    ));
+                    crate::utils::score_dynamics::record_baseline("trading.title_snr", t_snr);
+                    crate::utils::score_dynamics::record_baseline("trading.body_snr", b_snr);
+                    crate::utils::score_dynamics::record_baseline("trading.title_weight", 2.0 * ratio);
+                    2.0f32 * ratio
+                }
+                _ => {
+                    emit_term("  📐 [TITLE AXIS CONFIDENCE] 축 SNR 을 산출할 수 없어 기존 가중치 2.0 을 유지합니다.");
+                    2.0f32
+                }
+            }
+        };
         let mut merged = 0usize;
         for (cname, cs) in code_scores.iter_mut() {
             if let Some((_, ts)) = title_scores.iter().find(|(t, _)| t == cname) {
-                *cs += 2.0 * ts;
+                *cs += title_weight * ts;
                 merged += 1;
             }
         }
         code_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         emit_term(&format!(
-            "  🪪 [TITLE AXIS MERGE] 본문 축에 제목 축(가중치 2.0)을 합산했습니다. (코드 {}개)",
-            merged
+            "  🪪 [TITLE AXIS MERGE] 본문 축에 제목 축(가중치 {:.4})을 합산했습니다. (코드 {}개)",
+            title_weight, merged
         ));
     }
     for (c, s) in code_scores.iter() {
@@ -2597,8 +2940,18 @@ pub async fn process_trading_task(
                             unique_labels[h], t_field_names[f], label_self_cos[h], label_ref_cos[h]
                         ));
                     }
+                    // 🌟 [SDS 계측] 로그 상한(8건)과 무관하게 관측은 전량 기록합니다.
+                    //    로그는 사람이 읽는 상한이 필요하지만 통계는 표본이 많을수록 정확합니다.
+                    crate::utils::score_dynamics::record_field_reject(
+                        &t_field_names[f],
+                        crate::utils::score_dynamics::GateKind::SelfId,
+                    );
                     continue;
                 }
+                // 🌟 [SDS 계측] 이 필드가 후보로 검토되었다는 사실 자체를 남깁니다.
+                //    거절률의 분모가 되므로 게이트보다 먼저 기록해야 합니다.
+                crate::utils::score_dynamics::record_field_seen(&t_field_names[f]);
+
                 let prej = if t_prej_embs[f].is_empty() {
                     0.0
                 } else {
@@ -2607,14 +2960,24 @@ pub async fn process_trading_task(
                 if crate::utils::ai_utils::prejudice_dominates(own, prej, f_cohesion) {
                     emit_term(&format!("    🚫 [TRADING PREJUDICE GATE] '{}' → '{}' | Label: {:.4} | Prej: {:.4} | Cohesion: {:.4} (상대 우위 초과)",
                         unique_labels[h], t_field_names[f], own, prej, f_cohesion));
+                    // 🌟 [SDS 계측] 게이트 거절은 '판정 결과' 가 아니라
+                    //    '형식·구조 사실' 이므로 학습해도 자기강화 피드백(리스크 R1)이
+                    //    발생하지 않습니다. Phase 2 학습형 prejudice 의 유일한 입력입니다.
+                    crate::utils::score_dynamics::record_field_reject(
+                        &t_field_names[f],
+                        crate::utils::score_dynamics::GateKind::Prejudice,
+                    );
                     continue;
                 }
                 let pair_val = if f_multi { &phrase_multi[h] } else { &phrase_single[h] };
-
                 if pair_val.trim().is_empty()
                     || !crate::utils::ai_utils::value_matches_format(f_fmt, pair_val) {
                     emit_term(&format!("    🚫 [TRADING VALUE FORMAT GATE] '{}' → '{}' ({:?}) | 값 \"{}\" 형식 불일치",
                         unique_labels[h], t_field_names[f], f_fmt, pair_val));
+                    crate::utils::score_dynamics::record_field_reject(
+                        &t_field_names[f],
+                        crate::utils::score_dynamics::GateKind::Format,
+                    );
                     continue;
                 }
                 let _ = f_strict;
@@ -2622,11 +2985,13 @@ pub async fn process_trading_task(
                     && crate::utils::ai_utils::is_pure_numeric_value(pair_val) {
                     emit_term(&format!("    🚫 [TRADING ENUM NUMERIC GATE] '{}' → '{}' | 값 \"{}\" 은 순수 수치",
                         unique_labels[h], t_field_names[f], pair_val));
+                    crate::utils::score_dynamics::record_field_reject(
+                        &t_field_names[f],
+                        crate::utils::score_dynamics::GateKind::Enum,
+                    );
                     continue;
                 }
-
                 leaf_raw[f][h] = own;
-
                 if unique_section[h].is_empty() { continue; }
                 if section_embs[h].iter().all(|&v| v == 0.0) { continue; }
                 sec_raw[f][h] = crate::utils::ai_utils::weighted_max_pool_sim(
@@ -2690,7 +3055,80 @@ pub async fn process_trading_task(
             }
         }
 
-        let t_assign = crate::utils::ai_utils::exclusive_assign_by_score(&t_matrix, 0.0, 0.0);
+        // 🌟 [T-2] 잡음 마진 게이트를 적용한 배타 배정으로 교체합니다.
+        //
+        //  ── 실측 표적 ──
+        //   ✨ [PLINKO ASSIGN] 'related_po_number' → 'marks_numbers' | Margin: +0.0001
+        //   이 경로의 마진 임계값은 0.0 이라 사실상 게이트가 없습니다.
+        //   그 결과 동점에 가까운 배정이 아무 저항 없이 통과했습니다.
+        //
+        //  ── allow_tie 의 판단 근거 ──
+        //   PairConfusion(1·2위만 붙음)이면 혼동 사전을 조회해
+        //   과거에 같은 쌍이 반복 충돌했고 승자가 일관되었는지 봅니다.
+        //   Phase 0 관측이 부족하면 confusion_winner 가 None 을 돌려주므로
+        //   보류가 되고, 그 필드는 아래 LLM 카테고리 패스가 다시 채웁니다.
+        //   Flat(전체 평탄)은 다중 속성 값이거나 변별력 없음이므로
+        //   역사와 무관하게 항상 보류합니다. 결정론으로 고를 근거가 없기 때문입니다.
+        //
+        //  ── 보류가 손실이 아닌 이유 ──
+        //   PLINKO 는 'LLM 없이 확정' 하는 선행 단계일 뿐이고,
+        //   확정되지 않은 필드는 PRESENCE GATE 를 거쳐 LLM 이 채웁니다.
+        //   즉 잘못 확정하면 되돌릴 수 없지만, 보류하면 복구 경로가 있습니다.
+        let (t_assign, t_diags) = {
+            let names = t_field_names.clone();
+            crate::utils::ai_utils::exclusive_assign_by_score_adaptive(
+                &t_matrix,
+                0.0,
+                0.0,
+                |f: usize, rival: usize, kind: crate::utils::ai_utils::TieKind| -> bool {
+                    if kind == crate::utils::ai_utils::TieKind::Flat { return false; }
+                    let (a, b) = match (names.get(f), names.get(rival)) {
+                        (Some(x), Some(y)) => (x.as_str(), y.as_str()),
+                        _ => return false,
+                    };
+                    match crate::utils::score_dynamics::confusion_winner(a, b) {
+                        Some((winner, rate)) => winner == a && rate > 0.5,
+                        None => false,
+                    }
+                },
+            )
+        };
+        // 🌟 [T-2 진단] 동률 판정 결과를 로그와 관측으로 남깁니다.
+        for d in t_diags.iter() {
+            let fname = t_field_names.get(d.field).cloned().unwrap_or_default();
+            let rname = t_field_names.get(d.rival).cloned().unwrap_or_default();
+            match d.tie {
+                crate::utils::ai_utils::TieKind::Decisive => {}
+                crate::utils::ai_utils::TieKind::PairConfusion => {
+                    emit_term(&format!(
+                        "    ⚖️ [TIE / PAIR CONFUSION] Label '{}' | '{}' vs '{}' | 마진 {:+.4} < 잡음 마진 {:.4} | 1·2위만 붙고 3위 이하는 떨어짐 → {}",
+                        unique_labels.get(d.line).cloned().unwrap_or_default(),
+                        fname, rname, d.margin, d.noise_margin,
+                        if d.accepted { "혼동 사전의 역사 승자로 확정" } else { "보류 (LLM 패스로 이관)" }
+                    ));
+                }
+                crate::utils::ai_utils::TieKind::Flat => {
+                    emit_term(&format!(
+                        "    ⚖️ [TIE / FLAT] Label '{}' | '{}' vs '{}' | 마진 {:+.4} < 잡음 마진 {:.4} | 경쟁 분포 전체가 평탄 → 보류 (다중 속성 값이거나 변별력 없음)",
+                        unique_labels.get(d.line).cloned().unwrap_or_default(),
+                        fname, rname, d.margin, d.noise_margin
+                    ));
+                }
+            }
+            if d.tie != crate::utils::ai_utils::TieKind::Decisive {
+                crate::utils::score_dynamics::record_confusion(&fname, &rname, d.margin);
+                crate::utils::score_dynamics::record_baseline("plinko.noise_margin", d.noise_margin);
+            }
+        }
+        {
+            let held = t_diags.iter().filter(|d| !d.accepted).count();
+            if held > 0 {
+                emit_term(&format!(
+                    "  ⚖️ [T-2 TIE GATE] 잡음 마진을 넘지 못한 배정 {}건을 보류했습니다. (잘못 확정하면 되돌릴 수 없지만, 보류는 LLM 패스가 복구합니다)",
+                    held
+                ));
+            }
+        }
         use crate::logic::trade_field_category;
         let mut drift_dropped = 0usize;
         for (f, a) in t_assign.iter().enumerate() {
@@ -2840,55 +3278,57 @@ pub async fn process_trading_task(
             emit_term(&format!("    ✨ [TRADING PLINKO ASSIGN] Label '{}' → Field '{}' (cat: {}) | Score: {:+.4} | Margin: {:+.4} | Line {} | Value: \"{}\"",
                 unique_labels[h], fname, if cat.is_empty() { "-" } else { cat }, score, margin, phrase_line[h] + 1, val));
 
-            // 🌟 [COUNT-UNIT SPLIT / 짝 축 주입] 분해된 반대편 값을 같은 카테고리 슬롯에 넣습니다.
-            //    이미 PLINKO 가 그 축을 확정했다면 덮지 않습니다. (인쇄된 별도 셀 우선)
-            if let Some((pair_field, pair_value, _)) = split_pair {
-                if assigned_fields.contains_key(&pair_field) {
-                    emit_term(&format!(
-                        "    ⏭️ [COUNT-UNIT SPLIT SKIP] '{}' 는 이미 확정값 \"{}\" 을 갖고 있어 분해값 \"{}\" 을 주입하지 않습니다.",
-                        pair_field, assigned_fields.get(&pair_field).cloned().unwrap_or_default(), pair_value
-                    ));
-                } else {
-                    let pair_cat = trade_field_category(&pair_field);
-                    let wrote = match pair_cat {
-                        "" => false,
-                        "items" | "containers" => {
-                            let ak = if pair_cat == "items" { "line_items" } else { "containers" };
-                            let slot = final_data_map
-                                .entry(ak.to_string())
-                                .or_insert_with(|| Value::Array(Vec::new()));
-                            match slot.as_array_mut() {
-                                Some(arr) => {
-                                    if arr.is_empty() { arr.push(Value::Object(serde_json::Map::new())); }
-                                    match arr[0].as_object_mut() {
-                                        Some(row) => { row.insert(pair_field.clone(), json!(pair_value.clone())); true }
-                                        None => false,
-                                    }
-                                }
-                                None => false,
-                            }
-                        }
-                        _ => match final_data_map.get_mut(pair_cat).and_then(|v| v.as_object_mut()) {
-                            Some(slot) => { slot.insert(pair_field.clone(), json!(pair_value.clone())); true }
-                            None => false,
-                        },
-                    };
-                    if wrote {
-                        assigned_fields.insert(pair_field.clone(), pair_value.clone());
-                        emit_term(&format!(
-                            "    ✅ [COUNT-UNIT SPLIT ASSIGN] '{}' (cat: {}) ← \"{}\" (복합값 분해분)",
-                            pair_field, if pair_cat.is_empty() { "-" } else { pair_cat }, pair_value
-                        ));
-                    } else {
-                        emit_term(&format!(
-                            "    ⚠️ [COUNT-UNIT SPLIT MISS] '{}' (cat: '{}') 를 기록할 슬롯이 없어 분해분을 폐기합니다.",
-                            pair_field, pair_cat
-                        ));
-                    }
+            // 🌟 [SDS 계측] 확정 마진과 그 라벨의 전체 감쇠 곡선을 남깁니다.
+            //
+            //  ── 표적 사고 ──
+            //   'related_po_number' → 'marks_numbers' | Margin: +0.0001
+            //   현재는 이 값이 로그로만 흘러가고 아무 데도 축적되지 않습니다.
+            //   그런데 이런 동률에는 두 종류가 있습니다.
+            //     우연한 근접  — 다음에는 다른 필드가 이길 수 있음
+            //     구조적 혼동  — 같은 쌍이 반복해서 붙음
+            //   혼동 카운트를 쌓으면 Phase 1 에서 역사 승자로 결정론 해소가 됩니다.
+            //
+            //  ── 감쇠 곡선을 함께 남기는 이유 ──
+            //   [0.85, 0.20, 0.15] 는 낮은 마진이어도 1위가 이상치이고,
+            //   [0.60, 0.59, 0.58] 은 높은 마진이어도 변별력이 없습니다.
+            //   두 상황을 마진만으로는 영원히 구분할 수 없습니다.
+            //
+            //  ── 값은 저장하지 않습니다 ──
+            //   프라이버시 정책상 필드명과 수치만 남기고 val 은 기록하지 않습니다.
+            crate::utils::score_dynamics::record_field_assigned(&fname, margin);
+            {
+                // 🌟 [정정] 이 스코프의 라벨×필드 행렬은 t_matrix 입니다.
+                //    d_matrix 는 scheduler.rs 상세 경로의 변수명이며 여기에는 존재하지 않습니다.
+                //    또한 무효 표식이 f32::MIN 이 아니라 -1.0 이므로
+                //    필터 조건도 그에 맞춰야 합니다. (FOREIGN REF PIN 이 -1.0 으로 열을 닫습니다)
+                let row: Vec<f32> = (0..t_field_names.len())
+                    .map(|fi| t_matrix[fi][h])
+                    .filter(|v| *v >= 0.0 && v.is_finite())
+                    .collect();
+                if row.len() >= 2 {
+                    crate::utils::score_dynamics::record_decay("plinko.label_row", &row);
+                }
+                // 2위 필드를 찾아 혼동 쌍으로 남깁니다.
+                let mut best2: (usize, f32) = (usize::MAX, f32::MIN);
+                for fi in 0..t_field_names.len() {
+                    if t_field_names[fi] == fname { continue; }
+                    let v = t_matrix[fi][h];
+                    if v < 0.0 || !v.is_finite() { continue; }
+                    if v > best2.1 { best2 = (fi, v); }
+                }
+                if best2.0 != usize::MAX {
+                    crate::utils::score_dynamics::record_confusion(
+                        &fname,
+                        &t_field_names[best2.0],
+                        margin,
+                    );
+                    // 마진이 극소하면 니어미스로도 별도 계상합니다.
+                    // '얼마나 작아야 니어미스인가' 는 Phase 1 에서 분포로 유도하므로
+                    // 여기서는 판정하지 않고 마진 분포에 그대로 남깁니다.
+                    crate::utils::score_dynamics::record_near_miss(&t_field_names[best2.0]);
                 }
             }
         }
-
         emit_term(&format!(
             "  ✅ [TRADING PLINKO] LLM 없이 {}개 필드 확정 완료. (표류 폐기 {}건)",
             assigned_fields.len(), drift_dropped

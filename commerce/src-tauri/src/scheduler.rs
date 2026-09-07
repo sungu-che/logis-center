@@ -211,7 +211,31 @@ pub async fn process_task(
     }
 
     let (url, origin_candidate) = crate::utils::url_utils::resolve_absolute_url(&task_data).await;
-
+    // 🌟 [SDS SCOPE] 이 태스크의 관측 스코프를 세웁니다.
+    //
+    //  ── 왜 여기인가 ──
+    //   url 과 origin 이 확정된 직후이자, 어떤 판정도 시작되기 전입니다.
+    //   이보다 앞이면 스코프의 2차 키(cc)가 비고, 이보다 뒤면
+    //   STEP A 의 초기 관측이 스코프 없이 버려집니다.
+    //
+    //  ── 1차 키는 나중에 정밀화됩니다 ──
+    //   지금은 page_type 을 모르므로 mode 만 넣고,
+    //   STEP A 가 분류를 마치거나 MODE PROBE 가 서식을 확정하면
+    //   refine_primary 가 1차 키를 교체합니다.
+    //
+    //  ── 이미지 경로는 여기 도달하지 않습니다 ──
+    //   image_extraction 은 위쪽에서 return 하므로
+    //   비전 스코프는 model/vision.rs 진입부에서 따로 세워야 합니다.
+    {
+        let track = if search_mode == "shipping" {
+            crate::utils::score_dynamics::Track::Trading
+        } else if search_mode == "analytic" {
+            crate::utils::score_dynamics::Track::Analytic
+        } else {
+            crate::utils::score_dynamics::Track::Commerce
+        };
+        crate::utils::score_dynamics::enter_scope(&team_id, track, &search_mode, &task.cc);
+    }
     let active_task_json = json!({
         "id": task.id.clone(),
         "type": task.r#type.clone(),
@@ -1772,6 +1796,30 @@ pub async fn process_task(
 
             emit_term("\n[PAGE-TYPE CLASSIFICATION] === Per-Category Score Breakdown ===");
             emit_term(&format!("  Document Title: '{}'", doc_title));
+            // 🌟 [SDS 계측] 6개 카테고리 점수 배열의 감쇠 형상과 제목 신뢰도를 남깁니다.
+            //
+            //  ── 무엇을 보려는 것인가 ──
+            //   현재 판정은 최고점 하나(max_total_score)로 page_type 을 확정합니다.
+            //   그런데 title_trust / title_trust_eff 는 램프 상수(0.02/0.08/0.15)로
+            //   유도된 값이라, 그 상수가 이 사이트에서 적절한지 알 방법이 없습니다.
+            //   카테고리 점수 배열의 형상과 신뢰도를 함께 쌓아야
+            //   Phase 1 의 역분산 융합이 램프 상수를 대체할 수 있습니다.
+            {
+                let arr: Vec<f32> = category_scores.iter().map(|(_, s, _, _)| *s).collect();
+                if arr.len() >= 2 {
+                    crate::utils::score_dynamics::record_decay("commerce.page_type", &arr);
+                }
+                crate::utils::score_dynamics::record_baseline("commerce.title_trust", title_trust);
+                crate::utils::score_dynamics::record_baseline("commerce.title_trust_eff", title_trust_eff);
+                crate::utils::score_dynamics::record_baseline("commerce.dedup_floor", dedup_floor);
+                for (ci, cat) in categories.iter().enumerate() {
+                    crate::utils::score_dynamics::record_category_max(
+                        cat,
+                        category_phrase_embs[ci].1.len(),
+                        ev_line[ci] + ev_body[ci] + ev_url[ci],
+                    );
+                }
+            }
             let mut sorted_scores = category_scores.clone();
             sorted_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             for (cat, score, t_sim, line_cnt) in &sorted_scores {
@@ -1782,7 +1830,9 @@ pub async fn process_task(
             emit_term("[PAGE-TYPE CLASSIFICATION] ====================================\n");
             page_type = best_type;
             println!("[Scheduler] Deterministic Classified Page Type: {} (Max Score: {:.4})", page_type, max_total_score);
-
+            // 🌟 [SDS SCOPE] 1차 키를 확정된 page_type 으로 교체합니다.
+            //    이 시점 이후의 관측은 'commerce|goods|' 처럼 도메인별로 격리됩니다.
+            crate::utils::score_dynamics::refine_primary(&page_type);
             if page_type.is_empty() { 
                 return Ok(()); 
             }
@@ -5689,16 +5739,53 @@ pub async fn process_task(
                 
                 
                 
-                let d_assign = exclusive_assign_by_score(&d_matrix, 0.0, 0.0);
-                
+                // 🌟 [T-2] 상세 페어 배정에도 잡음 마진 게이트를 적용합니다.
+                //
+                //  ── 왜 이 경로도 필요한가 ──
+                //   여기는 라벨-값 구조 페어를 필드에 배정합니다.
+                //   섹션 축(SECTION_WEIGHT)까지 더한 뒤 마진 0.0 으로 확정하므로,
+                //   섹션이 비어 있는 문서에서는 라벨 코사인만으로 동점 확정이 납니다.
+                //
+                //  ── 혼동 사전을 쓰는 이유 ──
+                //   커머스 상세는 필드 이름 공간이 안정적이고
+                //   (sender_name / recipient_name / bank / card 등)
+                //   같은 쌍이 반복 충돌하면 실제로 역사적 승자가 존재합니다.
+                //   트레이딩 배열 행과 달리 사전 조회가 유효합니다.
+                let (d_assign, d_diags) = {
+                    let names = d_field_names.clone();
+                    crate::utils::ai_utils::exclusive_assign_by_score_adaptive(
+                        &d_matrix,
+                        0.0,
+                        0.0,
+                        |f: usize, rival: usize, kind: crate::utils::ai_utils::TieKind| -> bool {
+                            if kind == crate::utils::ai_utils::TieKind::Flat { return false; }
+                            let (a, b) = match (names.get(f), names.get(rival)) {
+                                (Some(x), Some(y)) => (x.as_str(), y.as_str()),
+                                _ => return false,
+                            };
+                            match crate::utils::score_dynamics::confusion_winner(a, b) {
+                                Some((winner, rate)) => winner == a && rate > 0.5,
+                                None => false,
+                            }
+                        },
+                    )
+                };
+                for d in d_diags.iter() {
+                    if d.tie == crate::utils::ai_utils::TieKind::Decisive { continue; }
+                    let fname = d_field_names.get(d.field).cloned().unwrap_or_default();
+                    let rname = d_field_names.get(d.rival).cloned().unwrap_or_default();
+                    emit_term(&format!(
+                        "    ⚖️ [DETAIL TIE] '{}' vs '{}' | 마진 {:+.4} < 잡음 마진 {:.4} ({:?}) → {}",
+                        fname, rname, d.margin, d.noise_margin, d.tie,
+                        if d.accepted { "혼동 사전 승자로 확정" } else { "보류 (LLM 패스로 이관)" }
+                    ));
+                    crate::utils::score_dynamics::record_confusion(&fname, &rname, d.margin);
+                }
                 
                 for (f, a) in d_assign.iter().enumerate() {
                     let (h, score, margin) = match a { Some(v) => *v, None => continue };
                     let owner = d_field_names[f].clone();
-
-                    
                     if is_id_link_field(&owner) { continue; }
-
                     let mut targets: Vec<usize> = Vec::new();
                     for (pi, ph) in pair_phrases.iter().enumerate() {
                         if ph == &unique_phrases[h] { targets.push(pi); }
@@ -8372,6 +8459,17 @@ pub async fn process_task(
     let _ = app_handle.emit("extraction-progress", &payload);
     log_task_progress(app_handle, &task.id, &payload);
     
+    // 🌟 [SDS] 태스크 경계에서 관측을 확정하고 스코프를 내립니다.
+    //
+    //  ── 왜 태스크마다 flush 인가 ──
+    //   추출은 폴링 워커가 연속으로 도는 장기 세션입니다.
+    //   앱이 비정상 종료되면 그동안의 관측이 통째로 날아가므로,
+    //   태스크 경계라는 자연스러운 커밋 지점에서 확정합니다.
+    //   dirty 가 아니면 파일을 쓰지 않으므로 I/O 낭비가 없습니다.
+    emit_term(&format!("[PROCESS] {}", crate::utils::score_dynamics::report()));
+    crate::utils::score_dynamics::flush();
+    crate::utils::score_dynamics::leave_scope();
+
     println!("[PROCESS] Task {} completed. Handover to Embedding finished.", task.id);
     Ok(())
 }

@@ -403,11 +403,11 @@ async fn reindex_pending_embeddings(
         //     ── 비용 ──
         //      analytics 도메인 타입은 get_detail_schema_fields 에 스키마가 없어
         //      index_item_chunks 가 조기 종료됩니다. 즉 추가 비용은 '문서 벡터 1개' 뿐입니다.
-        const EMBED_EXCLUDE_TYPES: [&str; 10] = [
-            "pages", "page", "talk", "prompt", "ai_search",
-            "question", "answer", "team", "user", "member",
-        ];
-        if EMBED_EXCLUDE_TYPES.iter().any(|t| doc.r#type == *t) {
+        // 🌟 [제외 타입 위임] 기존 EMBED_EXCLUDE_TYPES 배열은 talk / user 타입 목록의
+        //    네 번째 복제본이었습니다. store.rs::is_embed_excluded_type 하나로 통합합니다.
+        //    analytic 원시 이벤트(click/hover/change/touch)와 report 는 제외되지 않습니다.
+        //    그것들이 빠지면 D1 에서 받아온 행동 로그가 검색에 절대 잡히지 않습니다.
+        if crate::store::is_embed_excluded_type(&doc.r#type) {
             continue;
         }
         // 🌟 [MODE INTEGRITY RECHECK] SQL 필터를 신뢰하지 않고 한 번 더 봅니다.
@@ -1016,16 +1016,14 @@ async fn summarize_image(
 }
 
 fn sanitize_scope_filter(filter: Option<String>) -> Option<String> {
-    const ENVELOPE_COLS: [&str; 9] = [
-        "id", "type", "flag", "from", "to", "cc", "bcc", "ref", "mode",
-    ];
-    const TIME_COLS: [&str; 2] = ["created_at", "updated_at"];
-
+    // 🌟 [SINGLE SOURCE] 봉투 컬럼 목록을 store.rs 의 물리 스키마 선언과 공유합니다.
+    //    기존에는 여기에 ENVELOPE_COLS[9] + TIME_COLS[2] 로 복제되어 있어,
+    //    init_all_tables 의 Field 선언이 바뀌면 조용히 어긋났습니다.
+    use crate::store::ENVELOPE_COLUMNS;
     let raw = match filter {
         Some(f) if !f.trim().is_empty() => f,
         _ => return None,
     };
-
     let mut kept: Vec<String> = Vec::new();
     let mut dropped: Vec<String> = Vec::new();
     for clause in raw.split(" AND ") {
@@ -1056,9 +1054,7 @@ fn sanitize_scope_filter(filter: Option<String>) -> Option<String> {
             .trim()
             .to_lowercase();
 
-        let is_envelope = ENVELOPE_COLS.iter().any(|e| *e == lhs)
-            || TIME_COLS.iter().any(|e| *e == lhs);
-
+        let is_envelope = ENVELOPE_COLUMNS.iter().any(|e| *e == lhs);
         if is_envelope {
             kept.push(c.to_string());
         } else {
@@ -3351,18 +3347,13 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
                         .unwrap_or("").to_string();
             
             let raw_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").trim().to_string();
-
-            const COMMERCE_RESERVED: [&str; 19] = [
-                "sales", "goods", "order", "tracking", "event", "coupon", "review",
-                "receiving", "shipping", "member", "team", "user", "users",
-                "pages", "page", "talk", "prompt", "ai_search", "unknown",
-            ];
-            const ANALYTIC_RESERVED: [&str; 7] = [
-                "click", "hover", "change", "touch", "report", "question", "answer",
-            ];
+            // 🌟 [예약 타입 판정 위임] 기존 COMMERCE_RESERVED / ANALYTIC_RESERVED 두 배열은
+            //    store.rs 의 COMMERCE_TYPES / USER_TYPES / TALK_TYPES / ANALYTIC_TYPES 와
+            //    같은 집합을 세 번째로 복제한 것이었습니다.
+            //    'ID'(Import Declaration) / 'CO' / 'CA' / 'PC' 처럼 커머스 소문자 타입과
+            //    대소문자만 다른 무역 코드가 있으므로 예약 판정이 반드시 먼저 와야 합니다.
             let lower = raw_type.to_lowercase();
-            let is_reserved = COMMERCE_RESERVED.iter().any(|t| *t == lower)
-                || ANALYTIC_RESERVED.iter().any(|t| *t == lower);
+            let is_reserved = crate::store::is_reserved_type(&lower);
             let type_str = if is_reserved {
                 lower
             } else {
@@ -3392,22 +3383,17 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
                     if let Some(mode) = item.get("mode") {
                         obj.insert("mode".to_string(), mode.clone());
                     } else {
-                        let is_analytic_type = matches!(
-                            type_str.as_str(),
-                            "click" | "hover" | "change" | "report" | "question" | "answer"
-                        );
-
-                        let is_shipping_doc_type =
-                            crate::utils::bias_schema::canonical_bias_type(type_str.as_str())
-                                == "shipping_doc";
-                        if is_analytic_type {
-                            obj.insert("mode".to_string(), serde_json::json!("analytic"));
-                        } else if is_shipping_doc_type {
+                        // 🌟 [MODE 자동 태깅 위임] 기존 인라인 판정은 'touch' 가 빠져 있어
+                        //    touch 이벤트가 commerce 로 태깅되었습니다.
+                        //    (store.rs 의 추론이 뒤에서 덮어써 우연히 동작하고 있었을 뿐입니다)
+                        //    이제 store.rs::infer_mode 하나가 유일한 판정자입니다.
+                        let inferred = crate::store::infer_mode(type_str.as_str());
+                        if inferred != "commerce" {
                             println!(
-                                "[SYNC] 🚢 [MODE AUTO-TAG] id='{}' type='{}' 은 무역 서식이므로 mode='shipping' 으로 태깅합니다.",
-                                id, type_str
+                                "[SYNC] 🧭 [MODE AUTO-TAG] id='{}' type='{}' → mode='{}'",
+                                id, type_str, inferred
                             );
-                            obj.insert("mode".to_string(), serde_json::json!("shipping"));
+                            obj.insert("mode".to_string(), serde_json::json!(inferred));
                         }
                     }
                 }
@@ -3553,28 +3539,21 @@ async fn upsert_items(state: State<'_, AppState>, items: Vec<Value>) -> Result<S
             //      Client Worker 는 페이지 캐시 행에만 table:'pages' 를 실어 보내므로
             //      그 명시값을 '진짜로' 1순위에 둡니다. (추정이 아니라 계약입니다)
             let table_hint = item.get("table").and_then(|v| v.as_str()).unwrap_or("");
-            let final_table = match table_hint {
-                // ── 1순위 : 서버가 명시한 물리 테이블 ──
-                "pages" | "page" => "pages",
-                "users" => "users",
-                // 🌟 [TABLE HINT GUARD] table_hint 가 "talks" 이면 messages 경로이므로 skip
-                "talks" => continue,
-                // ── 2순위 : 힌트가 없거나 레거시(sales/tracking/event)일 때만 type 으로 판정 ──
-                _ => match type_str.as_str() {
-                    "member" | "team" | "user" | "users" => "users",
-                    "pages" | "page" => "pages",
-                    // analytics 트랙 행동 로그 / 리포트 / 관리자 Q&A 는 무조건 items 입니다.
-                    "click" | "hover" | "change" | "report" | "question" | "answer" => "items",
-                    "sales" | "goods" | "order" | "tracking" | "event" | "coupon" | "review"
-                    | "receiving" | "shipping" => "items",
-                    // 🌟 [NON-SEARCH GUARD] 검색/음차/청크 인덱싱 대상이 아닌 타입은
-                    //    items 테이블로 유입되면 reindex 스캔에서 불필요한 모델 호출을 유발합니다.
-                    //    talk/prompt/ai_search 는 이미 위에서 messages 로 continue 되지만,
-                    //    방어적으로 여기서도 skip 합니다.
-                    "talk" | "prompt" | "ai_search" => continue,
-                    // sales / tracking / event 같은 레거시 table 힌트는 전부 items 로 접습니다.
-                    _ => "items",
-                },
+            // 🌟 [TABLE HINT GUARD] table_hint 가 "talks" 이면 messages 경로이므로 skip
+            if table_hint == "talks" { continue; }
+            // 🌟 [NON-SEARCH GUARD] 검색/음차/청크 인덱싱 대상이 아닌 타입은
+            //    items 테이블로 유입되면 reindex 스캔에서 불필요한 모델 호출을 유발합니다.
+            //    talk/prompt/ai_search 는 이미 위에서 messages 로 continue 되지만,
+            //    방어적으로 여기서도 skip 합니다.
+            if crate::store::is_talk_type(type_str.as_str()) { continue; }
+            // ── 1순위 : 서버가 명시한 물리 테이블. 2순위 : type 으로 판정 ──
+            //    두 경로 모두 store.rs::resolve_table_for 를 통과하므로,
+            //    upsert 가 쓴 테이블과 get_item_by_id / delete_item 이 여는 테이블이
+            //    구조적으로 어긋날 수 없습니다.
+            let final_table = if table_hint.is_empty() {
+                crate::store::resolve_table_for(type_str.as_str())
+            } else {
+                crate::store::resolve_table_for(table_hint)
             };
 
             

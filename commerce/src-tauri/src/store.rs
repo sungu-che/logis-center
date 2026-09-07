@@ -39,6 +39,146 @@ pub struct AppConfig {
     pub auth_token: Option<String>,
 }
 
+// =====================================================================
+// 🌟 [ENVELOPE CONTRACT v5 / SINGLE SOURCE]
+// ---------------------------------------------------------------------
+//  저장소 역할 분담을 코드 한 곳에서 선언합니다.
+//    LanceDB : 봉투(Envelope) 물리 컬럼 + 벡터/FTS 검색 부품
+//    Dexie   : data.* 중첩 인덱스로 도메인 조건 / 정렬 / 페이징
+//
+//  ── 왜 여기로 모으는가 ──
+//   이 계약이 지금까지 다음 5곳에 복제되어 있었고, 실제로 어긋나 있었습니다.
+//     lib.rs   sanitize_scope_filter  : 봉투 컬럼 화이트리스트(스키마와 별도 상수)
+//     lib.rs   upsert_items           : 예약 타입 / mode 자동 태깅 / 테이블 라우팅
+//     store.rs upsert_item            : mode 추론 / non_seed_type
+//     store.rs resolve_table          : 물리 테이블 라우팅
+//     lib.rs   reindex_pending_embeddings : EMBED_EXCLUDE_TYPES
+//   실측 결함:
+//     · lib.rs 의 is_analytic_type 에 'touch' 가 빠져 touch 이벤트가 commerce 로 태깅됨
+//     · store.rs 의 non_seed_type 에도 'touch' 가 빠져 커머스 시드 16키가 주입됨
+//   아래 상수/함수가 유일한 진실의 원천이며, 모든 호출부는 여기에 위임합니다.
+// =====================================================================
+
+/// LanceDB 물리 봉투 컬럼. sanitize_scope_filter / build_scope_filter 가 공유합니다.
+/// 이 목록 밖의 술어는 전부 Dexie 로 위임됩니다.
+/// ⚠️ init_all_tables 의 Field 선언과 반드시 같은 집합이어야 합니다.
+pub const ENVELOPE_COLUMNS: [&str; 11] = [
+    "id", "type", "flag", "from", "to", "cc", "bcc", "ref", "mode",
+    "created_at", "updated_at",
+];
+
+/// analytic 트랙 문서 타입.
+/// analytic.rs 의 ANALYTIC_EVENT_TYPES(원시 이벤트 4종) + report / question / answer.
+pub const ANALYTIC_TYPES: [&str; 7] = [
+    "click", "hover", "change", "touch", "report", "question", "answer",
+];
+
+/// 채팅 말풍선(talks 테이블) 전용 타입. items 로 유입되면 안 됩니다.
+pub const TALK_TYPES: [&str; 3] = ["talk", "prompt", "ai_search"];
+
+/// 커머스 도메인 예약 타입.
+pub const COMMERCE_TYPES: [&str; 9] = [
+    "sales", "goods", "order", "tracking", "event", "coupon", "review",
+    "receiving", "shipping",
+];
+
+/// 사용자 / 팀 통계 문서 타입.
+pub const USER_TYPES: [&str; 3] = ["member", "team", "user"];
+
+pub fn is_analytic_type(type_: &str) -> bool {
+    let t = type_.trim().to_lowercase();
+    ANALYTIC_TYPES.iter().any(|x| *x == t)
+}
+
+pub fn is_talk_type(type_: &str) -> bool {
+    let t = type_.trim().to_lowercase();
+    TALK_TYPES.iter().any(|x| *x == t)
+}
+
+pub fn is_user_type(type_: &str) -> bool {
+    let t = type_.trim().to_lowercase();
+    USER_TYPES.iter().any(|x| *x == t)
+}
+
+/// 예약 타입 판정. 무역 서식 코드 정규화(canonical_trade_doc_code)를 태우면 안 되는 타입입니다.
+/// ⚠️ 'ID'(Import Declaration) / 'CO' / 'CA' / 'PC' 처럼 커머스 소문자 타입과
+///    대소문자만 다른 무역 코드가 존재하므로, 예약 판정이 먼저 와야 합니다.
+pub fn is_reserved_type(type_: &str) -> bool {
+    let t = type_.trim().to_lowercase();
+    t == "unknown"
+        || t == "users" || t == "pages" || t == "page"
+        || is_user_type(&t)
+        || is_talk_type(&t)
+        || is_analytic_type(&t)
+        || COMMERCE_TYPES.iter().any(|x| *x == t)
+}
+
+/// 타입만으로 트랙(mode)을 확정합니다.
+/// 판정 순서는 기존 store.rs::upsert_item 과 동일합니다(무역 → analytic → commerce).
+pub fn infer_mode(type_: &str) -> &'static str {
+    if crate::utils::bias_schema::is_trade_doc_type(type_) {
+        "shipping"
+    } else if is_analytic_type(type_) {
+        "analytic"
+    } else {
+        "commerce"
+    }
+}
+
+/// 물리 테이블 라우팅. v4 부터 도메인 타입은 전부 items 로 접히고,
+/// 구분은 type 컬럼이 담당합니다.
+pub fn resolve_table_for(table_or_type: &str) -> &'static str {
+    let t = if table_or_type.starts_with("commerce_") {
+        &table_or_type[9..]
+    } else {
+        table_or_type
+    };
+    match t {
+        // 사용자/팀 : 라이프사이클이 달라 물리 분리 유지
+        "users" | "member" | "team" | "user" => "users",
+        // 페이지 셀렉터 캐시 : 검색 대상이 아니라 물리 분리 유지
+        "pages" | "page" => "pages",
+        // 그 외 전부 items (sales/tracking/event/goods/order/coupon/review/talk/...)
+        _ => "items",
+    }
+}
+
+/// 커머스 도메인 조회 축 기본값(canonicalize_data 의 SEED_KEYS)을 시딩해야 하는가.
+/// ⚠️ main.ts 의 NON_SEED_TYPES 와 반드시 같은 집합이어야 두 저장소가 일치합니다.
+pub fn needs_domain_seed(target_table: &str, type_: &str) -> bool {
+    if matches!(target_table, "users" | "pages") { return false; }
+    if is_user_type(type_) { return false; }
+    if is_analytic_type(type_) { return false; }
+    true
+}
+
+/// 로컬 임베딩(reindex_pending_embeddings) 대상에서 제외할 타입인가.
+/// analytic 원시 이벤트(click/hover/change/touch)와 report 는 제외하지 않습니다.
+/// 그것들이 빠지면 D1 에서 받아온 행동 로그가 검색에 절대 잡히지 않습니다.
+pub fn is_embed_excluded_type(type_: &str) -> bool {
+    let t = type_.trim().to_lowercase();
+    if t == "pages" || t == "page" { return true; }
+    if is_talk_type(&t) { return true; }
+    if t == "users" || is_user_type(&t) { return true; }
+    // question / answer 는 관리자 채팅 말풍선이며 parse_analytic_query 의 검색 스코프에서도 제외됩니다.
+    if t == "question" || t == "answer" { return true; }
+    false
+}
+
+/// 봉투 값 1개를 확정합니다. 인자 → data → 빈 문자열 순으로 우선합니다.
+/// upsert_item 이 물리 컬럼과 data 양쪽에 '같은 값' 을 쓰기 위한 단일 판정기입니다.
+pub fn resolve_envelope_field(arg: Option<&str>, data: &Value, key: &str) -> String {
+    if let Some(v) = arg {
+        let t = v.trim();
+        if !t.is_empty() { return t.to_string(); }
+    }
+    data.get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
 impl VectorStore {
     pub async fn new(base_path: &str) -> Result<Self> {
         let conn = connect(base_path).execute().await?;
@@ -476,26 +616,11 @@ impl VectorStore {
         Ok(())
     }
 
-    // 🌟 [SINGLE ROUTER] 테이블 라우팅을 단 하나의 함수로 통일합니다.
-    //    기존에는 delete_item / delete_items / find_item_by_property / search_items /
-    //    upsert_item 이 각자 다른 match 문을 복붙해 놓아 서로 어긋났고,
-    //    그 결과가 'review 는 items 에 저장되는데 event 에서 조회' 버그였습니다.
-    //    v4 부터 도메인 타입은 전부 items 로 접히고, 구분은 type 컬럼이 담당합니다.
+    // 🌟 [SINGLE ROUTER] 테이블 라우팅은 모듈 전역 함수 resolve_table_for 하나뿐입니다.
+    //    lib.rs 의 upsert_items 도 같은 함수를 호출하므로,
+    //    '저장 테이블과 조회 테이블이 어긋나는' 경로가 구조적으로 사라집니다.
     fn resolve_table(table_or_type: &str) -> &'static str {
-        let t = if table_or_type.starts_with("commerce_") {
-            &table_or_type[9..]
-        } else {
-            table_or_type
-        };
-
-        match t {
-            // 사용자/팀 : 라이프사이클이 달라 물리 분리 유지
-            "users" | "member" | "team" | "user" => "users",
-            // 페이지 셀렉터 캐시 : 검색 대상이 아니라 물리 분리 유지
-            "pages" | "page" => "pages",
-            // 그 외 전부 items (sales/tracking/event/goods/order/coupon/review/talk/...)
-            _ => "items",
-        }
+        resolve_table_for(table_or_type)
     }
 
     pub async fn delete_item(&self, table_name: &str, id: &str) -> Result<()> {
@@ -923,6 +1048,15 @@ impl VectorStore {
     ) -> Result<()> {
         let target = Self::resolve_table(if table_name.is_empty() { "items" } else { table_name });
         let table = self.conn.open_table(target).execute().await?;
+
+        // 🌟 [ID FIRST] id 해석을 가장 먼저 확정합니다.
+        //    기존에는 read_existing_vectors 안에서 id 해석 로직이 한 번 더 복제되어 있었고,
+        //    그 복제본이 final_id 계산과 어긋나면 벡터 승계가 조용히 실패했습니다.
+        let final_id = if id.is_empty() {
+            data_val.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string()
+        } else { id.to_string() };
+        if final_id.is_empty() { return Ok(()); }
+
         // 🌟 [VECTOR PRESERVE]
         //
         //  ── 무엇이 문제였나 ──
@@ -941,27 +1075,44 @@ impl VectorStore {
         //   text 가 바뀌었으면 reindex 가 다시 만들어야 합니다.
         //   어느 쪽이든 '0 으로 지우기' 가 정답인 경우는 없습니다.
         let (carry_vec, carry_vision) = if vector.is_none() || vision_vec.is_none() {
-            self.read_existing_vectors(target, if id.is_empty() {
-                data_val.get("id").and_then(|v| v.as_str()).unwrap_or("")
-            } else { id }).await
+            self.read_existing_vectors(target, &final_id).await
         } else {
             (None, None)
         };
         let vector = vector.or(carry_vec);
         let vision_vec = vision_vec.or(carry_vision);
-
-        let final_id = if id.is_empty() {
-            data_val.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string()
-        } else { id.to_string() };
-
-        if final_id.is_empty() { return Ok(()); }
-
-        // 🌟 [SKIP GUARD] digest 는 이제 물리 컬럼이 아니라 data.digest 입니다.
+        // 🌟 [SKIP GUARD v2] digest 는 이제 물리 컬럼이 아니라 data.digest 입니다.
         //    기존 문서의 digest 를 읽으려면 json_data 를 파싱해야 합니다.
+        //
+        //  ── v1 의 결함 ①: 봉투 변경을 무시했습니다 ──
+        //   digest 는 text 만으로 만들어집니다. 그래서 서버가 cc / bcc / ref / to 만 바꿔
+        //   내려보내면 old_digest == new_digest 가 되어 return Ok(()) 로 빠지고,
+        //   봉투가 영구히 옛 값으로 남습니다.
+        //   '봉투는 LanceDB 담당' 이라는 v4 계약과 정면으로 충돌합니다.
+        //   (team 마이그레이션 / 사이트 재스코프 이후 목록·검색이 어긋나는 직접 원인)
+        //
+        //  ── v1 의 결함 ②: 압축 페이로드에서 updated_at 을 0 으로 읽었습니다 ──
+        //   updated_at 이 gzip/base64 블롭 안에 있으면 여기서는 0 이 됩니다.
+        //   그러면 doc.updated_at_ts >= 0 이 항상 참이 되어 정상 갱신이 스킵될 수 있습니다.
+        //   블롭이 미해제 상태이면 아예 스킵 판정을 하지 않습니다.
         let new_digest = digest.unwrap_or("").to_string();
         let new_updated_at = data_val.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0);
+        let has_pending_blob = data_val
+            .get("data")
+            .and_then(|v| v.as_str())
+            .map_or(false, |s| s.len() > 50);
         if let Some(doc) = self.get_item_by_id(target, &final_id).await? {
-            if doc.updated_at_ts >= new_updated_at && !new_digest.is_empty() {
+            let envelope_same = doc.r#type == type_
+                && doc.from == resolve_envelope_field(from, &data_val, "from")
+                && doc.to == resolve_envelope_field(to, &data_val, "to")
+                && doc.cc == resolve_envelope_field(cc, &data_val, "cc")
+                && doc.bcc == resolve_envelope_field(bcc, &data_val, "bcc")
+                && doc.r#ref == resolve_envelope_field(r#ref, &data_val, "ref");
+            if !has_pending_blob
+                && envelope_same
+                && doc.updated_at_ts >= new_updated_at
+                && !new_digest.is_empty()
+            {
                 let old_digest = serde_json::from_str::<Value>(&doc.json_data)
                     .ok()
                     .and_then(|v| v.get("digest").and_then(|d| d.as_str()).map(|s| s.to_string()))
@@ -969,6 +1120,12 @@ impl VectorStore {
                 if old_digest == new_digest {
                     return Ok(());
                 }
+            }
+            if !envelope_same {
+                println!(
+                    "[STORE] ✉️ [ENVELOPE CHANGED] id='{}' 의 봉투가 변경되어 digest 가 같아도 재기록합니다. (from/to/cc/bcc/ref/type)",
+                    final_id
+                );
             }
             // 🌟 [CC-INDEPENDENT SKIP] digest 가 달라도 embed=1 이고 chunk 가 존재하면
             //    '이미 임베딩 완료된 문서의 cc 변경' 으로 간주하여
@@ -1044,108 +1201,25 @@ impl VectorStore {
             }
         }
 
-        // 🌟 [CANONICALIZE v4] canonical.rs 의 kind_of 를 사용하여
-        //    필드 이름 기반으로 저장 타입을 확정합니다.
-        //    기존은 ID_KEYS / NUM_KEYS / BOOL_KEYS 배열을 사용했는데,
-        //    새 필드 추가 시 배열을 수정해야 했습니다.
-        //    이제 규칙 기반으로 자동 판정합니다.
-        if let Some(obj) = final_data.as_object_mut() {
-            let existing: Vec<String> = obj.keys().cloned().collect();
-            for k in existing {
-                let kind = crate::utils::canonical::kind_of(&k);
-                if kind == crate::utils::canonical::CanonKind::Free { continue; }
-                
-                match kind {
-                    crate::utils::canonical::CanonKind::Identifier => {
-                        let s = match obj.get(&k) {
-                            Some(serde_json::Value::Null) | None => continue,
-                            Some(serde_json::Value::String(s)) => s.clone(),
-                            Some(serde_json::Value::Number(n)) => n.to_string(),
-                            Some(serde_json::Value::Bool(b)) => if *b { "1".to_string() } else { "0".to_string() },
-                            Some(serde_json::Value::Array(_)) | Some(serde_json::Value::Object(_)) => continue,
-                        };
-                        obj.insert(k, serde_json::json!(s));
-                    },
-                    crate::utils::canonical::CanonKind::Numeric => {
-                        let n: f64 = match obj.get(&k) {
-                            None | Some(serde_json::Value::Null) => continue,
-                            Some(serde_json::Value::Number(num)) => num.as_f64().unwrap_or(0.0),
-                            Some(serde_json::Value::Bool(b)) => if *b { 1.0 } else { 0.0 },
-                            Some(serde_json::Value::String(s)) => {
-                                let t = s.trim();
-                                if t.is_empty() || t == "null" || t == "N/A" { continue; }
-                                if k == "status" {
-                                    crate::logic::parse_status(t) as f64
-                                } else if let Some(ms) = crate::utils::canonical::iso_to_epoch_ms(t) {
-                                    ms as f64
-                                } else {
-                                    let cleaned: String = t.chars()
-                                        .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
-                                        .collect();
-                                    match cleaned.parse::<f64>() {
-                                        Ok(v) => v,
-                                        Err(_) => continue,
-                                    }
-                                }
-                            },
-                            Some(serde_json::Value::Array(_)) | Some(serde_json::Value::Object(_)) => continue,
-                        };
-                        if n.fract() == 0.0 && n.abs() < 9e15 {
-                            obj.insert(k, serde_json::json!(n as i64));
-                        } else {
-                            obj.insert(k, serde_json::json!(n));
-                        }
-                    },
-                    crate::utils::canonical::CanonKind::Boolean => {
-                        let b = match obj.get(&k) {
-                            Some(serde_json::Value::Bool(x)) => *x,
-                            Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(0) != 0,
-                            Some(serde_json::Value::String(s)) => {
-                                let t = s.trim();
-                                if t.is_empty() { continue; }
-                                t == "1" || t.eq_ignore_ascii_case("true")
-                            },
-                            Some(serde_json::Value::Array(_)) | Some(serde_json::Value::Object(_)) => continue,
-                            None | Some(serde_json::Value::Null) => continue,
-                        };
-                        obj.insert(k, serde_json::json!(if b { 1 } else { 0 }));
-                    },
-                    crate::utils::canonical::CanonKind::Tags => {
-                        let tags: Vec<serde_json::Value> = match obj.get(&k) {
-                            Some(serde_json::Value::Array(arr)) => arr.iter().map(|t| {
-                                if let Some(o) = t.as_object() {
-                                    serde_json::json!(o.get("tag").and_then(|x| x.as_str()).unwrap_or(""))
-                                } else if let Some(s) = t.as_str() {
-                                    serde_json::json!(s)
-                                } else {
-                                    serde_json::json!(t.to_string().trim_matches('"'))
-                                }
-                            }).filter(|t| t.as_str().map_or(false, |s| !s.is_empty())).collect(),
-                            Some(serde_json::Value::String(s)) if !s.is_empty() => vec![serde_json::json!(s.clone())],
-                            None | Some(serde_json::Value::Null) => continue,
-                            _ => Vec::new(),
-                        };
-                        obj.insert(k, serde_json::json!(tags));
-                    },
-                    crate::utils::canonical::CanonKind::Free => {},
-                }
-            }
-        }
-
+        // 🌟 [CANONICALIZE — 단일 호출로 통합]
+        //
+        //  ── 무엇이 문제였나 ──
+        //   여기에 canonicalize_data 의 본문(Identifier / Numeric / Boolean / Tags 판정)이
+        //   그대로 복사되어 있었고, 함수 말미에서 Self::canonicalize_data 가 또 한 번 돌았습니다.
+        //   즉 같은 규칙이 한 문서에 두 번 적용되고, 두 벌의 코드가 따로 늙어갔습니다.
+        //   canonicalize_data 의 주석이 "SINGLE SOURCE" 라고 선언한 계약이 깨진 상태였습니다.
+        //
+        //  ── 해결 ──
+        //   여기서는 정규화하지 않습니다. 봉투 확정과 미러링만 수행하고,
+        //   실제 타입 확정은 함수 말미의 Self::canonicalize_data(final_data, seed_defaults)
+        //   한 번으로 끝냅니다. (시딩 여부까지 그 호출이 함께 결정합니다)
         let src = &final_data;
         let mode_str = match src.get("mode").and_then(|v| v.as_str()) {
             Some(m) if !m.trim().is_empty() => m.trim().to_string(),
             _ => {
-                let inferred = if crate::utils::bias_schema::is_trade_doc_type(type_) {
-                    "shipping"
-                } else if matches!(
-                    type_,
-                    "click" | "hover" | "change" | "touch" | "report" | "question" | "answer"
-                ) {
-                    "analytic"
-                } else {
-                    "commerce"
-                };
+                // 🌟 [MODE 추론 위임] lib.rs::upsert_items 와 같은 판정기를 씁니다.
+                //    기존에는 두 곳에 복제되어 있었고, lib.rs 쪽에 'touch' 가 빠져 있었습니다.
+                let inferred = infer_mode(type_);
                 if inferred != "commerce" {
                     println!(
                         "[STORE] 🧭 [MODE INFER] id='{}' type='{}' 에 mode 가 없어 '{}' 로 확정합니다.",
@@ -1155,7 +1229,6 @@ impl VectorStore {
                 inferred.to_string()
             }
         };
-
         let has_updated_key = src.get("updated_at").is_some();
         let new_updated_at = src.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(new_updated_at);
         let wall_now = chrono::Utc::now().timestamp_millis();
@@ -1167,11 +1240,34 @@ impl VectorStore {
         } else {
             wall_now
         };
-
         let created_at = src.get("created_at")
             .and_then(|v| v.as_i64())
             .filter(|v| *v > 0)
             .unwrap_or(wall_now);
+
+        // 🌟 [ENVELOPE MIRROR] 봉투 값을 물리 컬럼과 data 양쪽에 '같은 값' 으로 확정합니다.
+        //
+        //  ── 무엇이 문제였나 ──
+        //   봉투가 반반으로 흩어져 있었습니다.
+        //     from / to / cc / bcc / ref → 물리 컬럼에만 기록, data 에는 미반영
+        //     flag                       → data 에만 존재, 물리 컬럼이 그것을 읽어감
+        //   Dexie 는 json_data(= data) 를 보는데 그 안의 cc 가 비어 있거나 옛 값이었습니다.
+        //   migrate_team_identity 이후 Dexie 쪽 스코프가 어긋나는 직접 원인입니다.
+        //
+        //  ── 해결 ──
+        //   인자 → data → 빈 문자열 순으로 한 번 확정하고(resolve_envelope_field),
+        //   그 확정값을 물리 컬럼과 data 에 동시에 씁니다.
+        //   두 저장소가 구조적으로 갈라질 수 없습니다.
+        //
+        //  ⚠️ kind_of("from"/"to"/"cc"/"bcc"/"ref") 는 전부 Free 이므로
+        //     canonicalize_data 가 이 값들을 변형하지 않습니다.
+        //     json_to_natural_language 도 이 키들을 스킵 목록에 두고 있어
+        //     청크·임베딩 본문에 새어 들어가지 않습니다.
+        let env_from = resolve_envelope_field(from, &final_data, "from");
+        let env_to   = resolve_envelope_field(to,   &final_data, "to");
+        let env_cc   = resolve_envelope_field(cc,   &final_data, "cc");
+        let env_bcc  = resolve_envelope_field(bcc,  &final_data, "bcc");
+        let env_ref  = resolve_envelope_field(r#ref, &final_data, "ref");
 
         if let Some(obj) = final_data.as_object_mut() {
             // 별칭 보정 (기존 동작 유지)
@@ -1181,12 +1277,17 @@ impl VectorStore {
             if let Some(p) = obj.get("price").cloned() {
                 if obj.get("sale_price").is_none() { obj.insert("sale_price".to_string(), p); }
             }
-
             obj.insert("id".to_string(), json!(final_id.clone()));
             obj.insert("type".to_string(), json!(type_));
             obj.insert("mode".to_string(), json!(mode_str.clone()));
             obj.insert("created_at".to_string(), json!(created_at));
             obj.insert("updated_at".to_string(), json!(updated_ts));
+            // 🌟 봉투 5축을 data 에도 그대로 각인합니다. (Dexie 가 보는 문서가 자기완결적이 됩니다)
+            obj.insert("from".to_string(), json!(env_from.clone()));
+            obj.insert("to".to_string(), json!(env_to.clone()));
+            obj.insert("cc".to_string(), json!(env_cc.clone()));
+            obj.insert("bcc".to_string(), json!(env_bcc.clone()));
+            obj.insert("ref".to_string(), json!(env_ref.clone()));
             if !new_digest.is_empty() {
                 obj.insert("digest".to_string(), json!(new_digest.clone()));
             }
@@ -1196,7 +1297,6 @@ impl VectorStore {
                 obj.insert("has_vision".to_string(), json!(1));
             }
         }
-
         // 🌟 Dexie 와 동일 규칙으로 정규화한 뒤 저장합니다.
         //    users / pages 는 도메인 필드 인덱스가 없으므로 기본값 시딩을 끕니다.
         //    (팀 통계 문서에 sale_price: 0 같은 키가 48개 붙는 오염을 방지)
@@ -1204,13 +1304,12 @@ impl VectorStore {
         //    🌟 [ANALYTICS] analytics 트랙 행동 로그(click / hover / change / report)와
         //       관리자 Q&A(question / answer)도 commerce 도메인 필드를 갖지 않습니다.
         //       main.ts 의 NON_SEED_TYPES 와 반드시 동일한 집합이어야 두 저장소가 일치합니다.
-        let non_seed_type = matches!(
-            type_,
-            "team" | "user" | "member"
-                | "click" | "hover" | "change" | "report"
-                | "question" | "answer"
-        );
-        let seed_defaults = !matches!(target, "users" | "pages") && !non_seed_type;
+        // 🌟 [SEED 판정 위임] 기존 인라인 matches! 에는 'touch' 가 빠져 있어
+        //    touch 이벤트에 커머스 시드 16키(id/no/code/tracking_number/index/goods/
+        //    order/tracking/status/embed/tags ...)가 강제 주입되었습니다.
+        //    main.ts 의 NON_SEED_TYPES 와 같은 집합이어야 한다는 계약이 깨진 상태였습니다.
+        //    이제 needs_domain_seed 하나가 유일한 판정자입니다.
+        let seed_defaults = needs_domain_seed(target, type_);
         let final_data = Self::canonicalize_data(final_data, seed_defaults);
 
         let json_str = final_data.to_string();
@@ -1242,15 +1341,17 @@ impl VectorStore {
         //    9 data / 10 created_at / 11 updated_at / 12 vector / 13 vision_vec / 14 text / 15 masked_text / 16 schema_v4
         //    🌟 updated_ts 가 0 이면 draft 입니다. 물리 컬럼에도 0 을 그대로 남겨야
         //       프론트엔드(Dexie)와 서버(proxy)의 draft 판정이 일치합니다.
+        // 🌟 [ENVELOPE MIRROR] 물리 컬럼에는 반드시 위에서 확정한 env_* 를 씁니다.
+        //    인자를 직접 쓰면 data 에 각인한 값과 갈라질 수 있습니다.
         let batch = RecordBatch::try_new(schema.clone(), vec![
             Arc::new(StringArray::from(vec![final_id])),
             Arc::new(StringArray::from(vec![type_])),
             Arc::new(StringArray::from(vec![flag_str])),
-            Arc::new(StringArray::from(vec![from.unwrap_or("")])),
-            Arc::new(StringArray::from(vec![to.unwrap_or("")])),
-            Arc::new(StringArray::from(vec![cc.unwrap_or("")])),
-            Arc::new(StringArray::from(vec![bcc.unwrap_or("")])),
-            Arc::new(StringArray::from(vec![r#ref.unwrap_or("")])),
+            Arc::new(StringArray::from(vec![env_from])),
+            Arc::new(StringArray::from(vec![env_to])),
+            Arc::new(StringArray::from(vec![env_cc])),
+            Arc::new(StringArray::from(vec![env_bcc])),
+            Arc::new(StringArray::from(vec![env_ref])),
             Arc::new(StringArray::from(vec![mode_str])),
             Arc::new(StringArray::from(vec![json_str])),
             Arc::new(Int64Array::from(vec![created_at])),
@@ -1535,7 +1636,12 @@ impl VectorStore {
             if !f.trim().is_empty() { q = q.only_if(f); }
         }
 
-        let scan_cap = std::cmp::max(20_000, (offset + limit).saturating_mul(50));
+        // 🌟 [SCAN CAP] 기존 `max(20_000, (offset+limit) * 50)` 은 상한이 아니라 증폭기였습니다.
+        //    migrate_team_identity 가 limit 5000 으로 부르면 250,000 행을 파싱하고 정렬했습니다.
+        //    LanceDB 는 이 버전에서 ORDER BY 푸시다운이 없으므로 '메모리에 올려 정렬' 은 불가피하지만,
+        //    올릴 양의 천장은 고정되어야 합니다. 요청량보다 적게 읽는 일은 없습니다.
+        const SCAN_CEILING: usize = 20_000;
+        let scan_cap = std::cmp::max(offset + limit, SCAN_CEILING);
         let results = q.limit(scan_cap).execute().await?.try_collect::<Vec<_>>().await?;
         let mut docs = Vec::new();
         for batch in results {

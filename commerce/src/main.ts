@@ -5240,10 +5240,23 @@ function setupDataChannel(channel: RTCDataChannel) {
             } else if (msg.type === "get_detail") {
                 const doc = await invoke<any>("get_document", { uuid: msg.uuid });
                 if (doc && dataChannel?.readyState === "open") {
+                    let parsed: any = {};
+                    try { parsed = JSON.parse(doc.json_data || "{}"); } catch (e) { parsed = {}; }
+                    const titleType = parsed.doc_type || doc.type || "Detail";
+                    const titleNo = parsed.doc_number || parsed.no || parsed.title || parsed.tracking_number || "";
+                    const esc = (s: any) => String(s ?? "")
+                        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+                    let pretty = "";
+                    try { pretty = JSON.stringify(parsed, null, 2); } catch (e) { pretty = String(doc.json_data || ""); }
+                    if (pretty.length > 60_000) pretty = pretty.slice(0, 60_000) + "\n… (truncated)";
                     dataChannel.send(JSON.stringify({
                         type: "sync_detail",
-                        title: `${doc.doc_type || 'Detail'} ${doc.doc_number || ''}`,
-                        content: `<div style="margin-bottom:15px;"><strong>Summary:</strong><br>${doc.text}</div><hr style="border-color:rgba(255,255,255,0.1);"><pre style="white-space: pre-wrap; font-size: 0.8rem; color:#fff; background:#000; padding:15px; border-radius:8px;">${doc.json_data}</pre>`
+                        title: `${titleType} ${titleNo}`.trim(),
+                        content:
+                            `<div style="margin-bottom:15px; font-size:0.85rem; color:#333;">` +
+                            `<strong>Summary</strong><br>${esc(doc.text)}</div>` +
+                            `<hr>` +
+                            `<pre>${esc(pretty)}</pre>`
                     }));
                 }
             } else if (msg.type === "get_session") {
@@ -5265,23 +5278,76 @@ function setupDataChannel(channel: RTCDataChannel) {
                     }));
                 }
             } else if (msg.type === "get_navigation") {
-                // Fetch pages and users for mobile tree
                 const pages = await Select["pages"]({});
                 const users = await Select["users"]({});
+                const slimPages = (pages || []).slice(0, 200).map((p: any) => ({
+                    id: p.id,
+                    uuid: p.id,
+                    type: p.type,
+                    mode: p.mode,
+                    ref: p.ref,
+                    cc: p.cc,
+                    title: p.title || p.data?.title || "",
+                    data: {
+                        type: p.data?.type || p.type || "",
+                        title: p.data?.title || p.title || "",
+                        link: p.data?.link || "",
+                        origin: p.data?.origin || "",
+                        detail: p.data?.detail ?? false
+                    }
+                }));
+                const slimUsers = (users || []).slice(0, 200).map((u: any) => ({
+                    id: u.id,
+                    uuid: u.id,
+                    type: u.type,
+                    from: u.from,
+                    to: u.to,
+                    cc: u.cc,
+                    data: {
+                        type: u.data?.type || u.type || "",
+                        name: u.data?.name || "",
+                        title: u.data?.title || "",
+                        flag: u.data?.flag || "",
+                        page_count: u.data?.page_count ?? 0
+                    }
+                }));
                 if (dataChannel?.readyState === "open") {
-                    dataChannel.send(JSON.stringify({ 
-                        type: "sync_navigation", 
-                        pages: pages,
-                        users: users
-                    }));
+                    const navPayload = JSON.stringify({
+                        type: "sync_navigation",
+                        pages: slimPages,
+                        users: slimUsers
+                    });
+                    if (navPayload.length > 240_000) {
+                        console.warn(`[WebRTC] sync_navigation 페이로드 ${navPayload.length}바이트. slice 상한을 낮추세요.`);
+                    }
+                    dataChannel.send(navPayload);
                 }
             } else if (msg.type === "get_chat_history") {
-                // Fetch last 20 messages for mobile
-                const messages = await invoke<any[]>("get_chat_messages", { limit: 20, offset: 0 });
+                const chatFilterParts: string[] = [];
+                if (activeContext.ref) chatFilterParts.push(`\`ref\` = '${activeContext.ref}'`);
+                else if (activeContext.cc) chatFilterParts.push(`cc = '${activeContext.cc}'`);
+                const chatFilter = chatFilterParts.length > 0 ? chatFilterParts.join(" AND ") : null;
+                const messages = await invoke<any[]>("get_chat_messages", {
+                    limit: 30,
+                    offset: 0,
+                    filter: chatFilter
+                });
+                const ordered = (messages || []).slice().sort(
+                    (a: any, b: any) => (Number(a?.created_at) || 0) - (Number(b?.created_at) || 0)
+                );
+                const slimMessages = ordered.map((m: any) => ({
+                    id: m.id,
+                    role: m.role,
+                    text: typeof m.text === "string" && m.text.length > 2000 ? m.text.slice(0, 2000) : m.text,
+                    status: m.status,
+                    task_id: m.task_id,
+                    created_at: m.created_at,
+                    updated_at: m.updated_at
+                }));
                 if (dataChannel?.readyState === "open") {
-                    dataChannel.send(JSON.stringify({ 
-                        type: "sync_chat_history", 
-                        messages: messages
+                    dataChannel.send(JSON.stringify({
+                        type: "sync_chat_history",
+                        messages: slimMessages
                     }));
                 }
             } else if (msg.type === "get_queue_status") {
@@ -5373,7 +5439,15 @@ function setupDataChannel(channel: RTCDataChannel) {
                         if (remoteQuery) {
                             const q = remoteQuery.toLowerCase();
                             rows = rows.filter((r: any) => {
-                                const hay = `${r.data?.text ?? ''} ${r.data?.title ?? ''} ${r.data?.name ?? ''} ${r.data?.no ?? ''} ${r.data?.tracking_number ?? ''}`.toLowerCase();
+                                const d = r.data ?? {};
+                                const hay = [
+                                    d.text, d.title, d.name, d.no, d.code,
+                                    d.tracking_number, d.doc_number, d.doc_type,
+                                    d.vessel, d.container_number, d.seal_number,
+                                    d.sender_name, d.recipient_name,
+                                    d.pol, d.pod, d.hs_code,
+                                    d.action, d.summary
+                                ].filter(Boolean).join(' ').toLowerCase();
                                 return hay.includes(q);
                             });
                         }
@@ -5394,9 +5468,26 @@ function setupDataChannel(channel: RTCDataChannel) {
                 const REMOTE_CARD_KEYS = [
                     'id', 'no', 'code', 'index', 'title', 'name', 'text', 'summary',
                     'status', 'type', 'mode', 'link', 'origin', 'image', 'thumbnail',
-                    'tracking_number', 'sale_price', 'amount', 'quantity',
-                    'doc_type', 'doc_number', 'vessel', 'pol', 'pod', 'etd', 'eta',
-                    'created_at', 'updated_at', 'search_badge', 'relation'
+                    'created_at', 'updated_at', 'search_badge', 'relation',
+                    'goods', 'event', 'tracking', 'views',
+                    'currency', 'amount', 'sale_price', 'price', 'supply_price',
+                    'discount', 'quantity', 'stock_keeping_unit', 'tax_included',
+                    'shipping_fee', 'shipping_method', 'shipping_duration', 'release_date',
+                    'carrier', 'tracking_number',
+                    'sender_name', 'sender_address', 'recipient_name', 'recipient_address',
+                    'notify_party_name',
+                    'doc_type', 'doc_number', 'vessel', 'voyage_number', 'pol', 'pod',
+                    'place_receipt', 'place_delivery', 'etd', 'eta', 'transport_mode',
+                    'incoterms', 'payment_terms', 'freight_payment_term',
+                    'freight_amount', 'insurance_amount',
+                    'container_number', 'seal_number', 'package_count', 'package_unit',
+                    'weight_gross', 'weight_net', 'volume', 'hs_code',
+                    'reference_invoice', 'reference_lc', 'reference_booking',
+                    'issue_date', 'expiry_date',
+                    'action', 'cross_action_flow', 'intent_evolution',
+                    'consistent_preferences', 'href',
+                    'usage_per', 'usage_limit', 'min_order_amount', 'max_discount_amount',
+                    'started_at', 'expired_at'
                 ];
                 const slim = page.map((r: any) => {
                     const d: any = {};

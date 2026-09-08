@@ -409,11 +409,15 @@ pub async fn process_task(
                 search_mode, v.code, v.title, v.score, v.rival, v.rival_score,
                 v.evidence_value, v.title_cos, v.chrome_cos, v.markers
             ));
+            crate::utils::score_dynamics::record_baseline("mode_probe.reroute", 1.0);
+            crate::utils::score_dynamics::flush();
+            crate::utils::score_dynamics::leave_scope();
             let reroute_pref = task_device_pref.clone().or_else(|| device_preference.clone());
             return process_trading_task(
                 task, store_mutex, model_mutex, cancellation_token, app_handle, reroute_pref
             ).await;
         }
+        crate::utils::score_dynamics::record_baseline("mode_probe.reroute", 0.0);
     }
     let base_model_size = if token_count > 60000 {
         crate::model::ModelSize::Qwen
@@ -1544,6 +1548,7 @@ pub async fn process_task(
             if ambiguous_lines > 0 {
                 emit_term(&format!("  ⚖️ [AMBIGUITY GATE] 카테고리 간 마진 부족으로 배제된 범용 라인: {}개", ambiguous_lines));
             }
+            crate::utils::score_dynamics::record_baseline("commerce.ambiguous_lines", ambiguous_lines as f32);
             let body_consensus: Vec<f32> = {
                 let mut raw: Vec<f32> = Vec::with_capacity(categories.len());
                 for ci in 0..categories.len() {
@@ -1684,6 +1689,8 @@ pub async fn process_task(
                 if tokens.len() > 16 { tokens.truncate(16); }
                 if tokens.is_empty() {
                     emit_term("  🔗 [URL AXIS] 경로에서 판정 가능한 토큰을 얻지 못해 URL 축을 사용하지 않습니다.");
+                    crate::utils::score_dynamics::record_baseline("commerce.url_trust", 0.0);
+                    crate::utils::score_dynamics::record_baseline("commerce.url_margin", 0.0);
                     (vec![0.0f32; categories.len()], 0.0f32)
                 } else {
                     let tok_embs = model
@@ -1712,6 +1719,8 @@ pub async fn process_task(
                         "  🔗 [URL AXIS] tokens: {:?} | Margin: {:.4} → Trust: {:.3}",
                         tokens, margin, trust
                     ));
+                    crate::utils::score_dynamics::record_baseline("commerce.url_trust", trust);
+                    crate::utils::score_dynamics::record_baseline("commerce.url_margin", margin);
                     for ci in 0..categories.len() {
                         emit_term(&format!(
                             "    🔗 [URL] {} | MaxPool: {:.4} (token '{}') | Contrast: {:+.4}",
@@ -2463,6 +2472,12 @@ pub async fn process_task(
             if track_damp < 1.0 {
                 emit_term(&format!("  ⚖️ [TRACK ASYMMETRY GUARD] 한쪽 트랙 측정 실패(List: {:.4} / Form: {:.4}). 양쪽 트랙 50% 감쇠 적용.", total_list_score, total_form_score));
             }
+            crate::utils::score_dynamics::record_baseline("commerce.heading_gap", heading_gap);
+            crate::utils::score_dynamics::record_baseline("commerce.periodicity_contrast", periodicity_contrast);
+            crate::utils::score_dynamics::record_baseline("commerce.row_repeat_score", row_repeat_score);
+            crate::utils::score_dynamics::record_baseline("commerce.track_damp", track_damp);
+            crate::utils::score_dynamics::record_baseline("commerce.track_list_raw", total_list_score);
+            crate::utils::score_dynamics::record_baseline("commerce.track_form_raw", total_form_score);
 
             let list_final = eff_list_track + heading_list_bonus + periodicity_bonus + row_repeat_bonus;
             let form_final = eff_form_track + heading_form_bonus;
@@ -2472,6 +2487,10 @@ pub async fn process_task(
             emit_term(&format!("  🧮 [EVIDENCE SUM] ListFinal: {:.4} (track {:.4} + heading {:.4} + period {:.4} + rows {:.4}) | FormFinal: {:.4} (track {:.4} + heading {:.4})", list_final, eff_list_track, heading_list_bonus, periodicity_bonus, row_repeat_bonus, form_final, eff_form_track, heading_form_bonus));
 
             let decision_margin = (form_final - list_final).abs();
+            crate::utils::score_dynamics::record_baseline(
+                "commerce.detail_fallback",
+                if decision_margin < 0.02 { 1.0 } else { 0.0 },
+            );
             if decision_margin < 0.02 {
                 emit_term(&format!("  ⚠️ [LOW-CONFIDENCE FALLBACK] 판정 마진 {:.4} < 0.02. 전체 PUG 직접 임베딩 폴백 가동.", decision_margin));
                 let fallback_pug_emb = model.get_embedding(filtered_light_pug.clone()).await.unwrap_or(vec![0.0f32; 384]);
@@ -3396,9 +3415,11 @@ pub async fn process_task(
                                 }
                             }
                             if enum_sim > chrome_sim {
+                                crate::utils::score_dynamics::record_baseline("commerce.ui_action_margin", enum_sim - chrome_sim);
                                 emit_term(&format!("[Scheduler] 🛡️ [ENUM VECTOR PROTECT] 반복되지만 스키마 유사도({:.4}) > UI 액션 유사도({:.4}) 이므로 실데이터로 보호: '{}' ({} / {} 아이템)", enum_sim, chrome_sim, text, count, total_items));
                                 continue;
                             }
+                            crate::utils::score_dynamics::record_baseline("commerce.ui_action_margin", enum_sim - chrome_sim);
                             boilerplate_texts.insert(text.clone());
                             emit_term(&format!("[Scheduler] 🚫 [UI ACTION DROP] 전역 중복 텍스트 탈락: '{}' ({} / {} 아이템 | EnumSim: {:.4} <= ChromeSim: {:.4})", text, count, total_items, enum_sim, chrome_sim));
                         }
@@ -4080,24 +4101,29 @@ pub async fn process_task(
 
                     let mut best_score = f32::MIN;
                     let mut best_idx: Option<usize> = None;
-
+                    let mut idlink_scores: Vec<f32> = Vec::new();
+                    let mut idlink_top = f32::MIN;
                     for (ci, cand) in idlink_cands.iter().enumerate() {
                         let emb = &role_embs[ci];
                         if emb.iter().all(|&v| v == 0.0) { continue; }
-
                         let own = weighted_max_pool_sim(emb, &idlink_label_embs, &idlink_label_weights);
                         let prej = if idlink_prej_embs.is_empty() { 0.0 } else { max_pool_sim(emb, &idlink_prej_embs) };
                         let score = (own - prej) + 0.15 * (cand.prior - 1.0);
-
+                        idlink_scores.push(score);
+                        if score > idlink_top { idlink_top = score; }
                         emit_term(&format!("      🧭 [ID/LINK CANDIDATE] '{}' ← 역할 '{}' | LabelMaxPool: {:.4} | PrejMaxPool: {:.4} | Prior: {:.2}{} | Score: {:+.4}",
                             cand.token, cand.role_phrase, own, prej, cand.prior,
                             if cand.is_host_part { " (host)" } else { "" }, score));
-
                         if own < 0.30 { continue; }
                         if score <= 0.0 { continue; }
                         if score > best_score { best_score = score; best_idx = Some(ci); }
                     }
-
+                    if idlink_scores.len() >= 2 {
+                        crate::utils::score_dynamics::record_decay("commerce.idlink_row", &idlink_scores);
+                    }
+                    if idlink_top > f32::MIN {
+                        crate::utils::score_dynamics::record_baseline("commerce.idlink_top", idlink_top);
+                    }
                     if let Some(bi) = best_idx {
                         let c = &idlink_cands[bi];
                         det_id_link = Some((c.token.clone(), c.href.clone()));
@@ -4110,6 +4136,13 @@ pub async fn process_task(
                     if let Some((fid, flink)) = &det_id_link {
                         emit_term(&format!("    🔑 [ID/LINK FALLBACK] 코사인 게이트를 통과한 후보가 없어 레거시 해석기로 확정: '{}' → '{}'", fid, flink));
                     }
+                }
+                match &det_id_link {
+                    Some(_) => crate::utils::score_dynamics::record_field_assigned("id,link", 0.0),
+                    None => crate::utils::score_dynamics::record_field_reject(
+                        "id,link",
+                        crate::utils::score_dynamics::GateKind::Prejudice,
+                    ),
                 }
 
                 let mut det_consumed_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
@@ -4327,6 +4360,8 @@ pub async fn process_task(
 
                         let mut extracted_results = Vec::new();
                         for (k, val_str) in bypassed_values {
+                            crate::utils::score_dynamics::record_field_assigned(&k, 0.0);
+                            crate::utils::score_dynamics::record_baseline("commerce.premap_bypass", 1.0);
                             item_val.as_object_mut().unwrap().insert(k.clone(), json!(val_str));
                             extracted_results.push(format!("\"{}\": \"{}\"", k, val_str));
                             
@@ -5127,6 +5162,8 @@ pub async fn process_task(
                     }
                 }
 
+                crate::utils::score_dynamics::record_baseline("commerce.idlink_retry_recovered", retry_count as f32);
+                crate::utils::score_dynamics::record_baseline("commerce.idlink_retry_rejected", reject_count as f32);
                 if retry_count > 0 || reject_count > 0 {
                     emit_term(&format!("  🔄 [ID/LINK RETRY SUMMARY] 복구 {}개 | 생김새·호스트 게이트 거부 {}개.", retry_count, reject_count));
                 }
@@ -5639,6 +5676,13 @@ pub async fn process_task(
                     emit_term(&format!("  🔑 [ID/LINK FALLBACK] 코사인 게이트 통과 후보가 없어 레거시 해석기로 확정: '{}' → '{}'", fid, flink));
                 }
             }
+            match &det_id_link {
+                Some(_) => crate::utils::score_dynamics::record_field_assigned("id,link", 0.0),
+                None => crate::utils::score_dynamics::record_field_reject(
+                    "id,link",
+                    crate::utils::score_dynamics::GateKind::Prejudice,
+                ),
+            }
 
             let mut det_consumed_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
             if let Some((det_id, _)) = &det_id_link {
@@ -5793,9 +5837,17 @@ pub async fn process_task(
                     for h in 0..unique_phrases.len() {
                         if leaf_embs[h].iter().all(|&v| v == 0.0) { continue; }
                         let own = weighted_max_pool_sim(&leaf_embs[h], &d_label_embs[f], &d_label_weights[f]);
-                        if own < pair_abs_floor { continue; }
+                        crate::utils::score_dynamics::record_field_seen(&d_field_names[f]);
+                        if own < pair_abs_floor {
+                            crate::utils::score_dynamics::record_near_miss(&d_field_names[f]);
+                            continue;
+                        }
                         let prej = if d_prej_embs[f].is_empty() { 0.0 } else { max_pool_sim(&leaf_embs[h], &d_prej_embs[f]) };
                         if prej >= own {
+                            crate::utils::score_dynamics::record_field_reject(
+                                &d_field_names[f],
+                                crate::utils::score_dynamics::GateKind::Prejudice,
+                            );
                             emit_term(&format!("    🚫 [PAIR PREJUDICE GATE] '{}' → '{}' | LabelMaxPool: {:.4} <= PrejMaxPool: {:.4}. 경쟁 개념이 우세하여 후보 제외.",
                                 unique_phrases[h], d_field_names[f], own, prej));
                             continue;
@@ -5806,6 +5858,10 @@ pub async fn process_task(
                         let pair_val = if f_multi { &phrase_multi_value[h] } else { &phrase_single_value[h] };
                         if f_strict {
                             if pair_val.trim().is_empty() || !value_matches_format(f_fmt, pair_val) {
+                                crate::utils::score_dynamics::record_field_reject(
+                                    &d_field_names[f],
+                                    crate::utils::score_dynamics::GateKind::Format,
+                                );
                                 emit_term(&format!("    🚫 [PAIR VALUE FORMAT GATE] '{}' → '{}' ({:?}) | 값 \"{}\" 이 형식과 불일치하여 후보 제외.",
                                     unique_phrases[h], d_field_names[f], f_fmt, pair_val));
                                 continue;
@@ -5815,6 +5871,10 @@ pub async fn process_task(
                         
                         
                         if f_fmt == FieldFormat::Enum && is_pure_numeric_value(pair_val) {
+                            crate::utils::score_dynamics::record_field_reject(
+                                &d_field_names[f],
+                                crate::utils::score_dynamics::GateKind::Enum,
+                            );
                             emit_term(&format!("    🚫 [ENUM NUMERIC GATE] '{}' → '{}' | 값 \"{}\" 은 순수 수치이므로 열거형 후보가 될 수 없습니다.",
                                 unique_phrases[h], d_field_names[f], pair_val));
                             continue;
@@ -5959,12 +6019,16 @@ pub async fn process_task(
                         _ => value_matches_format(owner_fmt, &merged),
                     };
                     if !fmt_ok {
+                        crate::utils::score_dynamics::record_field_reject(
+                            &owner,
+                            crate::utils::score_dynamics::GateKind::Format,
+                        );
                         emit_term(&format!("    🚫 [DETAIL PAIR FORMAT REJECT] '{}' ({:?}) | 라벨 '{}' 의 값 '{}' 이 형식과 불일치하여 주입하지 않습니다.",
                             owner, owner_fmt, unique_phrases[h], merged));
                         continue;
                     }
-
                     pair_line_map.insert(owner.clone(), primary);
+                    crate::utils::score_dynamics::record_field_assigned(&owner, margin);
                     pre_mapped_hints.push(json!({
                         "target_column": owner.clone(),
                         "extracted_value": merged.clone()
@@ -6391,6 +6455,8 @@ pub async fn process_task(
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
                 if let Some(canon) = enum_resolved.get(&field_name).cloned() {
+                    crate::utils::score_dynamics::record_field_assigned(&field_name, 0.0);
+                    crate::utils::score_dynamics::record_baseline("commerce.enum_bypass", 1.0);
                     extracted_data.as_object_mut().unwrap().insert(field_name.clone(), json!(canon.clone()));
                     if !global_ignore_list.contains(&canon) {
                         global_ignore_list.push(canon.clone());
@@ -6439,6 +6505,8 @@ pub async fn process_task(
 
                     let mut extracted_results = Vec::new();
                     for (k, val_str) in bypassed_values {
+                        crate::utils::score_dynamics::record_field_assigned(&k, 0.0);
+                        crate::utils::score_dynamics::record_baseline("commerce.premap_bypass", 1.0);
                         extracted_data.as_object_mut().unwrap().insert(k.clone(), json!(val_str));
                         extracted_results.push(format!("\"{}\": \"{}\"", k, val_str));
                         
@@ -6509,6 +6577,8 @@ pub async fn process_task(
                         let keys: Vec<&str> = field_name.split(',').map(|s| s.trim()).collect();
                         let mut done = Vec::new();
                         for k in &keys {
+                            crate::utils::score_dynamics::record_field_assigned(k, best_margin);
+                            crate::utils::score_dynamics::record_baseline("commerce.date_regex_bypass", 1.0);
                             extracted_data.as_object_mut().unwrap().insert(k.to_string(), json!(date_literal.clone()));
                             done.push(format!("\"{}\": \"{}\"", k, date_literal));
                         }
@@ -6538,6 +6608,8 @@ pub async fn process_task(
                             let keys: Vec<&str> = field_name.split(',').map(|s| s.trim()).collect();
                             let mut done = Vec::new();
                             for k in &keys {
+                                crate::utils::score_dynamics::record_field_assigned(k, best_margin);
+                                crate::utils::score_dynamics::record_baseline("commerce.value_copy_bypass", 1.0);
                                 extracted_data.as_object_mut().unwrap().insert(k.to_string(), json!(raw_val.clone()));
                                 done.push(format!("\"{}\": \"{}\"", k, raw_val));
                             }

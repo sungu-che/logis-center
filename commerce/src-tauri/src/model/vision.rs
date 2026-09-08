@@ -8,7 +8,7 @@ use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
 use tauri::Emitter;
 use crate::openai_types::*;
-use crate::model::merge::{record_grounding_claims, collect_claimed, merge_extracted, apply_grounding_verdicts};
+use crate::model::merge::{record_grounding_claims, collect_claimed, merge_extracted, apply_grounding_verdicts, record_claim_violations};
 
 impl crate::model::LogisModel {
 
@@ -525,7 +525,12 @@ impl crate::model::LogisModel {
                             ).await?;
 
                             let tile_json = crate::parsing::parse_json_from_llm(&tile_res);
-
+                            record_claim_violations(
+                                &claimed,
+                                &tile_json,
+                                &plan.category,
+                                &emit_term,
+                            );
                             // 🌟 병합 '전' 에 이 타일이 주장한 값을 출처 bbox 와 함께 기록합니다.
                             //    STEP 6 이 이 목록으로 접지 검증을 수행합니다.
                             {
@@ -671,6 +676,12 @@ impl crate::model::LogisModel {
                         ).await?;
 
                         let parsed = crate::parsing::parse_json_from_llm(&res);
+                        record_claim_violations(
+                            &claimed,
+                            &parsed,
+                            &plan.category,
+                            &emit_term,
+                        );
                         record_grounding_claims(
                             &mut grounding_claims,
                             &plan.category,

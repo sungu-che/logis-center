@@ -687,6 +687,19 @@ pub fn load(team: &str) {
                             "[SDS] 🧹 레시피 세대 불일치 (저장 '{}' vs 현재 '{}'). 통계를 전량 폐기하고 새로 시작합니다.",
                             f.recipe, SDS_RECIPE
                         );
+                    } else if !team.is_empty()
+                        && !f.team.is_empty()
+                        && f.team != team
+                        && f.team == local_default_team()
+                    {
+                        let n = f.scopes.len();
+                        let prev_team = f.team.clone();
+                        fresh = f;
+                        fresh.team = team.to_string();
+                        println!(
+                            "[SDS] 🚚 [TEAM MIGRATE] 로컬 기본 팀 '{}' 에 귀속된 스코프 {}개를 실제 팀 '{}' 로 이관했습니다.",
+                            prev_team, n, team
+                        );
                     } else if !team.is_empty() && !f.team.is_empty() && f.team != team {
                         println!(
                             "[SDS] 🧹 팀 불일치 (저장 '{}' vs 현재 '{}'). 통계를 전량 폐기합니다. (스코프 격리 원칙)",
@@ -763,10 +776,16 @@ pub fn rebind_team(team: &str) {
         }
         if let Ok(mut d) = DIRTY.write() { *d = true; }
         flush();
+        let after = SDS.read().ok().map(|s| s.scopes.len()).unwrap_or(0);
         println!(
-            "[SDS] 🚚 [TEAM MIGRATE] 로컬 기본 팀의 스코프 {}개를 실제 팀 '{}' 로 이관했습니다. (기획 6-4: 로그인은 폐기가 아니라 마이그레이션입니다)",
-            scopes, team
+            "[SDS] 🚚 [TEAM MIGRATE] 로컬 기본 팀의 스코프 {}개를 실제 팀 '{}' 로 이관했습니다. (이관 후 잔존 {}개)",
+            scopes, team, after
         );
+        if scopes == 0 {
+            println!(
+                "[SDS] ⚠️ [TEAM MIGRATE] 이관 시점에 메모리 스코프가 0개였습니다. load() 가 이미 폐기했을 가능성이 있으니 파일의 team 값을 확인하십시오."
+            );
+        }
         return;
     }
     println!("[SDS] 🔄 팀 전환 감지. 이전 팀 통계를 폐기하고 새 팀으로 재바인딩합니다.");
@@ -1105,6 +1124,7 @@ where
         (scope.key_secondary(), m2),
         (scope.key_primary(), m1),
         (scope.key_global(), mg),
+        ("unscoped||".to_string(), mg.max(m1)),
     ] {
         if need == 0 { continue; }
         if let Some(st) = store.scopes.get(&key) {

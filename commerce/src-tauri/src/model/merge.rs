@@ -291,7 +291,71 @@ pub fn collect_claimed(merged: &serde_json::Map<String, Value>) -> Vec<(String, 
     }
     out
 }
-
+pub fn record_claim_violations(
+    claimed: &[(String, String)],
+    incoming: &Value,
+    category: &str,
+    emit: &dyn Fn(&str),
+) -> usize {
+    if claimed.is_empty() {
+        return 0;
+    }
+    fn norm(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    }
+    fn substantial(s: &str) -> bool {
+        s.chars().filter(|c| c.is_alphanumeric()).count() >= 2
+    }
+    fn harvest(o: &serde_json::Map<String, Value>, out: &mut Vec<(String, String)>) {
+        for (k, v) in o.iter() {
+            let s = match v {
+                Value::String(s) => s.trim().to_string(),
+                Value::Number(n) => n.to_string(),
+                _ => continue,
+            };
+            if s.is_empty() || is_schema_echo(&s) {
+                continue;
+            }
+            out.push((k.clone(), s));
+        }
+    }
+    let mut scan: Vec<(String, String)> = Vec::new();
+    if let Some(o) = incoming.as_object() {
+        harvest(o, &mut scan);
+    } else if let Some(arr) = incoming.as_array() {
+        for e in arr {
+            if let Some(o) = e.as_object() {
+                harvest(o, &mut scan);
+            }
+        }
+    }
+    let mut hits = 0usize;
+    for (field, value) in scan.iter() {
+        if !substantial(value) {
+            continue;
+        }
+        let nv = norm(value);
+        for (owner, owned) in claimed.iter() {
+            if owner == field {
+                continue;
+            }
+            if norm(owned) != nv {
+                continue;
+            }
+            hits += 1;
+            crate::utils::score_dynamics::record_field_seen(field);
+            crate::utils::score_dynamics::record_near_miss(field);
+            crate::utils::score_dynamics::record_confusion(owner, field, 0.0);
+            emit(&format!(
+                "    ⚠️ [CLAIM VIOLATION] [{}] '{}' = \"{}\" 는 이미 '{}' 가 확정한 값입니다. 금지 목록으로 지시했으나 모델이 되돌려주었습니다.",
+                category, field, value, owner
+            ));
+            break;
+        }
+    }
+    crate::utils::score_dynamics::record_baseline("vision.claim_violation", hits as f32);
+    hits
+}
 /// 🌟 [GROUNDING CLAIM 수집] 한 타일이 주장한 (필드, 값) 을 출처 bbox 와 함께 기록합니다.
 ///
 ///  ── 왜 병합 전에 기록하는가 ──
@@ -320,6 +384,11 @@ pub fn record_grounding_claims(
             };
             if s.is_empty() || is_schema_echo(&s) {
                 continue;
+            }
+            if s.chars().filter(|c| c.is_alphanumeric()).count() >= 2
+                && out.iter().any(|c| c.field != *k && c.value == s)
+            {
+                crate::utils::score_dynamics::record_baseline("vision.value_reuse", 1.0);
             }
             // 같은 (필드, 값) 이 여러 타일에서 나오면 한 번만 검증합니다.
             if out.iter().any(|c| c.field == *k && c.value == s) {

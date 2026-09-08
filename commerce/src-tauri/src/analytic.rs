@@ -916,9 +916,30 @@ pub async fn run_analytic_structuring(
             "analytic.relate_count",
             relate.len() as f32,
         );
+        crate::utils::score_dynamics::record_baseline(
+            "analytic.summary_len",
+            summary.chars().count() as f32,
+        );
         crate::utils::score_dynamics::record_field_seen("action");
         crate::utils::score_dynamics::record_field_assigned("action", 0.0);
-
+        crate::utils::score_dynamics::record_field_seen("summary");
+        if summary.is_empty() {
+            crate::utils::score_dynamics::record_field_reject(
+                "summary",
+                crate::utils::score_dynamics::GateKind::Format,
+            );
+        } else {
+            crate::utils::score_dynamics::record_field_assigned("summary", 0.0);
+        }
+        crate::utils::score_dynamics::record_field_seen("relate");
+        if relate.is_empty() {
+            crate::utils::score_dynamics::record_field_reject(
+                "relate",
+                crate::utils::score_dynamics::GateKind::Format,
+            );
+        } else {
+            crate::utils::score_dynamics::record_field_assigned("relate", 0.0);
+        }
         emit_term(&format!(
             "  ✅ [ANALYTIC STRUCTURED] id='{}' | action=\"{}\" | relate={}건",
             doc.id, action, relate.len()
@@ -1143,10 +1164,30 @@ pub async fn run_analytic_structuring(
         let cross_action = parsed.get("cross_action_flow").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
         let intent_evo = parsed.get("intent_evolution").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
         let preferences = parsed.get("consistent_preferences").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-
+        for (fname, fval) in [
+            ("cross_action_flow", &cross_action),
+            ("intent_evolution", &intent_evo),
+            ("consistent_preferences", &preferences),
+        ] {
+            crate::utils::score_dynamics::record_field_seen(fname);
+            if fval.is_empty() {
+                crate::utils::score_dynamics::record_field_reject(
+                    fname,
+                    crate::utils::score_dynamics::GateKind::Format,
+                );
+            } else {
+                crate::utils::score_dynamics::record_field_assigned(fname, 0.0);
+            }
+        }
+        crate::utils::score_dynamics::record_baseline(
+            "analytic.report_len",
+            (cross_action.chars().count() + intent_evo.chars().count() + preferences.chars().count()) as f32,
+        );
         if cross_action.is_empty() && intent_evo.is_empty() && preferences.is_empty() {
+            crate::utils::score_dynamics::record_baseline("analytic.flow_empty", 1.0);
             continue;
         }
+        crate::utils::score_dynamics::record_baseline("analytic.flow_empty", 0.0);
 
         let report_text = format!("{} {} {}", cross_action, intent_evo, preferences)
             .split_whitespace()

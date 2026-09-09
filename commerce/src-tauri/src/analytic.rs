@@ -8,75 +8,8 @@ use crate::store::{Task, VectorStore};
 use crate::model::LogisModel;
 use crate::utils::logger::log_task_progress;
 use crate::parsing::PugMode;
-
-// =====================================================================
-// 🌟 [ANALYTIC PIPELINE v2]
-// ---------------------------------------------------------------------
-//  ── 구조 ──
-//   ① content.js        : click / hover / change 의 outerHTML 을 그대로 기록
-//   ② console Worker    : D1 items 에 updated_at = 0(draft) 으로 적재
-//   ③ Client App(여기)  : D1 → LanceDB 동기화된 draft 를 집어
-//                         HTML → PUG → 속성 전량 제거 → Qwen3.5 2B 요약
-//                         → action / relate / summary 확정 → updated_at 갱신
-//   ④ reindex           : 로컬 임베딩 모델이 벡터화 + item_chunks 인덱싱
-//   ⑤ #global-search    : 벡터 검색 → 회수한 시맨틱 기록 → Qwen3.5 2B 리포트
-//
-//  ── 왜 서버(analytics-logis-center)의 Cron 을 걷어냈는가 ──
-//   Cron 은 원시 outerHTML 을 통째로 LLM 에 넣었기 때문에
-//   class/id/style 같은 사이트별 잡음이 토큰의 대부분을 차지했고,
-//   7000 토큰 상한(content.js 의 tokenAmount 게이트)에 자주 걸려
-//   구조화 자체가 누락되었습니다.
-//   PUG 로 접고 속성을 제거하면 같은 화면이 1/5~1/10 토큰으로 줄어들고,
-//   남는 신호가 '태그 구조 + 인쇄된 텍스트' 뿐이라 환각이 물리적으로 줄어듭니다.
-// =====================================================================
-
-/// 구조화 대상 이벤트 타입.
-///
-///  🌟 [TOUCH ORPHAN FIX]
-///   기존 주석은 "content.js 가 실제로 발행하는 3종" 이라고 단정했지만,
-///   bias.json 의 analytic_event_filters 에는 touch 노드가 있고
-///   ANALYTIC_SEARCH_TYPES / main.ts 의 ANALYTIC_TYPE_SET / TYPE_SETS.analytic
-///   에도 전부 touch 가 등재되어 있습니다.
-///
-///   이 목록에만 touch 가 빠져 있어서, touch 이벤트가 한 번이라도 들어오면
-///     ① structure_pending_analytics 의 type IN 절에서 탈락 → 영구 미구조화
-///     ② text 가 비어 reindex 의 RAW GUARD 가 임베딩을 영구 보류
-///     ③ 목록에는 보이는데 검색에는 절대 안 잡히는 draft 로 잔존
-///   이 됩니다.
-///
-///   touch 가 실제로 발행되지 않는다면 이 항목은 아무 비용도 발생시키지 않고
-///   (조회 결과 0건), 발행된다면 고아 상태가 사라집니다. 넣는 편이 안전합니다.
 pub const ANALYTIC_EVENT_TYPES: [&str; 4] = ["click", "hover", "change", "touch"];
-
-// 🌟 analytics 검색 스코프. question / answer 는 검색 대상이 아닙니다.
-//    (그것들은 채팅 말풍선이며, 검색 스코프에 넣으면 모든 질의에 끼어듭니다)
-//    이 배열은 parse_analytic_search_query 가 스코프 컨텍스트의
-//    types 로 보내므로, lib.rs 의 STAGE-3 이 이 목록을 그대로
-//    LanceDB 스코프 SQL 로 사용합니다.
-// 🌟 [TOUCH] bias.json analytic_event_filters 에 touch 가 정의되어 있으므로
-//    검색 스코프에도 포함해야 합니다. 빠지면 touch 이벤트는 검색에서
-//    통째로 탈락합니다.
 pub const ANALYTIC_SEARCH_TYPES: [&str; 5] = ["click", "hover", "change", "report", "touch"];
-
-// =====================================================================
-// 🌟 [EVENT TYPE ANCHOR BANK]
-// ---------------------------------------------------------------------
-//  ── 왜 필요한가 ──
-//   기존에는 event_types 를 Qwen3.5 2B 가 '단독으로' 골랐습니다.
-//   프롬프트의 [AVAILABLE EVENT TYPES] 는 영어 한 줄 설명뿐이라
-//   '클릭한' 같은 한국어 표현이 hover / change 와 구분되는 벡터 근거가 없었고,
-//   실측 로그에서는 질의에 '클릭'이 들어갔다는 이유만으로
-//   event_types 가 ["click"] 하나로 좁혀져
-//   방금 구조화한 hover 3건 + report 1건이 스코프에서 통째로 탈락했습니다.
-//
-//  ── 해결 ──
-//   bias.json 의 `analytic_event_filters` 노드를 구 단위로 쪼개 Max-Pool 뱅크를 만듭니다.
-//   노드가 없으면 코드 폴백을 씁니다. (get_trade_category_schema 의 fallback_base 와 동일 패턴)
-//   구 단위 Max-Pool 은 다국어 임베딩에서 '클릭한' ↔ 'pressed the button' 을
-//   직접 연결하므로 어휘 하드코딩 없이 판정이 성립합니다.
-// =====================================================================
-
-/// 🌟 [EVENT ANCHOR] 이벤트 타입 1종의 의미 앵커 구를 반환합니다.
 pub fn event_type_anchor_phrases(event_type: &str) -> Vec<String> {
     // ① bias.json 우선 (semantic + bias)
     if let Some(node) = crate::parsing::BIAS_DICT
@@ -97,7 +30,6 @@ pub fn event_type_anchor_phrases(event_type: &str) -> Vec<String> {
             return out;
         }
     }
-    // ② 코드 폴백 : bias.json 을 손대지 않아도 즉시 동작합니다.
     let raw = match event_type {
         "click" => "click, clicked, pressed, tapped, selected, chose, picked, opened, pushed the button, selection, choice, purchase intent",
         "hover" => "hover, hovered, mouse over, lingered, dwelled, looked at, browsed, scanned, glanced, viewed without clicking, attention, interest",
@@ -107,11 +39,6 @@ pub fn event_type_anchor_phrases(event_type: &str) -> Vec<String> {
     };
     crate::utils::ai_utils::split_bias_phrases_full(raw)
 }
-
-/// 🌟 [EVENT PREJUDICE] 경쟁 타입의 앵커를 편견 뱅크로 사용합니다.
-///  bias.json 에 prejudice 가 명시되어 있으면 그것을 우선하고,
-///  없으면 '나머지 3종의 앵커' 를 그대로 편견으로 씁니다.
-///  이 구조 덕분에 새 이벤트 타입이 생겨도 편견 사전을 따로 만들 필요가 없습니다.
 pub fn event_type_prejudice_phrases(event_type: &str) -> Vec<String> {
     if let Some(s) = crate::parsing::BIAS_DICT
         .get("analytic_event_filters")

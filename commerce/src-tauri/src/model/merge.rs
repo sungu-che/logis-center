@@ -1,21 +1,4 @@
-#![allow(unused_imports)]
-// 🌟 [SPLIT] 원본 model.rs 27~113 + 9181~9798 행에서 이동.
-//    parse_commerce_query / parse_shipping_query 가 이 함수들을 호출하는데
-//    그쪽은 이제 형제 모듈이므로, 비공개 fn 이면 보이지 않습니다.
-//    전부 pub(crate) 로 올립니다.
 use serde_json::{Value, json, Map};
-
-// pub fn generate_rich_summary(doc_type: &str, data: &Value) -> String { /* 27~113 */ }
-
-// pub(crate) fn trade_resolve_condition_value(field: &str, chunk: &str) -> String { /* ... */ }
-// pub(crate) fn trade_resolve_condition_operator(field: &str, chunk: &str) -> String { /* ... */ }
-// pub(crate) fn is_schema_echo(s: &str) -> bool { /* ... */ }
-// pub(crate) fn collect_claimed(merged: &Map<String, Value>) -> Vec<(String, String)> { /* ... */ }
-// pub(crate) fn record_grounding_claims(/* ... */) { /* ... */ }
-// pub(crate) fn apply_grounding_verdicts(/* ... */) { /* ... */ }
-// pub(crate) fn merge_extracted(/* ... */) { /* ... */ }
-// pub fn merge_json_manual(root: &mut Map<String, Value>, cat: &str, data: Value) { /* ... */ }
-
 pub fn generate_rich_summary(doc_type: &str, data: &Value) -> String {
     let type_map = json!({
         "CI": "Commercial Invoice", "PI": "Proforma Invoice", "PL": "Packing List",

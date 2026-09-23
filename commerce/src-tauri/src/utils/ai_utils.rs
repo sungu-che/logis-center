@@ -312,12 +312,55 @@ pub fn max_pool_sim(target: &[f32], phrase_embs: &Vec<Vec<f32>>) -> f32 {
     best
 }
 
+fn is_abbreviation_slash(chars: &[char], i: usize) -> bool {
+    let mut left = 0usize;
+    let mut left_alpha = false;
+    let mut j = i;
+    while j > 0 && chars[j - 1].is_ascii_alphanumeric() {
+        left += 1;
+        left_alpha |= chars[j - 1].is_ascii_alphabetic();
+        j -= 1;
+    }
+    let mut right = 0usize;
+    let mut right_alpha = false;
+    let mut k = i + 1;
+    while k < chars.len() && chars[k].is_ascii_alphanumeric() {
+        right += 1;
+        right_alpha |= chars[k].is_ascii_alphabetic();
+        k += 1;
+    }
+    left_alpha && right_alpha && (1..=2).contains(&left) && (1..=2).contains(&right)
+}
+
+fn split_phrase_list(raw: &str) -> Vec<String> {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for (i, c) in chars.iter().enumerate() {
+        let sep = match *c {
+            ',' | '\n' | '|' => true,
+            '/' => !is_abbreviation_slash(&chars, i),
+            _ => false,
+        };
+        if sep {
+            let t = cur.trim();
+            if !t.is_empty() {
+                out.push(t.to_string());
+            }
+            cur.clear();
+        } else {
+            cur.push(*c);
+        }
+    }
+    let t = cur.trim();
+    if !t.is_empty() {
+        out.push(t.to_string());
+    }
+    out
+}
+
 pub fn split_bias_phrases(raw: &str) -> Vec<String> {
-    let mut v: Vec<String> = raw
-        .split(|c: char| c == ',' || c == '\n' || c == '/' || c == '|')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let mut v: Vec<String> = split_phrase_list(raw);
     let mut seen = std::collections::HashSet::new();
     v.retain(|p| seen.insert(p.clone()));
     if v.len() > 48 { v.truncate(48); }
@@ -369,11 +412,7 @@ pub fn weighted_max_pool_sim(target: &[f32], phrase_embs: &Vec<Vec<f32>>, weight
 //    48개로 자르면 한국어/영어 이후의 언어(ベージュ, بيج, бежевый ...)가 통째로 소멸합니다.
 //    다국어 검색이 목적이므로 속성 뱅크에는 절대 상한을 두지 않습니다.
 pub fn split_bias_phrases_full(raw: &str) -> Vec<String> {
-    let mut v: Vec<String> = raw
-        .split(|c: char| c == ',' || c == '\n' || c == '/' || c == '|')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let mut v: Vec<String> = split_phrase_list(raw);
     let mut seen = std::collections::HashSet::new();
     v.retain(|p| seen.insert(p.clone()));
     v
@@ -3024,6 +3063,46 @@ pub fn is_pure_numeric_value(value: &str) -> bool {
     if digits == 0 { return false; }
     let letters = v.chars().filter(|c| c.is_alphabetic()).count();
     letters <= 1
+}
+
+pub fn is_document_number_shaped(value: &str) -> bool {
+    let v = value.trim();
+    if v.is_empty() || !v.chars().any(|c| c.is_numeric()) {
+        return false;
+    }
+    if !has_date_shape(v) {
+        return true;
+    }
+    let norm = normalize_digits_ascii(v);
+    for tok in norm.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()) {
+        let mut segs: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        let mut cur_digit: Option<bool> = None;
+        for ch in tok.chars() {
+            let d = ch.is_ascii_digit();
+            if cur_digit.map_or(false, |x| x != d) && !cur.is_empty() {
+                segs.push(std::mem::take(&mut cur));
+            }
+            cur.push(ch);
+            cur_digit = Some(d);
+        }
+        if !cur.is_empty() {
+            segs.push(cur);
+        }
+        for (i, s) in segs.iter().enumerate() {
+            if s.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            if DATE_UNIT_MARKERS.iter().any(|u| *u == s.as_str()) || month_from_name(s).is_some() {
+                continue;
+            }
+            if i > 0 && s.chars().count() <= 2 {
+                continue;
+            }
+            return true;
+        }
+    }
+    false
 }
 
 pub fn value_matches_format(fmt: FieldFormat, value: &str) -> bool {

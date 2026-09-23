@@ -1663,6 +1663,7 @@ fn evaluate_dexie_plan(
 ///   그러나 '그 축을 힌트로 내린 판단이 옳았는가' 는 다음 회차의 강등·치환 판정에
 ///   직접 쓰이는 정보인데, 지금은 evaluated 가 0 이라 관측 자체가 없습니다.
 fn evaluate_dexie_hints(plan: &Value, docs: &[Value]) -> Vec<(String, usize, usize)> {
+    use crate::utils::canonical::{kind_of, CanonKind};
     let alternates = plan.get("alternates").cloned().unwrap_or(json!({}));
     let hints = match plan.get("hints").and_then(|v| v.as_object()) {
         Some(h) => h.clone(),
@@ -1673,23 +1674,79 @@ fn evaluate_dexie_hints(plan: &Value, docs: &[Value]) -> Vec<(String, usize, usi
         let op = spec.get("operator").and_then(|v| v.as_str()).unwrap_or("contains");
         let want = spec.get("value").cloned().unwrap_or(Value::Null);
         if want.is_null() { continue; }
-        let kind = if want.is_number() { "number" } else { "string" };
-        let cond = json!({
-            "path": format!("data.{}", field),
-            "op": op,
-            "value": want,
-            "kind": kind
-        });
+        let numeric_axis = matches!(kind_of(field), CanonKind::Numeric);
+        let kind = if want.is_number()
+            || (numeric_axis && want.as_str().map_or(false, |s| s.trim().parse::<f64>().is_ok()))
+        {
+            "number"
+        } else {
+            "string"
+        };
+        let mut axes: Vec<String> = vec![field.clone()];
+        if let Some(arr) = alternates.get(field.as_str()).and_then(|v| v.as_array()) {
+            for a in arr.iter() {
+                if let Some(s) = a.as_str() {
+                    if !axes.iter().any(|x| x == s) { axes.push(s.to_string()); }
+                }
+            }
+        }
+        let negative = op == "neq" || op == "not_contains";
+        let ranking = op == "top" || op == "bottom";
         let mut present = 0usize;
         let mut satisfied = 0usize;
         for d in docs.iter() {
-            let has = d.get(field.as_str()).map_or(false, |v| {
-                !(v.is_null() || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false))
-            });
-            if has { present += 1; }
-            if dexie_condition_passes(&cond, d, &alternates) { satisfied += 1; }
+            let values: Vec<&Value> = axes
+                .iter()
+                .flat_map(|k| doc_axis_values(d, k))
+                .filter(|v| !(v.is_null() || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false)))
+                .collect();
+            if !values.is_empty() { present += 1; }
+            let pass = if values.is_empty() {
+                negative
+            } else if ranking {
+                true
+            } else if negative {
+                values.iter().all(|v| dexie_value_passes(op, kind, v, &want))
+            } else {
+                values.iter().any(|v| dexie_value_passes(op, kind, v, &want))
+            };
+            if pass { satisfied += 1; }
         }
         out.push((field.clone(), satisfied, present));
+    }
+    out
+}
+
+fn doc_axis_values<'a>(doc: &'a Value, field: &str) -> Vec<&'a Value> {
+    let mut out: Vec<&'a Value> = Vec::new();
+    let obj = match doc.as_object() {
+        Some(o) => o,
+        None => return out,
+    };
+    let scalar = |v: &Value| !(v.is_object() || v.is_array());
+    if let Some(v) = obj.get(field) {
+        match v {
+            Value::Array(xs) => out.extend(xs.iter().filter(|x| scalar(x))),
+            other if scalar(other) => out.push(other),
+            _ => {}
+        }
+    }
+    for node in obj.values() {
+        match node {
+            Value::Object(o) => {
+                if let Some(v) = o.get(field).filter(|v| scalar(v)) {
+                    out.push(v);
+                }
+            }
+            Value::Array(rows) => {
+                for r in rows.iter() {
+                    if let Some(v) = r.as_object().and_then(|o| o.get(field)).filter(|v| scalar(v)) {
+                        out.push(v);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
     out
 }
@@ -1745,37 +1802,126 @@ fn axis_format_compatible(a: &str, b: &str) -> bool {
     )
 }
 
+fn storage_page_type(page_type: &str) -> String {
+    let t = page_type.trim();
+    if crate::utils::bias_schema::is_trade_doc_type(t) {
+        return t.to_string();
+    }
+    let upper = t.to_uppercase();
+    if crate::utils::bias_schema::is_trade_doc_type(&upper) {
+        return upper;
+    }
+    t.to_string()
+}
+
+fn axis_label_bank(page_type: &str, field: &str) -> Vec<String> {
+    use crate::utils::ai_utils::{is_value_example_phrase, label_phrase_bank_multilingual, semantic_anchor_text};
+    let canon = crate::utils::bias_schema::canonical_bias_type(page_type);
+    let (raw, _) = if crate::utils::bias_schema::is_trade_doc_type(page_type) {
+        crate::model::merge::owner_label_bank("en", canon, field)
+    } else {
+        label_phrase_bank_multilingual("en", canon, field)
+    };
+    let mut bank: Vec<String> = Vec::new();
+    for p in raw.into_iter() {
+        let t = p.trim();
+        if t.is_empty() || is_value_example_phrase(t) { continue; }
+        if bank.iter().any(|e| e.eq_ignore_ascii_case(t)) { continue; }
+        bank.push(t.to_string());
+        if bank.len() >= 128 { break; }
+    }
+    if bank.is_empty() {
+        let s = semantic_anchor_text("en", page_type, field);
+        if !s.trim().is_empty() { bank.push(s); }
+    }
+    bank
+}
+
+fn bank_affinity(a: &[&[f32]], b: &[&[f32]]) -> f32 {
+    use crate::utils::ai_utils::cosine_similarity;
+    if a.is_empty() || b.is_empty() { return 0.0; }
+    let directed = |x: &[&[f32]], y: &[&[f32]]| -> f32 {
+        x.iter()
+            .map(|u| y.iter().map(|v| cosine_similarity(u, v)).fold(f32::MIN, f32::max))
+            .sum::<f32>()
+            / x.len() as f32
+    };
+    0.5 * (directed(a, b) + directed(b, a))
+}
+
 async fn nearest_storage_axis(
     model: &LogisModel,
     page_type: &str,
     blocked_field: &str,
     storage_axes: &[String],
 ) -> Option<(String, f32)> {
-    use crate::utils::ai_utils::{cosine_similarity, semantic_anchor_text};
-
+    let pt = storage_page_type(page_type);
+    let page_type = pt.as_str();
+    let schema: Vec<String> = crate::parsing::get_detail_schema_fields(page_type, "", "en")
+        .into_iter()
+        .map(|(f, _, _, _)| f)
+        .filter(|f| f != "id,link" && f != "status" && f != "doc_type")
+        .collect();
+    if schema.is_empty() {
+        println!(
+            "[AI-SEARCH] ⚪ [AXIS SUBSTITUTE SKIP / NO SCHEMA] '{}' 서식의 스키마 축 목록을 얻지 못했습니다. 저장본의 created_at·updated_at·type 같은 메타 축이 후보로 섞이므로 치환하지 않고 강등 경로에 맡깁니다.",
+            page_type
+        );
+        return None;
+    }
     let compatible: Vec<String> = storage_axes
         .iter()
         .filter(|a| a.as_str() != blocked_field)
+        .filter(|a| schema.iter().any(|s| s == *a))
         .filter(|a| axis_format_compatible(blocked_field, a))
         .cloned()
         .collect();
     if compatible.is_empty() { return None; }
 
-    let mut texts: Vec<String> = Vec::with_capacity(compatible.len() + 1);
-    texts.push(semantic_anchor_text("en", page_type, blocked_field));
+    let mut banks: Vec<Vec<String>> = Vec::with_capacity(compatible.len() + 1);
+    banks.push(axis_label_bank(page_type, blocked_field));
     for a in compatible.iter() {
-        texts.push(semantic_anchor_text("en", page_type, a));
+        banks.push(axis_label_bank(page_type, a));
     }
+    let mut uniq: Vec<String> = Vec::new();
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for b in banks.iter() {
+        for p in b.iter() {
+            if index.contains_key(p) { continue; }
+            index.insert(p.clone(), uniq.len());
+            uniq.push(p.clone());
+        }
+    }
+    let mut embs: Vec<Vec<f32>> = Vec::with_capacity(uniq.len());
+    for part in uniq.chunks(200) {
+        let e = model.get_embedding_batch(part.to_vec()).await.ok()?;
+        if e.len() != part.len() { return None; }
+        embs.extend(e);
+    }
+    let vecs: Vec<Vec<&[f32]>> = banks
+        .iter()
+        .map(|b| {
+            b.iter()
+                .filter_map(|p| index.get(p).map(|&i| embs[i].as_slice()))
+                .filter(|e| !e.is_empty() && !e.iter().all(|&v| v == 0.0))
+                .collect()
+        })
+        .collect();
+    if vecs[0].is_empty() { return None; }
 
-    let embs = model.get_embedding_batch(texts).await.ok()?;
-    if embs.len() != compatible.len() + 1 { return None; }
-
-    let target = &embs[0];
     let mut scored: Vec<(String, f32)> = Vec::with_capacity(compatible.len());
     for (i, a) in compatible.iter().enumerate() {
-        scored.push((a.clone(), cosine_similarity(target, &embs[i + 1])));
+        if vecs[i + 1].is_empty() { continue; }
+        scored.push((a.clone(), bank_affinity(&vecs[0], &vecs[i + 1])));
     }
     scored.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal));
+    println!(
+        "[AI-SEARCH] 🧮 [AXIS SUBSTITUTE / BANK AFFINITY] '{}' ({}구) ↔ 저장 축 {}개 다국어 라벨 뱅크 양방향 최근접 평균: {:?}",
+        blocked_field,
+        vecs[0].len(),
+        scored.len(),
+        scored.iter().take(6).map(|(a, s)| format!("{}({:.4})", a, s)).collect::<Vec<_>>()
+    );
 
     // 🌟 [SMALL POOL GUARD] 후보가 2개면 꼬리가 1개라 표준편차가 0 이거나 무의미합니다.
     //    그 상태에서 '평균 + 표준편차' 를 재면 1위가 언제나 통과합니다.
@@ -1794,7 +1940,15 @@ async fn nearest_storage_axis(
     let var = tail.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n;
     let sd = var.max(0.0).sqrt();
     if sd <= 1e-6 { return None; }
-    if scored[0].1 - mean < sd { return None; }
+    let z = (scored[0].1 - mean) / sd;
+    let need = crate::utils::ai_utils::gumbel_expected_z(scored.len()).max(1.0);
+    if z < need {
+        println!(
+            "[AI-SEARCH] ⚪ [AXIS SUBSTITUTE SKIP / NOT AN OUTLIER] '{}' → 1위 '{}' ({:.4}) 가 나머지 {}개 평균 {:.4} 보다 {:.2}σ 앞서지만, 후보 {}개 중 최댓값이 우연히 앞서는 기대치 {:.2}σ 에 못 미칩니다. 같은 계열(날짜·금액) 축끼리는 뱅크가 비슷해 누가 1위여도 이상치가 아니며, 이때 치환하면 조건이 조용히 다른 사실로 바뀝니다.",
+            blocked_field, scored[0].0, scored[0].1, scored.len() - 1, mean, z, scored.len(), need
+        );
+        return None;
+    }
     Some(scored[0].clone())
 }
 
@@ -3391,6 +3545,24 @@ async fn ai_search_complex(
                                     })
                                     .count();
                                 if here > 0 { continue; }
+                                let nested = docs
+                                    .iter()
+                                    .filter(|d| {
+                                        axes.iter().any(|k| {
+                                            doc_axis_values(d, k).iter().any(|v| {
+                                                !(v.is_null()
+                                                    || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false))
+                                            })
+                                        })
+                                    })
+                                    .count();
+                                if nested > 0 {
+                                    println!(
+                                        "[AI-SEARCH] ⚪ [AXIS SUBSTITUTE SKIP / NESTED] '{}' 는 회수 문서 {}건에 표 행(배열) 안의 값으로 저장되어 있습니다. 축이 없는 것이 아니라 경로가 루트가 아닐 뿐이므로, 루트에 있는 다른 축으로 치환하면 '품목 단가' 조건이 '문서 총액' 같은 다른 사실로 바뀝니다. 치환하지 않고 아래 강등 경로에 맡깁니다.",
+                                        field, nested
+                                    );
+                                    continue;
+                                }
                                 if let Some((cand, score)) =
                                     nearest_storage_axis(&model, &page_type, field, &storage_axes).await
                                 {

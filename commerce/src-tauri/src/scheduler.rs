@@ -7039,7 +7039,10 @@ pub async fn process_task(
                 };
                 obj.insert("currency".to_string(), json!(default_currency));
             } else {
-                obj.insert("currency".to_string(), json!(currency_val.to_uppercase()));
+                let canon = crate::logic::canonical_currency_code(currency_val)
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| currency_val.to_uppercase());
+                obj.insert("currency".to_string(), json!(canon));
             }
             
 

@@ -1276,7 +1276,10 @@ pub(crate) fn normalize_trading_data(item: &mut Value, doc_lang: &str) {
             };
             obj.insert("currency".to_string(), json!(def));
         } else {
-            obj.insert("currency".to_string(), json!(cur.to_uppercase()));
+            let canon = crate::logic::canonical_currency_code(&cur)
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| cur.to_uppercase());
+            obj.insert("currency".to_string(), json!(canon));
         }
 
         if obj.get("started_at").is_none() {

@@ -1284,6 +1284,47 @@ pub fn build_column_heatmaps(
             }
             bias_defs.push((cat.to_string(), fname.clone(), p));
         }
+        if crate::utils::bias_schema::is_trade_doc_type(doc_type) {
+            let sup = crate::logic::trade_label_supplement(fname);
+            let mut head_skip: Vec<String> = Vec::new();
+            for p in sup.iter() {
+                let compact: Vec<char> = p.chars().filter(|c| !c.is_whitespace()).collect();
+                let digits = compact.iter().filter(|c| c.is_ascii_digit()).count();
+                if compact.is_empty() || digits * 4 >= compact.len() {
+                    continue;
+                }
+                let lower = p.to_lowercase();
+                let covered = sup
+                    .iter()
+                    .map(|q| q.to_lowercase())
+                    .chain(
+                        bias_defs
+                            .iter()
+                            .filter(|(c, k, _)| c == cat && k == fname)
+                            .map(|(_, _, e)| e.to_lowercase()),
+                    )
+                    .any(|q| q != lower && q.contains(&lower));
+                if covered {
+                    head_skip.push(p.clone());
+                    continue;
+                }
+                if bias_defs
+                    .iter()
+                    .any(|(c, k, e)| c == cat && k == fname && e.eq_ignore_ascii_case(p))
+                {
+                    continue;
+                }
+                bias_defs.push((cat.to_string(), fname.clone(), p.clone()));
+            }
+            if !head_skip.is_empty() {
+                emit(&format!(
+                    "  🧹 [SUPPLEMENT HEAD SKIP] '{}' 보강 라벨 중 같은 필드의 더 긴 구에 통째로 들어 있는 머리어 {}개를 히트맵 앵커에서 뺍니다: {:?} — 텍스트 쌍 라우팅은 인쇄 라벨 전체와 비교하므로 머리어가 정확한 근거지만, 패치 코사인에서는 머리어가 같은 계열 라벨 칸 전부에 반응해 봉우리가 다른 축의 라벨로 옮겨 갑니다.",
+                    fname,
+                    head_skip.len(),
+                    head_skip.iter().take(10).collect::<Vec<_>>()
+                ));
+            }
+        }
     }
 
     // 🌟 [TABLE STRUCTURE ANCHOR 편입]
@@ -1511,7 +1552,16 @@ pub fn build_column_heatmaps(
     let mut shared: Vec<String> = Vec::new();
     for (cat, fname, ranked) in peak_cands.into_iter() {
         if let Some((_, owner)) = taken.iter().find(|(q, _)| *q == ranked[0].0) {
-            crate::utils::score_dynamics::record_confusion(owner, &fname, 0.0);
+            let owner_z = field_peaks_by_cat
+                .values()
+                .flat_map(|v| v.iter())
+                .find(|(f, p, _)| f == owner && *p == ranked[0].0)
+                .map(|(_, _, z)| *z);
+            crate::utils::score_dynamics::record_confusion(
+                owner,
+                &fname,
+                owner_z.map(|oz| oz - ranked[0].1).unwrap_or(f32::NAN),
+            );
         }
         let top_row = grid.rc(ranked[0].0).0;
         let hit = ranked

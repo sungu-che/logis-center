@@ -1237,7 +1237,7 @@ pub fn record_field_assigned(field: &str, margin: f32) {
     with_scope_mut(|s, ring| {
         let e = s.field.entry(field.to_string()).or_insert_with(FieldRejectStat::default);
         e.assigned += 1;
-        if margin.is_finite() {
+        if margin.is_finite() && margin != 0.0 {
             e.assign_margin.push(margin as f64, ring);
         }
     });

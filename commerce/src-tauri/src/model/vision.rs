@@ -490,6 +490,7 @@ impl crate::model::LogisModel {
                     let mut identity_locked: std::collections::HashSet<String> = std::collections::HashSet::new();
                     let mut read_legible: Vec<usize> = Vec::new();
                     let mut deferred_pairs: Vec<(String, String, Vec<f32>, (u32, u32, u32, u32))> = Vec::new();
+                    let mut array_deferred: Vec<(String, String, String, String, f32, (u32, u32, u32, u32))> = Vec::new();
                     let peak_cols = grid.grid_cols.max(1);
                     let peak_cw = grid.orig_width as f32 / peak_cols as f32;
                     let peak_ch = grid.orig_height as f32 / grid.grid_rows.max(1) as f32;
@@ -560,9 +561,34 @@ impl crate::model::LogisModel {
                             ));
                         }
 
-                        let row_tile_cat = crate::logic::TRADE_ARRAY_CATEGORIES
+                        let array_plan = crate::logic::TRADE_ARRAY_CATEGORIES
                             .iter()
                             .any(|c| *c == plan.category.as_str());
+                        let array_as_pairs = array_plan && {
+                            let ident = crate::model::merge::row_identity_fields(&plan.category);
+                            !ident.is_empty()
+                                && ident.iter().all(|k| {
+                                    let k: &str = k;
+                                    let anywhere = heatmaps.iter().any(|hm| {
+                                        hm.field_peaks.iter().any(|(f, _, _)| f.as_str() == k)
+                                    });
+                                    anywhere && !field_peak_inside(k, plan.bbox)
+                                })
+                        };
+                        if array_plan {
+                            crate::utils::score_dynamics::record_baseline(
+                                "vision.array_crop_as_pairs",
+                                if array_as_pairs { 1.0 } else { 0.0 },
+                            );
+                        }
+                        if array_as_pairs {
+                            emit_term(&format!(
+                                "    🧾 [ARRAY CROP → PAIRS] '{}' 크롭 px({},{})-({},{}) 안에 행 정체 축 {:?} 의 라벨 봉우리가 하나도 없습니다 (봉우리는 모두 크롭 밖 패치에 있습니다). 이 크롭에서 표 행을 만들면 병합 단계가 '정체 없는 행' 으로 전부 폐기하므로, 표 스키마 대신 라벨↔값 쌍으로 읽어 스키마 전체로 라우팅합니다. 표 아래에 붙은 총계 박스의 스칼라 라벨(총중량·인코텀즈 등)이 여기서 회수됩니다.",
+                                plan.category, plan.bbox.0, plan.bbox.1, plan.bbox.2, plan.bbox.3,
+                                crate::model::merge::row_identity_fields(&plan.category)
+                            ));
+                        }
+                        let row_tile_cat = array_plan && !array_as_pairs;
                         if !row_tile_cat && plan.category != crate::logic::TRADE_IDENTITY_CATEGORY {
                             let mine = legible_set_in(plan.bbox);
                             if !mine.is_empty() && mine.iter().all(|i| read_legible.contains(i)) {
@@ -578,12 +604,17 @@ impl crate::model::LogisModel {
                                 if !read_legible.contains(&i) { read_legible.push(i); }
                             }
                         }
+                        let tile_cats: &[&str] = if array_as_pairs {
+                            &[]
+                        } else {
+                            crate::logic::TRADE_ARRAY_CATEGORIES
+                        };
                         let (tile_count, _why) = crate::models::siglip2::vision_crop::decide_tile_count(
                             plan,
                             &heatmaps,
                             &grid,
                             &legibility,
-                            crate::logic::TRADE_ARRAY_CATEGORIES,
+                            tile_cats,
                             &emit_term,
                         );
                         let table_evidence = if row_tile_cat {
@@ -640,9 +671,10 @@ impl crate::model::LogisModel {
                             //    겹침 타일에서 같은 값이 두 번 나오는 것은 정상이므로
                             //    배열 카테고리는 이 목록을 넘기지 않습니다.
                             //    (넘기면 두 번째 타일이 정당한 반복 행을 스스로 버립니다)
-                            let is_array_cat = crate::logic::TRADE_ARRAY_CATEGORIES
-                                .iter()
-                                .any(|c| *c == plan.category.as_str());
+                            let is_array_cat = !array_as_pairs
+                                && crate::logic::TRADE_ARRAY_CATEGORIES
+                                    .iter()
+                                    .any(|c| *c == plan.category.as_str());
                             let claimed = if is_array_cat {
                                 Vec::new()
                             } else {
@@ -814,6 +846,45 @@ impl crate::model::LogisModel {
                                 }
                             }
                             if identity_pass_ran {
+                                let off_shape: Vec<(String, String)> = tile_json
+                                    .as_object()
+                                    .map(|o| {
+                                        o.iter()
+                                            .filter(|(k, _)| {
+                                                k.as_str() == crate::logic::TRADE_IDENTITY_FIELD
+                                                    || k.starts_with("reference_")
+                                            })
+                                            .filter_map(|(k, v)| {
+                                                let s = match v {
+                                                    Value::String(s) => s.trim().to_string(),
+                                                    Value::Number(n) => n.to_string(),
+                                                    _ => return None,
+                                                };
+                                                if s.is_empty() || crate::model::merge::is_schema_echo(&s) {
+                                                    return None;
+                                                }
+                                                if crate::utils::ai_utils::is_document_number_shaped(&s) {
+                                                    return None;
+                                                }
+                                                Some((k.clone(), s))
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                if let Some(o) = tile_json.as_object_mut() {
+                                    for (k, s) in off_shape.iter() {
+                                        o.insert(k.clone(), Value::Null);
+                                        crate::utils::score_dynamics::record_field_seen(k);
+                                        crate::utils::score_dynamics::record_field_reject(
+                                            k,
+                                            crate::utils::score_dynamics::GateKind::Format,
+                                        );
+                                        emit_term(&format!(
+                                            "    🚫 [IDENTITY SHAPE] 식별 패스가 '{}' 에 \"{}\" 를 돌려주었습니다. 문서번호·참조번호 축은 숫자를 품은 식별자만 담을 수 있는데 이 값에는 숫자가 없거나 날짜 모양입니다. 옆 칸의 지명·상호·문구를 식별 축으로 승격한 것이므로 잠그기 전에 비웁니다.",
+                                            k, s
+                                        ));
+                                    }
+                                }
                                 let dn_now: Option<String> = tile_json
                                     .get(crate::logic::TRADE_IDENTITY_FIELD)
                                     .and_then(|v| v.as_str())
@@ -989,7 +1060,12 @@ impl crate::model::LogisModel {
                                             rest_embs.push(pair_embs.get(pi).cloned().unwrap_or_default());
                                             continue;
                                         }
-                                        let target = if crate::utils::ai_utils::has_date_shape(v) {
+                                        let id_shaped = crate::utils::ai_utils::is_document_number_shaped(v)
+                                            && crate::utils::ai_utils::value_matches_format(
+                                                crate::utils::ai_utils::FieldFormat::Identifier,
+                                                v,
+                                            );
+                                        let target = if !id_shaped {
                                             None
                                         } else {
                                             codes.iter().find_map(|c| {
@@ -1013,10 +1089,17 @@ impl crate::model::LogisModel {
                                                 foreign_title_labels.insert(l.clone());
                                                 rest_pairs.push((l.clone(), v.clone()));
                                                 rest_embs.push(pair_embs.get(pi).cloned().unwrap_or_default());
-                                                emit_term(&format!(
-                                                    "      ⚪ [PAIR DOC-TITLE / NO AXIS] \"{}\" → \"{}\" | 라벨이 다른 서식 {:?} 의 전문을 품고 있지만 이 서식의 스키마에 그 서식을 가리키는 참조 축이 없습니다. 나머지 축 경쟁에는 맡기되 doc_number 로는 들어가지 못하게 막습니다.",
-                                                    l, v, codes
-                                                ));
+                                                if id_shaped {
+                                                    emit_term(&format!(
+                                                        "      ⚪ [PAIR DOC-TITLE / NO AXIS] \"{}\" → \"{}\" | 라벨이 다른 서식 {:?} 의 전문을 품고 있지만 이 서식의 스키마에 그 서식을 가리키는 참조 축이 없습니다. 나머지 축 경쟁에는 맡기되 doc_number 로는 들어가지 못하게 막습니다.",
+                                                        l, v, codes
+                                                    ));
+                                                } else {
+                                                    emit_term(&format!(
+                                                        "      ⚪ [PAIR DOC-TITLE / NOT AN ID] \"{}\" → \"{}\" | 라벨이 다른 서식 {:?} 의 전문을 품고 있지만 값이 문서번호 모양(숫자를 품은 4자 이상 코드 토큰)이 아니거나 날짜입니다. 서식 이름을 품은 수량·날짜 라벨이므로 참조 축으로 곧장 보내지 않고 나머지 축 경쟁에 맡깁니다. doc_number 로는 들어가지 못하게 막습니다.",
+                                                        l, v, codes
+                                                    ));
+                                                }
                                             }
                                         }
                                     }
@@ -1118,6 +1201,20 @@ impl crate::model::LogisModel {
                                                 label, rcat, field, value, rows,
                                                 if row_current.is_empty() { "비어 있음" } else { row_current.as_str() }
                                             ));
+                                            if row_current.is_empty()
+                                                && !array_deferred
+                                                    .iter()
+                                                    .any(|d| d.2 == field && d.1.eq_ignore_ascii_case(&value))
+                                            {
+                                                array_deferred.push((
+                                                    label.clone(),
+                                                    value.clone(),
+                                                    field.clone(),
+                                                    rcat.clone(),
+                                                    own,
+                                                    tile.bbox,
+                                                ));
+                                            }
                                             continue;
                                         }
                                         if !crate::logic::is_trade_array_category(&rcat) {
@@ -1139,19 +1236,26 @@ impl crate::model::LogisModel {
                                                         let s = scalar_text(v);
                                                         !s.is_empty() && crate::model::merge::same_printed_value(&s, &label)
                                                     });
-                                                    echo = Some((acat.to_string(), afield, ri, rows.len(), label_in_row));
-                                                    break;
+                                                    let better = match echo.as_ref() {
+                                                        None => true,
+                                                        Some(prev) => label_in_row && !prev.4,
+                                                    };
+                                                    if better {
+                                                        echo = Some((acat.to_string(), afield, ri, rows.len(), label_in_row));
+                                                    }
+                                                    if label_in_row { break; }
                                                 }
-                                                if echo.is_some() { break; }
+                                                if echo.as_ref().map_or(false, |e| e.4) { break; }
                                             }
                                             if let Some((acat, afield, ri, nrows, label_in_row)) = echo {
-                                                let fmt = crate::utils::ai_utils::detect_field_format(&field);
-                                                let numeric_like = matches!(
-                                                    fmt,
-                                                    crate::utils::ai_utils::FieldFormat::Numeric
-                                                        | crate::utils::ai_utils::FieldFormat::Identifier
-                                                        | crate::utils::ai_utils::FieldFormat::TrackingCode
-                                                );
+                                                let fmt = crate::utils::ai_utils::query_value_format(&field);
+                                                let numeric_like = field.starts_with("reference_")
+                                                    || matches!(
+                                                        fmt,
+                                                        crate::utils::ai_utils::FieldFormat::Numeric
+                                                            | crate::utils::ai_utils::FieldFormat::Identifier
+                                                            | crate::utils::ai_utils::FieldFormat::TrackingCode
+                                                    );
                                                 let mut column_own = f32::MIN;
                                                 if !label_in_row && numeric_like && nrows >= 2 {
                                                     if let Some(emb) = pairs
@@ -1325,6 +1429,11 @@ impl crate::model::LogisModel {
                                 if plan.owned_patches == 0 {
                                     emit_term(&format!(
                                         "    ⚪ [RESIDUAL PASS SKIP / TERRITORY] [{}] 이 크롭 안에 자기 영토 패치가 한 칸도 없습니다 (봉우리만 있는 축 {:?}). 영토 없는 크롭에서 스키마로 물으면 모델은 옆 칸의 값을 그 축으로 승격합니다. 명시된 라벨↔값 쌍만 씁니다.",
+                                        plan.category, residual
+                                    ));
+                                } else if array_as_pairs {
+                                    emit_term(&format!(
+                                        "    ⚪ [RESIDUAL PASS SKIP / ARRAY AS PAIRS] [{}] 이 크롭은 표 스키마 대신 라벨↔값 쌍으로만 읽습니다 (봉우리만 있는 축 {:?}). 표 카테고리의 축을 스키마로 다시 물으면 행 정체 축이 빈 행이 만들어져 병합 단계에서 그대로 폐기됩니다.",
                                         plan.category, residual
                                     ));
                                 } else if residual.is_empty() {
@@ -1720,6 +1829,27 @@ impl crate::model::LogisModel {
                             merge_extracted(&mut final_data_map, &plan.category, &tile_json, &emit_term);
                         }
                     }
+                    {
+                        let dropped = crate::models::siglip2::value_grounding::retain_merged_claims(
+                            &mut grounding_claims,
+                            &final_data_map,
+                        );
+                        crate::utils::score_dynamics::record_baseline(
+                            "vision.unmerged_claims",
+                            dropped.len() as f32,
+                        );
+                        if !dropped.is_empty() {
+                            emit_term(&format!(
+                                "  🧹 [CLAIM PRUNE / CROP LOOP] 크롭이 주장했지만 병합이 받아들이지 않은 값 {}건을 접지 목록에서 뺍니다: {:?} — 주장은 병합 '전' 에 기록되므로, 식별 잠금에 막힌 값이나 정체 없는 행으로 폐기된 값이 저장되지 않았는데도 복구 가지치기·접지 검증·중복 소유 경쟁의 근거로 남아 있었습니다.",
+                                dropped.len(),
+                                dropped
+                                    .iter()
+                                    .map(|c| format!("{}.{}=\"{}\"", c.category, c.field, c.value))
+                                    .take(8)
+                                    .collect::<Vec<_>>()
+                            ));
+                        }
+                    }
                     if !deferred_pairs.is_empty() {
                         let scalar_banks: Vec<(String, Vec<Vec<f32>>, Vec<f32>)> = gate_banks
                             .iter()
@@ -1866,15 +1996,36 @@ impl crate::model::LogisModel {
                                 .map(|rows| rows.iter().any(|r| r.get(f).map(|v| non_empty(v)).unwrap_or(false)))
                                 .unwrap_or(false)
                         };
-                        let mut filled_peaks: Vec<usize> = Vec::new();
-                        for hm in heatmaps.iter() {
-                            for (field, patch, _) in hm.field_peaks.iter() {
-                                if is_filled(field) { filled_peaks.push(*patch); }
-                            }
-                        }
                         let cols = grid.grid_cols.max(1);
                         let cw = grid.orig_width as f32 / cols as f32;
                         let ch = grid.orig_height as f32 / grid.grid_rows.max(1) as f32;
+                        let mut filled_peaks: Vec<usize> = Vec::new();
+                        let mut unsourced: Vec<String> = Vec::new();
+                        for hm in heatmaps.iter() {
+                            for (field, patch, _) in hm.field_peaks.iter() {
+                                if !is_filled(field) { continue; }
+                                let px = ((patch % cols) as f32 + 0.5) * cw;
+                                let py = ((patch / cols) as f32 + 0.5) * ch;
+                                let sourced = grounding_claims.iter().any(|g| {
+                                    g.field == *field
+                                        && px >= g.bbox.0 as f32
+                                        && px <= g.bbox.2 as f32
+                                        && py >= g.bbox.1 as f32
+                                        && py <= g.bbox.3 as f32
+                                });
+                                if sourced {
+                                    if !filled_peaks.contains(patch) { filled_peaks.push(*patch); }
+                                } else if !unsourced.iter().any(|u| u == field) {
+                                    unsourced.push(field.clone());
+                                }
+                            }
+                        }
+                        if !unsourced.is_empty() {
+                            emit_term(&format!(
+                                "  🧭 [RECOVERY PEAK SOURCE] 값은 채워졌지만 그 값을 읽은 크롭이 자기 라벨 봉우리 칸을 품지 않은 필드 {}개: {:?} — 이 필드들의 봉우리 칸은 '이미 다른 값의 출처' 라는 근거가 없으므로 그 칸을 공유한 빈 필드를 가지치기하지 않습니다. 표 열의 값은 표 행에서 읽히는데 봉우리는 표 밖 총계 라벨에 찍힐 수 있고, 패치 한 칸이 글자 행 여러 줄을 덮으면 봉우리를 공유해도 라벨은 서로 다릅니다.",
+                                unsourced.len(), unsourced
+                            ));
+                        }
                         let mut verify_fields: Vec<String> = Vec::new();
                         let mut pruned: Vec<String> = Vec::new();
                         let mut history_skip: Vec<String> = Vec::new();
@@ -2509,6 +2660,140 @@ impl crate::model::LogisModel {
                         }
                     }
 
+                    if !array_deferred.is_empty() {
+                        let overlaps = |a: (u32, u32, u32, u32), b: (u32, u32, u32, u32)| -> bool {
+                            a.0 < b.2 && b.0 < a.2 && a.1 < b.3 && b.1 < a.3
+                        };
+                        let mut owner_cats: Vec<String> = Vec::new();
+                        for d in array_deferred.iter() {
+                            if !owner_cats.iter().any(|c| *c == d.3) {
+                                owner_cats.push(d.3.clone());
+                            }
+                        }
+                        for rcat in owner_cats.iter() {
+                            let group: Vec<&(String, String, String, String, f32, (u32, u32, u32, u32))> =
+                                array_deferred.iter().filter(|d| d.3 == *rcat).collect();
+                            let rows_now = final_data_map
+                                .get(rcat.as_str())
+                                .and_then(|v| v.as_array())
+                                .map(|a| a.len())
+                                .unwrap_or(0);
+                            if rows_now == 0 {
+                                let mut seen_fields: Vec<&str> = Vec::new();
+                                let mut dup = false;
+                                for d in group.iter() {
+                                    if seen_fields.iter().any(|f| *f == d.2.as_str()) {
+                                        dup = true;
+                                    }
+                                    seen_fields.push(d.2.as_str());
+                                }
+                                let mut reach: Vec<bool> = vec![false; group.len()];
+                                let mut stack: Vec<usize> = vec![0];
+                                reach[0] = true;
+                                while let Some(i) = stack.pop() {
+                                    for j in 0..group.len() {
+                                        if !reach[j] && overlaps(group[i].5, group[j].5) {
+                                            reach[j] = true;
+                                            stack.push(j);
+                                        }
+                                    }
+                                }
+                                let connected = reach.iter().all(|r| *r);
+                                if dup || !connected {
+                                    crate::utils::score_dynamics::record_baseline("vision.array_owner_resolved", 0.0);
+                                    emit_term(&format!(
+                                        "  ⚪ [ARRAY OWNER RESOLVE SKIP] '{}' 는 복구가 끝난 뒤에도 행이 0개인데 미뤄 둔 쌍 {:?} 가 {}. 한 행으로 묶을 근거가 없어 버립니다.",
+                                        rcat,
+                                        group.iter().map(|d| format!("\"{}\"→{}=\"{}\"", d.0, d.2, d.1)).collect::<Vec<_>>(),
+                                        if dup { "같은 축을 두 번 주장합니다 (서로 다른 당사자)" } else { "서로 겹치지 않는 지면에서 왔습니다" }
+                                    ));
+                                    continue;
+                                }
+                                let mut row = serde_json::Map::new();
+                                for d in group.iter() {
+                                    row.insert(d.2.clone(), json!(d.1.clone()));
+                                    let mut p = serde_json::Map::new();
+                                    p.insert(d.2.clone(), json!(d.1.clone()));
+                                    record_grounding_claims(&mut grounding_claims, rcat, &Value::Object(p), d.5);
+                                    pair_evidence.insert(d.2.clone(), d.4);
+                                    pair_label.insert(d.2.clone(), d.0.clone());
+                                    crate::utils::score_dynamics::record_field_seen(&d.2);
+                                    crate::utils::score_dynamics::record_field_assigned(&d.2, d.4);
+                                }
+                                crate::utils::score_dynamics::record_baseline("vision.array_owner_resolved", 1.0);
+                                emit_term(&format!(
+                                    "  ✅ [ARRAY OWNER RESOLVE / NEW ROW] '{}' 는 복구가 끝난 뒤에도 행이 0개입니다. 미뤄 둔 쌍 {:?} 는 서로 겹치는 지면에서 왔고 같은 축을 두 번 주장하지 않으므로 한 당사자의 사실로 보고 행 하나로 만듭니다.",
+                                    rcat,
+                                    group.iter().map(|d| format!("\"{}\"→{}=\"{}\"", d.0, d.2, d.1)).collect::<Vec<_>>()
+                                ));
+                                merge_extracted(&mut final_data_map, rcat, &Value::Object(row), &emit_term);
+                                continue;
+                            }
+                            if rows_now != 1 {
+                                crate::utils::score_dynamics::record_baseline("vision.array_owner_resolved", 0.0);
+                                emit_term(&format!(
+                                    "  ⚪ [ARRAY OWNER RESOLVE SKIP] '{}' 는 행이 {}개라 미뤄 둔 쌍 {}건이 어느 행의 것인지 단정할 수 없습니다.",
+                                    rcat, rows_now, group.len()
+                                ));
+                                continue;
+                            }
+                            for d in group.iter() {
+                                let (label, value, field, _, own, bbox) = *d;
+                                let occupied = final_data_map
+                                    .get(rcat.as_str())
+                                    .and_then(|v| v.as_array())
+                                    .and_then(|a| a.first())
+                                    .and_then(|r| r.get(field.as_str()))
+                                    .map(|v| match v {
+                                        Value::Null => false,
+                                        Value::String(s) => !s.trim().is_empty(),
+                                        _ => true,
+                                    })
+                                    .unwrap_or(false);
+                                if occupied {
+                                    continue;
+                                }
+                                let near = grounding_claims
+                                    .iter()
+                                    .any(|g| g.category == *rcat && overlaps(g.bbox, *bbox));
+                                if !near {
+                                    crate::utils::score_dynamics::record_baseline("vision.array_owner_resolved", 0.0);
+                                    emit_term(&format!(
+                                        "  ⚪ [ARRAY OWNER RESOLVE SKIP] \"{}\" → {}.{} = \"{}\" | '{}' 의 유일한 행을 만든 지면과 이 쌍을 읽은 크롭이 겹치지 않습니다. 다른 당사자의 사실일 수 있어 채우지 않습니다.",
+                                        label, rcat, field, value, rcat
+                                    ));
+                                    continue;
+                                }
+                                let claimed = collect_claimed(&final_data_map);
+                                if let Some((owner, _)) = claimed
+                                    .iter()
+                                    .find(|(k, v)| k != field && v.eq_ignore_ascii_case(value))
+                                {
+                                    emit_term(&format!(
+                                        "  🚫 [ARRAY OWNER RESOLVE / CLAIMED] \"{}\" → {}.{} = \"{}\" | 이미 '{}' 가 확정한 값입니다.",
+                                        label, rcat, field, value, owner
+                                    ));
+                                    continue;
+                                }
+                                if !crate::model::merge::write_into_single_row(&mut final_data_map, rcat, field, value) {
+                                    continue;
+                                }
+                                let mut p = serde_json::Map::new();
+                                p.insert(field.clone(), json!(value.clone()));
+                                record_grounding_claims(&mut grounding_claims, rcat, &Value::Object(p), *bbox);
+                                pair_evidence.insert(field.clone(), *own);
+                                pair_label.insert(field.clone(), label.clone());
+                                crate::utils::score_dynamics::record_field_seen(field);
+                                crate::utils::score_dynamics::record_field_assigned(field, *own);
+                                crate::utils::score_dynamics::record_baseline("vision.array_owner_resolved", 1.0);
+                                emit_term(&format!(
+                                    "  ✅ [ARRAY OWNER RESOLVE] \"{}\" → {}.{} = \"{}\" | 크롭 루프에서는 '{}' 의 행이 없어 미뤄 두었는데, 복구가 끝난 지금 행이 정확히 하나이고 그 행을 만든 지면이 이 쌍의 크롭과 겹칩니다. 같은 당사자의 사실이므로 그 행에 채웁니다 (중립점수 {:+.4}).",
+                                    label, rcat, field, value, rcat, own
+                                ));
+                            }
+                        }
+                    }
+
                     extracted_data = Value::Object(final_data_map);
                     if let Some(m) = extracted_data.as_object_mut() {
                         let n = self
@@ -2688,6 +2973,23 @@ impl crate::model::LogisModel {
                 }
             }
 
+            if let Some(m) = extracted_data.as_object() {
+                let dropped = crate::models::siglip2::value_grounding::retain_merged_claims(
+                    &mut grounding_claims,
+                    m,
+                );
+                if !dropped.is_empty() {
+                    emit_term(&format!(
+                        "  🧹 [CLAIM PRUNE / STAGE-6] 저장본에 없는 주장 {}건을 접지 검증 전에 뺍니다: {:?} — 저장되지 않은 값을 검증하면 폐기 판정이 아무 데도 적용되지 않은 채 SDS 접지 분포만 오염되고, 같은 값을 두 축이 나눠 가진 것처럼 보여 중복 소유 경쟁이 헛돌았습니다.",
+                        dropped.len(),
+                        dropped
+                            .iter()
+                            .map(|c| format!("{}.{}=\"{}\"", c.category, c.field, c.value))
+                            .take(8)
+                            .collect::<Vec<_>>()
+                    ));
+                }
+            }
             if !grounding_claims.is_empty() {
                 emit_term(&format!(
                     "[STAGE-6] 🔬 추출값 {}건 접지 검증 (SigLIP2 텍스트 ↔ 이미지 패치)",
@@ -2716,8 +3018,16 @@ impl crate::model::LogisModel {
                             })
                             .cloned()
                             .collect();
+                    let v1_history =
+                        crate::utils::score_dynamics::adaptive_baseline("vision.grounding_v1_doc_reject");
                     if survivors.is_empty() {
                         emit_term("  ⚪ [VALUE GROUNDING v1 SKIP] v2 를 통과한 주장이 없어 패치 코사인 관측을 건너뜁니다.");
+                    } else if let Some((reject_mean, reject_sd)) = v1_history.filter(|(m, _)| *m > 0.5) {
+                        crate::utils::score_dynamics::record_baseline("vision.grounding_v1_retired", 1.0);
+                        emit_term(&format!(
+                            "  ⏭️ [VALUE GROUNDING v1 RETIRED] 이 서식 스코프에서 v1 관측을 거친 문서들의 문서별 폐기 비율이 평균 {:.3} (σ {:.3}) 입니다. 환각은 소수여야 하는데 문서마다 과반을 폐기하는 게이트는 환각이 아니라 짧은 값 문자열 자체를 거르고 있다는 뜻이므로, 관측을 더 쌓아도 게이트로 켤 근거가 생기지 않습니다. Qwen3.5 반환 → SigLIP2 텍스트 인코더 부착 → 임베딩 재적재 비용을 이번 문서부터 지불하지 않습니다.",
+                            reject_mean, reject_sd
+                        ));
                     } else {
                         emit_term(&format!(
                             "  🔬 [VALUE GROUNDING v1 / OBSERVE] v2 를 통과한 {}건을 패치 코사인으로 한 번 더 관측합니다. v2 는 출처 사각형 안에 글자가 있는지만 세므로 그 자리에 인쇄되지 않은 문자열도 통과합니다. 이번 회차는 관측만 하고 값을 폐기하지 않습니다. (Qwen3.5 반환 + SigLIP2 텍스트 인코더 1회 부착 비용이 듭니다)",
@@ -2776,6 +3086,13 @@ impl crate::model::LogisModel {
                                             v.category, v.field, v.value, v.surprisal_in, v.surprisal_out, v.reason
                                         ));
                                     }
+                                }
+                                let judged = list.len().saturating_sub(held);
+                                if judged > 0 {
+                                    crate::utils::score_dynamics::record_baseline(
+                                        "vision.grounding_v1_doc_reject",
+                                        would_drop.len() as f32 / judged as f32,
+                                    );
                                 }
                                 if would_drop.is_empty() {
                                     emit_term(&format!(

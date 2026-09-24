@@ -3211,7 +3211,7 @@ pub async fn process_task(
                 None
             } else {
                 emit_term(&format!(
-                    "  🏷️ [HEADER GRID → PUG] {}행 x {}열 격자를 목록 분해에 주입합니다. (alt 라벨 + canonical 필드명 동봉)",
+                    "  🏷️ [HEADER GRID → PUG] {}행 x {}열 격자를 목록 분해에 주입합니다. (alt 라벨 + field 속성, 값 구분자 '|' 는 속성에 싣지 않음)",
                     trade_headers.len(),
                     trade_headers.first().map(|r| r.len()).unwrap_or(0)
                 ));
@@ -3286,27 +3286,46 @@ pub async fn process_task(
             
             
             let mut dead_action_texts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            let mut control_texts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            let mut plain_texts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            let mut cell_value_texts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
             for item_pug in &pug_list {
                 let mut seen_in_this_item = std::collections::HashSet::new();
+                let mut seen_control = std::collections::HashSet::new();
+                let mut seen_plain = std::collections::HashSet::new();
                 for line in item_pug.lines() {
-
                     if let Some(idx) = line.find('|') {
                         let text_part = line[idx + 1..].trim();
                         if !text_part.is_empty() && text_part.len() > 2 {
                             seen_in_this_item.insert(text_part.to_string());
+                            if pug_line_is_ui_control(line) {
+                                seen_control.insert(text_part.to_string());
+                            } else {
+                                seen_plain.insert(text_part.to_string());
+                            }
                         }
                     }
                 }
                 for text in seen_in_this_item {
                     *text_frequency.entry(text).or_insert(0) += 1;
                 }
+                for text in seen_control {
+                    *control_texts.entry(text).or_insert(0) += 1;
+                }
+                for text in seen_plain {
+                    *plain_texts.entry(text).or_insert(0) += 1;
+                }
 
                 let cell_lines: Vec<String> = item_pug.lines().map(|s| s.to_string()).collect();
                 let mut seen_sub = std::collections::HashSet::new();
                 let mut seen_dead = std::collections::HashSet::new();
+                let mut seen_cell_value = std::collections::HashSet::new();
 
                 for cell in parse_pug_grid(&cell_lines) {
+                    if let Some(t) = pug_cell_sole_value(&cell_lines, &cell.line_indices) {
+                        if t.len() > 2 { seen_cell_value.insert(t); }
+                    }
                     let has_real_link = cell.line_indices.iter()
                         .any(|&li| line_real_href(&cell_lines[li]).is_some());
                     if !has_real_link { continue; }
@@ -3330,27 +3349,34 @@ pub async fn process_task(
 
                 for t in seen_sub { *subordinate_texts.entry(t).or_insert(0) += 1; }
                 for t in seen_dead { *dead_action_texts.entry(t).or_insert(0) += 1; }
+                for t in seen_cell_value { *cell_value_texts.entry(t).or_insert(0) += 1; }
             }
 
             let mut boilerplate_texts = std::collections::HashSet::new();
+            let mut control_boilerplate: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut hard_drop_texts: std::collections::HashSet<String> = std::collections::HashSet::new();
 
             let fields = parsing::get_list_schema_fields(&page_type, &url, &doc_lang);
             let total_fields = fields.len();
 
             let enum_guard_embs: Vec<Vec<f32>> = {
-                let mut embs = Vec::new();
-                for (fname, _, bias_target, _) in fields.iter() {
-                    let is_enum_like = fname.contains("status")
-                        || fname.contains("payment_method")
-                        || fname.contains("payment_origin")
-                        || fname.contains("condition")
-                        || fname.contains("currency");
-                    if is_enum_like {
-                        let e = model.get_embedding(bias_target.clone()).await.unwrap_or(vec![0.0; 384]);
-                        embs.push(e);
+                let mut phrases: Vec<String> = Vec::new();
+                for (fname, _, _, _) in fields.iter() {
+                    if detect_field_format(fname) != FieldFormat::Enum { continue; }
+                    let (mut label_phrases, _) = label_phrase_bank(&doc_lang, &page_type, fname);
+                    if label_phrases.is_empty() {
+                        label_phrases = label_phrase_bank_multilingual(&doc_lang, &page_type, fname).0;
+                    }
+                    for p in label_phrases {
+                        if !phrases.iter().any(|e| e == &p) { phrases.push(p); }
                     }
                 }
-                embs
+                if phrases.is_empty() {
+                    Vec::new()
+                } else {
+                    model.get_embedding_batch(phrases.clone()).await
+                        .unwrap_or_else(|_| vec![vec![0.0; 384]; phrases.len()])
+                }
             };
             
             
@@ -3382,61 +3408,91 @@ pub async fn process_task(
                     if count >= threshold {
 
                         let is_numeric_data = re_numeric.is_match(&text);
-                        
+                        if !is_numeric_data && text.len() > 3 && has_date_shape(&text) {
+                            crate::utils::score_dynamics::record_baseline("commerce.repeat_date_protect", 1.0);
+                            emit_term(&format!("[Scheduler] 🛡️ [DATE SHAPE PROTECT] 반복되지만 날짜 모양이라 UI 문구가 될 수 없어 실데이터로 보호: '{}' ({} / {} 아이템)", text, count, total_items));
+                            continue;
+                        }
                         if !is_numeric_data && text.len() > 3 {
-
-                            
-                            
-                            
-                            
-                            
-                            
                             let sub_hits = subordinate_texts.get(&text).copied().unwrap_or(0);
                             let dead_hits = dead_action_texts.get(&text).copied().unwrap_or(0);
-                            if sub_hits >= threshold || dead_hits >= threshold {
-                                boilerplate_texts.insert(text.clone());
-                                emit_term(&format!("[Scheduler] 🚫 [ACTION LINE DROP] 구조적으로 UI 액션/종속 라인 확정 탈락: '{}' ({} / {} 아이템 | Subordinate: {} | DeadHref: {})", text, count, total_items, sub_hits, dead_hits));
-                                continue;
-                            }
 
-                            
-                            //
-                            
-                            
-                            
-                            
-                            //
-                            
-                            
-                            
-                            
-                            
-                            
-                            //
-                            
-                            
-                            
                             let mut enum_sim = 0.0f32;
                             let mut chrome_sim = 0.0f32;
+                            let mut sim_pool: Vec<f32> = Vec::new();
                             if !enum_guard_embs.is_empty() || !ui_action_embs.is_empty() {
                                 let t_emb = model.get_embedding(text.clone()).await.unwrap_or(vec![0.0f32; 384]);
                                 for ge in &enum_guard_embs {
                                     let s = cosine_similarity(ge, &t_emb);
+                                    sim_pool.push(s);
                                     if s > enum_sim { enum_sim = s; }
                                 }
                                 for ce in &ui_action_embs {
                                     let s = cosine_similarity(ce, &t_emb);
+                                    sim_pool.push(s);
                                     if s > chrome_sim { chrome_sim = s; }
                                 }
                             }
-                            if enum_sim > chrome_sim {
-                                crate::utils::score_dynamics::record_baseline("commerce.ui_action_margin", enum_sim - chrome_sim);
-                                emit_term(&format!("[Scheduler] 🛡️ [ENUM VECTOR PROTECT] 반복되지만 스키마 유사도({:.4}) > UI 액션 유사도({:.4}) 이므로 실데이터로 보호: '{}' ({} / {} 아이템)", enum_sim, chrome_sim, text, count, total_items));
+                            let exact_chrome = chrome_sim >= 0.999;
+                            let exact_enum = enum_sim >= 0.999;
+                            let exact_action = exact_chrome && !exact_enum;
+                            let bank_shift = if !exact_chrome && sim_pool.len() >= 2 && !enum_guard_embs.is_empty() && !ui_action_embs.is_empty() {
+                                let n = sim_pool.len() as f32;
+                                let mean = sim_pool.iter().sum::<f32>() / n;
+                                let sd = (sim_pool.iter().map(|s| (s - mean) * (s - mean)).sum::<f32>() / n).sqrt().max(1e-6);
+                                sd * (gumbel_expected_z(ui_action_embs.len()) - gumbel_expected_z(enum_guard_embs.len()))
+                            } else {
+                                0.0
+                            };
+                            let control_hits = control_texts.get(&text).copied().unwrap_or(0);
+                            let plain_hits = plain_texts.get(&text).copied().unwrap_or(0);
+                            let semantic_data = if exact_chrome {
+                                exact_enum && control_hits < threshold
+                            } else {
+                                enum_sim + bank_shift >= chrome_sim
+                            };
+                            if sub_hits >= threshold || dead_hits >= threshold {
+                                boilerplate_texts.insert(text.clone());
+                                let hard = dead_hits >= threshold && !semantic_data;
+                                if hard {
+                                    hard_drop_texts.insert(text.clone());
+                                }
+                                emit_term(&format!("[Scheduler] 🚫 [ACTION LINE DROP] 구조적으로 UI 액션/종속 라인 확정 탈락: '{}' ({} / {} 아이템 | Subordinate: {} | DeadHref: {}{})", text, count, total_items, sub_hits, dead_hits, if hard { " | UI 액션 쪽 죽은 링크라 헤더 소유 칸도 보호하지 않음" } else { "" }));
+                                continue;
+                            }
+                            let control_drop = if exact_chrome {
+                                control_hits > 0
+                            } else {
+                                control_hits >= threshold && !semantic_data
+                            };
+                            if control_drop {
+                                control_boilerplate.insert(text.clone());
+                                if exact_action {
+                                    hard_drop_texts.insert(text.clone());
+                                }
+                                crate::utils::score_dynamics::record_baseline("commerce.ui_control_drop", 1.0);
+                                emit_term(&format!("[Scheduler] 🚫 [UI CONTROL DROP] '{}' 는 버튼/입력 컨트롤로 {} / {} 아이템에 나오고 UI 액션 쪽입니다 (EnumSim {:.4} + 보정 {:+.4} vs ChromeSim {:.4}). 컨트롤 라인을 탈락 대상으로 둡니다. 컨트롤 밖 같은 글자는 {} 아이템 → {}", text, control_hits, total_items, enum_sim, bank_shift, chrome_sim, plain_hits, if exact_action { "UI 액션 글자라 아래 판정을 계속합니다." } else if plain_hits < threshold { "반복 기준 미달이라 그대로 둡니다." } else { "아래 칸·의미 판정을 계속합니다." }));
+                                if plain_hits < threshold && !exact_action {
+                                    continue;
+                                }
+                            }
+                            let cell_hits = cell_value_texts.get(&text).copied().unwrap_or(0);
+                            if cell_hits >= threshold && !exact_action {
+                                crate::utils::score_dynamics::record_baseline("commerce.cell_value_margin", enum_sim - chrome_sim);
+                                emit_term(&format!("[Scheduler] 🛡️ [CELL VALUE PROTECT] 반복되지만 {} / {} 아이템에서 링크·입력 없는 표 칸의 유일한 글자(버튼·숨김 입력은 제외하고 셈)라 컬럼 상수값으로 보호: '{}' (참고: EnumSim {:.4} + 보정 {:+.4} vs ChromeSim {:.4})", cell_hits, total_items, text, enum_sim, bank_shift, chrome_sim));
                                 continue;
                             }
                             crate::utils::score_dynamics::record_baseline("commerce.ui_action_margin", enum_sim - chrome_sim);
+                            crate::utils::score_dynamics::record_baseline("commerce.ui_action_bank_shift", bank_shift);
+                            if semantic_data {
+                                emit_term(&format!("[Scheduler] 🛡️ [ENUM VECTOR PROTECT] 반복되지만 열거형 값 구 유사도({:.4}) + 은행 크기 보정({:+.4}) >= UI 액션 유사도({:.4}) 이므로 실데이터로 보호: '{}' ({} / {} 아이템)", enum_sim, bank_shift, chrome_sim, text, count, total_items));
+                                continue;
+                            }
                             boilerplate_texts.insert(text.clone());
-                            emit_term(&format!("[Scheduler] 🚫 [UI ACTION DROP] 전역 중복 텍스트 탈락: '{}' ({} / {} 아이템 | EnumSim: {:.4} <= ChromeSim: {:.4})", text, count, total_items, enum_sim, chrome_sim));
+                            if exact_action {
+                                hard_drop_texts.insert(text.clone());
+                            }
+                            emit_term(&format!("[Scheduler] 🚫 [UI ACTION DROP] 전역 중복 텍스트 탈락: '{}' ({} / {} 아이템 | EnumSim: {:.4} + 보정 {:+.4} vs ChromeSim: {:.4}{})", text, count, total_items, enum_sim, bank_shift, chrome_sim, if exact_action { " | UI 액션 구와 글자 그대로 일치 → 열거형 컬럼의 단독 값일 때만 헤더 소유 보호" } else if exact_chrome { " | 열거형·UI 액션 양쪽과 글자 그대로 일치 → 헤더 소유 칸만 보호" } else { " | UI 액션 쪽" }));
                         }
                     }
                 }
@@ -3547,20 +3603,7 @@ pub async fn process_task(
             let mut thead_embeddings = vec![vec![0.0; 384]; thead_lines.len()];
             
 
-            let thead_cells = parse_pug_grid(&thead_lines);
-            let mut header_cols: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
-
-            for cell in &thead_cells {
-                for c in cell.col..(cell.col + cell.colspan) {
-                    let existing = header_cols.entry(c).or_insert(String::new());
-                    if !existing.is_empty() && !cell.text.is_empty() {
-                        existing.push_str(" > ");
-                    }
-                    if !cell.text.is_empty() {
-                        existing.push_str(&cell.text);
-                    }
-                }
-            }
+            let header_grid = HeaderGrid::new(parse_pug_grid(&thead_lines));
 
             if !thead_lines.is_empty() {
                 emit_term(&format!("\n[PRE-PROCESSING] Vectorizing Table Header ({} lines)...", thead_lines.len()));
@@ -3609,13 +3652,46 @@ pub async fn process_task(
             }
 
 
-            let mut unique_headers = Vec::new();
-            for (_, h_text) in &header_cols {
-                let clean_h = h_text.trim();
-                if !clean_h.is_empty() && !unique_headers.contains(&clean_h.to_string()) {
-                    unique_headers.push(clean_h.to_string());
+            let mut unique_headers: Vec<String> = Vec::new();
+            let mut item_grids: Vec<Vec<GridCell>> = Vec::with_capacity(pug_list.len());
+            let mut interleaved_items = 0usize;
+            for item_pug in pug_list.iter() {
+                let item_cell_lines: Vec<String> = item_pug.lines().map(|s| s.to_string()).collect();
+                let cells = parse_pug_grid(&item_cell_lines);
+                if header_grid.interleaved_with(&cells) {
+                    interleaved_items += 1;
+                }
+                item_grids.push(cells);
+            }
+            let page_interleaved = interleaved_items > 0 && interleaved_items * 2 > pug_list.len();
+            for cells in item_grids.iter() {
+                for cell in cells.iter() {
+                    let label = header_grid.cell_label(cell.row, cell.col, cell.colspan, cell.rowspan, page_interleaved);
+                    let clean_h = label.trim();
+                    if !clean_h.is_empty() && !unique_headers.iter().any(|h| h == clean_h) {
+                        unique_headers.push(clean_h.to_string());
+                    }
                 }
             }
+            if unique_headers.is_empty() {
+                for col in 0..header_grid.column_count() {
+                    let label = header_grid.column_label(col);
+                    let clean_h = label.trim();
+                    if !clean_h.is_empty() && !unique_headers.iter().any(|h| h == clean_h) {
+                        unique_headers.push(clean_h.to_string());
+                    }
+                }
+            }
+            if page_interleaved {
+                emit_term(&format!(
+                    "  🧩 [HEADER GRID LABEL] 헤더 {}행과 본문 칸 배치가 행마다 겹치는 교차 배치 아이템 {}/{}개 (과반) → 좌표가 정확히 겹치는 헤더 칸은 그 칸 라벨을, 나머지 칸은 조인 라벨을 씁니다. | 라벨 {}개: {:?}",
+                    header_grid.rows, interleaved_items, pug_list.len(), unique_headers.len(), unique_headers
+                ));
+            }
+            crate::utils::score_dynamics::record_baseline(
+                "commerce.header_interleaved",
+                if page_interleaved { 1.0 } else { 0.0 },
+            );
 
             let mut header_to_field_map = std::collections::HashMap::new();
 
@@ -3624,6 +3700,38 @@ pub async fn process_task(
                     .get_embedding_batch(unique_headers.clone())
                     .await
                     .unwrap_or_else(|_| vec![vec![0.0; 384]; unique_headers.len()]);
+                let header_terminal: Vec<String> = unique_headers
+                    .iter()
+                    .map(|h| h.rsplit(" > ").next().unwrap_or("").trim().to_string())
+                    .collect();
+                let header_leaf_texts: Vec<Option<String>> = unique_headers
+                    .iter()
+                    .zip(header_terminal.iter())
+                    .map(|(h, leaf)| {
+                        if leaf.is_empty() || leaf == h.trim() { return None; }
+                        let shared = header_terminal.iter().filter(|t| *t == leaf).count();
+                        if shared == 1 { Some(leaf.clone()) } else { None }
+                    })
+                    .collect();
+                let leaf_batch: Vec<String> = header_leaf_texts.iter().filter_map(|x| x.clone()).collect();
+                let leaf_batch_embs: Vec<Vec<f32>> = if leaf_batch.is_empty() {
+                    Vec::new()
+                } else {
+                    model.get_embedding_batch(leaf_batch.clone()).await
+                        .unwrap_or_else(|_| vec![vec![0.0; 384]; leaf_batch.len()])
+                };
+                let mut header_leaf_embs: Vec<Option<Vec<f32>>> = Vec::with_capacity(unique_headers.len());
+                {
+                    let mut k = 0usize;
+                    for lt in header_leaf_texts.iter() {
+                        if lt.is_some() {
+                            header_leaf_embs.push(leaf_batch_embs.get(k).cloned());
+                            k += 1;
+                        } else {
+                            header_leaf_embs.push(None);
+                        }
+                    }
+                }
 
                 let mut hdr_field_names: Vec<String> = Vec::new();
                 let mut hdr_label_embs: Vec<Vec<Vec<f32>>> = Vec::new();
@@ -3656,34 +3764,50 @@ pub async fn process_task(
                 let hdr_margin = 0.03f32;
 
                 let mut hdr_matrix: Vec<Vec<f32>> = vec![vec![-1.0f32; unique_headers.len()]; hdr_field_names.len()];
+                let mut hdr_leaf_won: Vec<Vec<bool>> = vec![vec![false; unique_headers.len()]; hdr_field_names.len()];
                 for f in 0..hdr_field_names.len() {
                     for h in 0..unique_headers.len() {
                         if header_embs[h].iter().all(|&v| v == 0.0) { continue; }
-                        // 🌟 [SDS 계측] 이 필드가 이 헤더와 경쟁했다는 사실 자체를 남깁니다.
-                        //
-                        //  ── 왜 필요한가 ──
-                        //   score_dynamics.json 에서 field.* 관측은 트레이딩 경로가 전부입니다.
-                        //   커머스 0건, 비전 0건이라 T-3(학습형 prejudice)를 이 두 트랙으로
-                        //   확장할 근거가 없습니다. seen 이 있어야 거절률이 비율로 읽힙니다.
                         crate::utils::score_dynamics::record_field_seen(&hdr_field_names[f]);
-                        let own = weighted_max_pool_sim(&header_embs[h], &hdr_label_embs[f], &hdr_label_weights[f]);
+                        let score_of = |emb: &Vec<f32>| -> (f32, f32, f32) {
+                            let own = weighted_max_pool_sim(emb, &hdr_label_embs[f], &hdr_label_weights[f]);
+                            let prej = if hdr_prej_embs[f].is_empty() { 0.0 } else { max_pool_sim(emb, &hdr_prej_embs[f]) };
+                            (own, prej, own - prej)
+                        };
+                        let joined = score_of(&header_embs[h]);
+                        let joined_ok = joined.0 >= hdr_abs_floor && joined.2 >= hdr_score_floor;
+                        let mut chosen = joined;
+                        let mut is_leaf = false;
+                        if !joined_ok {
+                            if let Some(Some(le)) = header_leaf_embs.get(h) {
+                                if !le.iter().all(|&v| v == 0.0) {
+                                    let leaf = score_of(le);
+                                    let leaf_ok = leaf.0 >= hdr_abs_floor && leaf.2 >= hdr_score_floor;
+                                    if leaf_ok {
+                                        chosen = leaf;
+                                        is_leaf = true;
+                                    }
+                                }
+                            }
+                        }
+                        let (own, prej, score) = chosen;
                         if own < hdr_abs_floor {
-                            // 라벨 자체가 약해서 탈락한 경우입니다. 편견과 구분해 둡니다.
                             crate::utils::score_dynamics::record_near_miss(&hdr_field_names[f]);
                             continue;
                         }
-                        let prej = if hdr_prej_embs[f].is_empty() { 0.0 } else { max_pool_sim(&header_embs[h], &hdr_prej_embs[f]) };
-                        let score = own - prej;
                         if score < hdr_score_floor {
                             emit_term(&format!("    🚫 [HEADER PREJUDICE DROP] '{}' → '{}' | LabelMaxPool: {:.4} | PrejMaxPool: {:.4} | Score: {:+.4} < {:.2}", unique_headers[h], hdr_field_names[f], own, prej, score, hdr_score_floor));
-                            // 🌟 [SDS 계측] 라벨은 충분했는데 편견이 이겨서 탈락한 경우입니다.
                             crate::utils::score_dynamics::record_field_reject(
                                 &hdr_field_names[f],
                                 crate::utils::score_dynamics::GateKind::Prejudice,
                             );
                             continue;
                         }
+                        if is_leaf {
+                            emit_term(&format!("    🌿 [HEADER LEAF RESCUE] '{}' → '{}' | 조인 라벨 Score {:+.4} 가 하한 미달이라, 헤더 전체에서 한 번만 나오는 하위 라벨 '{}' 로 다시 쟀습니다 → Score {:+.4}", unique_headers[h], hdr_field_names[f], joined.2, header_terminal[h], score));
+                        }
                         hdr_matrix[f][h] = score;
+                        hdr_leaf_won[f][h] = is_leaf;
                     }
                 }
 
@@ -3692,13 +3816,10 @@ pub async fn process_task(
                     match a {
                         Some((h, score, margin)) => {
                             header_to_field_map.insert(unique_headers[*h].clone(), hdr_field_names[f].clone());
-                            emit_term(&format!("    ✨ [HEADER COSINE MAP] Header '{}' → Field '{}' | Score: {:+.4} | Margin: {:+.4}", unique_headers[*h], hdr_field_names[f], score, margin));
-                            // 🌟 [SDS 계측] 헤더 확정 마진을 남깁니다.
-                            //
-                            //  ── 실측 ──
-                            //   확정 3건의 마진이 +0.0538 / +0.0829 / +0.0330 이었습니다.
-                            //   고정 임계 hdr_margin = 0.03 바로 위입니다.
-                            //   이 상수가 이 사이트에서 적절한지는 분포를 봐야 알 수 있습니다.
+                            emit_term(&format!("    ✨ [HEADER COSINE MAP] Header '{}' → Field '{}' | Score: {:+.4} | Margin: {:+.4}{}", unique_headers[*h], hdr_field_names[f], score, margin, if hdr_leaf_won[f][*h] { " | 하위 라벨 기준" } else { "" }));
+                            if hdr_leaf_won[f][*h] {
+                                crate::utils::score_dynamics::record_baseline("commerce.header_leaf_win", 1.0);
+                            }
                             crate::utils::score_dynamics::record_field_assigned(
                                 &hdr_field_names[f],
                                 *margin,
@@ -3798,6 +3919,39 @@ pub async fn process_task(
                 let mut item_lines: Vec<String> = item_pug.lines().map(|s| s.to_string()).collect();
                 
 
+                let item_cells = parse_pug_grid(&item_lines);
+                let mut line_owner_field: Vec<Option<String>> = vec![None; item_lines.len()];
+                let mut line_header_label: Vec<Option<String>> = vec![None; item_lines.len()];
+                for cell in &item_cells {
+                    let h_text = header_grid.cell_label(cell.row, cell.col, cell.colspan, cell.rowspan, page_interleaved);
+                    let h_clean = h_text.trim();
+                    if h_clean.is_empty() { continue; }
+                    let owner = header_to_field_map.get(h_clean).cloned();
+                    for &line_idx in &cell.line_indices {
+                        if line_idx >= item_lines.len() { continue; }
+                        line_header_label[line_idx] = Some(h_clean.to_string());
+                        if let Some(o) = &owner {
+                            line_owner_field[line_idx] = Some(o.clone());
+                        }
+                    }
+                }
+                let mut line_aux_control: Vec<bool> = vec![false; item_lines.len()];
+                let mut line_sole_value: Vec<bool> = vec![false; item_lines.len()];
+                for cell in &item_cells {
+                    let visible: Vec<usize> = cell.line_indices.iter().copied()
+                        .filter(|&li| li < item_lines.len() && pug_line_visible_data(&item_lines[li]))
+                        .collect();
+                    if visible.len() == 1 {
+                        line_sole_value[visible[0]] = true;
+                    }
+                    if visible.is_empty() { continue; }
+                    for &li in &cell.line_indices {
+                        if li < item_lines.len() && pug_line_is_ui_control(&item_lines[li]) {
+                            line_aux_control[li] = true;
+                        }
+                    }
+                }
+
                 for i in 0..item_lines.len() {
                     {
                         let l = item_lines[i].trim_start();
@@ -3819,51 +3973,48 @@ pub async fn process_task(
                     let line = &item_lines[i];
                     if let Some(idx) = line.find('|') {
                         let text_part = line[idx + 1..].trim();
-                        if boilerplate_texts.contains(text_part) {
-
-                            
-                            
-                            
-                            let has_link_or_event = line_real_href(line).is_some() || line.contains("onclick") || line.contains("data-url");
-                            if has_link_or_event {
-                                emit_term(&format!("    🛡️ [DUPLICATE LINK PROTECT] Item Line {}/{} : {} (실제 이동 href/event 포함 데이터 보호)", i + 1, item_lines.len(), text_part));
-                                continue;
+                        let is_control = pug_line_is_ui_control(line);
+                        let control_dup = is_control && control_boilerplate.contains(text_part);
+                        if boilerplate_texts.contains(text_part) || control_dup {
+                            if !is_control {
+                                let has_link_or_event = line_real_href(line).is_some() || line.contains("onclick") || line.contains("data-url");
+                                if has_link_or_event {
+                                    emit_term(&format!("    🛡️ [DUPLICATE LINK PROTECT] Item Line {}/{} : {} (실제 이동 href/event 포함 데이터 보호)", i + 1, item_lines.len(), text_part));
+                                    continue;
+                                }
+                            }
+                            let owner_enum = line_owner_field[i].as_ref().map_or(false, |o| detect_field_format(o) == FieldFormat::Enum);
+                            let header_protectable = !(is_control && line_aux_control[i])
+                                && (!hard_drop_texts.contains(text_part) || (owner_enum && line_sole_value[i] && !line.contains("href=")));
+                            if header_protectable {
+                                if let Some(owner) = line_owner_field[i].as_ref() {
+                                    crate::utils::score_dynamics::record_baseline("commerce.header_repeat_protect", 1.0);
+                                    emit_term(&format!("    🛡️ [HEADER OWNED PROTECT / REPEAT] Item Line {}/{} : {} (전 아이템 반복 텍스트지만 '{}' 컬럼으로 헤더 코사인 확정된 칸의 값이라 보호합니다)", i + 1, item_lines.len(), text_part, owner));
+                                    continue;
+                                }
                             }
 
-                            emit_term(&format!("    🚫 [DUPLICATE FILTERED] Item Line {}/{} : {} (반복 UI 탈락)", i + 1, item_lines.len(), text_part));
+                            emit_term(&format!("    🚫 [DUPLICATE FILTERED] Item Line {}/{} : {} ({})", i + 1, item_lines.len(), text_part, if is_control { "반복 버튼/입력 컨트롤 탈락" } else { "반복 UI 탈락" }));
 
                             item_lines[i] = format!("{} ", &line[..=idx]);
                         }
                     }
                 }
 
-
-                let item_cells = parse_pug_grid(&item_lines);
                 let mut line_enriched_texts = vec![String::new(); item_lines.len()];
-                
-                
-                
-                let mut line_owner_field: Vec<Option<String>> = vec![None; item_lines.len()];
-                
                 for cell in &item_cells {
-                    let h_text = header_cols.get(&cell.col).cloned().unwrap_or_default();
-                    let owner = header_to_field_map.get(h_text.trim()).cloned();
                     for &line_idx in &cell.line_indices {
-                        if let Some(o) = &owner {
-                            line_owner_field[line_idx] = Some(o.clone());
-                        }
+                        if line_idx >= item_lines.len() { continue; }
                         let original_text = if let Some(p) = item_lines[line_idx].find('|') {
                             item_lines[line_idx][p + 1..].trim()
                         } else {
                             ""
                         };
-                        if !original_text.is_empty() {
-                            line_enriched_texts[line_idx] = if h_text.is_empty() {
-                                original_text.to_string()
-                            } else {
-                                format!("{} | {}", h_text, original_text)
-                            };
-                        }
+                        if original_text.is_empty() { continue; }
+                        line_enriched_texts[line_idx] = match &line_header_label[line_idx] {
+                            Some(h) => format!("{} | {}", h, original_text),
+                            None => original_text.to_string(),
+                        };
                     }
                 }
 
@@ -4009,6 +4160,23 @@ pub async fn process_task(
                 let mut header_owned_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
                 let mut header_id_tokens: Vec<String> = Vec::new();
 
+                let mut owner_line_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                let mut owner_real_href: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                let mut owner_dead_href: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                for line_idx in 0..item_lines_ref.len() {
+                    if let Some(o) = &line_owner_field[line_idx] {
+                        if line_values[line_idx].is_empty() || line_aux_control[line_idx] { continue; }
+                        *owner_line_counts.entry(o.clone()).or_insert(0) += 1;
+                        let raw = item_lines_ref[line_idx];
+                        if line_real_href(raw).is_some() {
+                            *owner_real_href.entry(o.clone()).or_insert(0) += 1;
+                        } else if raw.contains("href=") {
+                            *owner_dead_href.entry(o.clone()).or_insert(0) += 1;
+                        }
+                    }
+                }
+                let mut rep_meta: std::collections::HashMap<String, (usize, (u8, u8, i32, f32, usize))> = std::collections::HashMap::new();
+
                 for line_idx in 0..item_lines_ref.len() {
                     let owner_field = match &line_owner_field[line_idx] {
                         Some(o) => o.clone(),
@@ -4018,9 +4186,16 @@ pub async fn process_task(
 
                     let target_text = if !line_enriched_texts[line_idx].is_empty() { &line_enriched_texts[line_idx] } else { item_lines_ref[line_idx] };
                     let clean_text = if let Some(idx) = target_text.find('|') { target_text[idx + 1..].trim() } else { "" };
-                    if clean_text.is_empty() || clean_text.chars().count() < 2 { continue; }
+                    let owner_fmt = detect_field_format(&owner_field);
+                    let min_chars = if owner_fmt == FieldFormat::Numeric { 1 } else { 2 };
+                    if clean_text.is_empty() || clean_text.chars().count() < min_chars { continue; }
 
                     header_owned_lines.insert(line_idx);
+
+                    if line_aux_control[line_idx] {
+                        emit_term(&format!("    ⏭️ [AUX CONTROL SKIP] '{}' ← Item Line {} (\"{}\") | 같은 칸에 데이터 라인이 있는 버튼/입력 컨트롤이라 값 후보에서 뺍니다. 라인은 이 컬럼 소유로 남습니다.", owner_field, line_idx + 1, clean_text));
+                        continue;
+                    }
 
                     if is_id_link_field(&owner_field) {
                         for tok in clean_text.split(|c: char| !c.is_alphanumeric()) {
@@ -4029,6 +4204,29 @@ pub async fn process_task(
                             if !header_id_tokens.iter().any(|t| t == tok) { header_id_tokens.push(tok.to_string()); }
                         }
                         emit_term(&format!("    🔑 [HEADER OWNED / ID COLUMN] Item Line {} 는 '{}' 컬럼입니다. 결정론적 ID/LINK 해석기에 위임하고 타 컬럼 선점을 차단합니다.", line_idx + 1, owner_field));
+                        continue;
+                    }
+
+                    let owner_fmt_ok = match owner_fmt {
+                        FieldFormat::Link | FieldFormat::Synthesis => true,
+                        FieldFormat::Identifier => {
+                            clean_text.chars().any(|c| c.is_ascii_digit()) || value_token_in_url_pool(clean_text, &url_pool)
+                        }
+                        FieldFormat::Enum => {
+                            value_matches_format(owner_fmt, clean_text) && enum_value_reject(&owner_field, clean_text).is_none()
+                        }
+                        _ => value_matches_format(owner_fmt, clean_text),
+                    };
+                    if !owner_fmt_ok {
+                        crate::utils::score_dynamics::record_field_reject(
+                            &owner_field,
+                            if owner_fmt == FieldFormat::Enum {
+                                crate::utils::score_dynamics::GateKind::Enum
+                            } else {
+                                crate::utils::score_dynamics::GateKind::Format
+                            },
+                        );
+                        emit_term(&format!("    🚫 [HEADER OWNED FORMAT REJECT] '{}' ({:?}) ← Item Line {} (\"{}\") | 헤더 칸의 값이 필드 형식과 맞지 않아 주입하지 않습니다. 라인은 이 컬럼 소유로 남아 다른 필드도 가져가지 못합니다.", owner_field, owner_fmt, line_idx + 1, clean_text));
                         continue;
                     }
 
@@ -4045,37 +4243,71 @@ pub async fn process_task(
                         continue;
                     }
 
-                    
-                    
-                    
-                    
-                    
                     let raw_line = item_lines_ref[line_idx];
-                    let line_rank: i32 = if line_real_href(raw_line).is_some() {
+                    let multi_line = owner_line_counts.get(&owner_field).copied().unwrap_or(0) >= 2;
+                    let action_margin: Option<f32> = if multi_line && !ui_action_embs.is_empty() {
+                        match fields.iter().position(|(n, _, _, _)| n == &owner_field) {
+                            Some(oi) => {
+                                let v_emb = model.get_embedding(clean_text.to_string()).await.unwrap_or(vec![0.0f32; 384]);
+                                if v_emb.iter().all(|&v| v == 0.0) {
+                                    None
+                                } else {
+                                    let own = weighted_max_pool_sim(&v_emb, &field_phrase_embs[oi], &field_phrase_weights[oi]);
+                                    let chrome = max_pool_sim(&v_emb, &ui_action_embs);
+                                    crate::utils::score_dynamics::record_baseline("commerce.premap_action_margin", own - chrome);
+                                    Some(own - chrome)
+                                }
+                            }
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let action_like = action_margin.map_or(false, |m| m < 0.0);
+                    let line_margin = action_margin.unwrap_or(0.0);
+                    let is_real_href = line_real_href(raw_line).is_some();
+                    let real_links = owner_real_href.get(&owner_field).copied().unwrap_or(0);
+                    let dead_links = owner_dead_href.get(&owner_field).copied().unwrap_or(0);
+                    let menu_penalty: u8 = if is_real_href && dead_links >= 1 && real_links >= 2 { 1 } else { 0 };
+                    let line_rank: i32 = if is_real_href {
                         2
-                    } else if raw_line.contains("href=") {
+                    } else if is_bracket_annotation(clean_text) {
                         0
                     } else {
                         1
                     };
+                    let new_key: (u8, u8, i32, f32, usize) = (
+                        menu_penalty,
+                        if action_like { 1 } else { 0 },
+                        line_rank,
+                        line_margin,
+                        clean_text.chars().count(),
+                    );
+                    if action_like || menu_penalty == 1 {
+                        crate::utils::score_dynamics::record_baseline("commerce.premap_action_demote", 1.0);
+                        emit_term(&format!("    🧹 [PREMAP DEMOTE] '{}' ← Item Line {} (\"{}\") |{}{} | 필드 구 - UI 액션 구 = {:+.4}", owner_field, line_idx + 1, clean_text, if menu_penalty == 1 { format!(" 드롭다운 메뉴 링크 (같은 칸 죽은 링크 트리거 {}개 · 실링크 {}개)", dead_links, real_links) } else { String::new() }, if action_like { " · UI 액션 쪽" } else { "" }, line_margin));
+                    }
 
                     if let Some(existing) = pre_mapped_hints.iter_mut().find(|h: &&mut serde_json::Value| h.get("target_column").and_then(|v| v.as_str()) == Some(owner_field.as_str())) {
                         let prev = existing.get("extracted_value").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let prev_rank = existing.get("line_rank").and_then(|v| v.as_i64()).unwrap_or(1) as i32;
+                        let prev_key = rep_meta.get(&owner_field).map(|m| m.1).unwrap_or((0, 0, 1, 0.0, prev.chars().count()));
 
                         if is_multi_value_field(&owner_field) {
-                            if !prev.is_empty() && prev != clean_text {
+                            if action_like {
+                                emit_term(&format!("    ⏭️ [SUBORDINATE SKIP] '{}' 다중값 병합에서 UI 액션 라인 \"{}\" 는 제외합니다.", owner_field, clean_text));
+                            } else if prev_key.1 == 1 {
+                                existing.as_object_mut().unwrap().insert("extracted_value".to_string(), json!(clean_text));
+                                rep_meta.insert(owner_field.clone(), (line_idx, new_key));
+                                emit_term(&format!("    🥇 [REPRESENTATIVE SWAP] '{}' 대표값 교체: \"{}\" (Rank {}) → \"{}\" (Rank {})", owner_field, prev, prev_key.2, clean_text, line_rank));
+                            } else if !prev.is_empty() && prev != clean_text {
                                 existing.as_object_mut().unwrap().insert("extracted_value".to_string(), json!(format!("{} {}", prev, clean_text)));
                             }
-                        } else if prev.is_empty()
-                            || line_rank > prev_rank
-                            || (line_rank == prev_rank && clean_text.chars().count() > prev.chars().count())
-                        {
+                        } else if prev.is_empty() || premap_rep_better(new_key, prev_key) {
                             existing.as_object_mut().unwrap().insert("extracted_value".to_string(), json!(clean_text));
-                            existing.as_object_mut().unwrap().insert("line_rank".to_string(), json!(line_rank));
-                            emit_term(&format!("    🥇 [REPRESENTATIVE SWAP] '{}' 대표값 교체: \"{}\" (Rank {}) → \"{}\" (Rank {})", owner_field, prev, prev_rank, clean_text, line_rank));
+                            rep_meta.insert(owner_field.clone(), (line_idx, new_key));
+                            emit_term(&format!("    🥇 [REPRESENTATIVE SWAP] '{}' 대표값 교체: \"{}\" (Rank {}) → \"{}\" (Rank {})", owner_field, prev, prev_key.2, clean_text, line_rank));
                         } else {
-                            emit_term(&format!("    ⏭️ [SUBORDINATE SKIP] '{}' 는 이미 상위 랭크 대표값(\"{}\")을 확보하여 \"{}\" (Rank {}) 는 병합하지 않습니다.", owner_field, prev, clean_text, line_rank));
+                            emit_term(&format!("    ⏭️ [SUBORDINATE SKIP] '{}' 는 이미 상위 대표값(\"{}\")을 확보하여 \"{}\" (Rank {}) 는 병합하지 않습니다.", owner_field, prev, clean_text, line_rank));
                         }
                     } else {
                         pre_mapped_hints.push(json!({
@@ -4083,8 +4315,22 @@ pub async fn process_task(
                             "extracted_value": clean_text,
                             "line_rank": line_rank
                         }));
+                        rep_meta.insert(owner_field.clone(), (line_idx, new_key));
                     }
                     emit_term(&format!("    🔍 [FAST-PRE-MAP] Item Line {} mapped to '{}' (Rank {}) via Header cosine", line_idx + 1, owner_field, line_rank));
+                }
+
+                let premap_handoff: Vec<(String, usize)> = rep_meta
+                    .iter()
+                    .filter(|(_, (_, k))| k.1 == 1)
+                    .map(|(o, (li, _))| (o.clone(), *li))
+                    .collect();
+                let mut premap_handoff_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for (owner, li) in premap_handoff {
+                    pre_mapped_hints.retain(|h| h.get("target_column").and_then(|v| v.as_str()) != Some(owner.as_str()));
+                    premap_handoff_fields.insert(owner.clone());
+                    crate::utils::score_dynamics::record_baseline("commerce.premap_action_handoff", 1.0);
+                    emit_term(&format!("    🎯 [PREMAP ACTION HANDOFF] '{}' 칸의 후보가 모두 UI 액션 쪽이라 값 우회(PRE-MAP BYPASS)를 멈추고, 한 줄 강제 없이 아이템 전체 문맥으로 LLM 이 고르게 합니다. (최선 후보 Item Line {})", owner, li + 1));
                 }
                 
 
@@ -4197,11 +4443,15 @@ pub async fn process_task(
                     }
                 }
 
-                
-                
-                
-                
-                
+                let field_header_mapped: Vec<bool> = fields
+                    .iter()
+                    .map(|(n, _, _, _)| header_to_field_map.values().any(|v| v == n))
+                    .collect();
+                let mut enum_value_blocked = 0usize;
+                let mut column_contract_blocked = 0usize;
+                let aux_control_lines = (0..item_lines_ref.len())
+                    .filter(|&l| line_aux_control[l] && !det_consumed_lines.contains(&l) && !line_values[l].is_empty())
+                    .count();
                 let (mut vector_assignment, vector_raw_matrix): (Vec<Option<(usize, f32, f32)>>, Vec<Vec<f32>>) = {
                     let line_count = item_lines_ref.len();
                     let field_count = field_phrase_embs.len();
@@ -4214,6 +4464,7 @@ pub async fn process_task(
                             if item_lines_ref[l].trim().is_empty() { continue; }
                             if item_embeddings[l].iter().all(|&v| v == 0.0) { continue; }
                             if det_consumed_lines.contains(&l) { continue; }
+                            if line_aux_control[l] { continue; }
 
                             let value = &line_values[l];
                             let format_ok = match fmt {
@@ -4221,6 +4472,19 @@ pub async fn process_task(
                                 _ => value_matches_format(fmt, value),
                             };
                             if !format_ok { continue; }
+                            if fmt == FieldFormat::Enum && enum_value_reject(&fields[f].0, value).is_some() {
+                                enum_value_blocked += 1;
+                                continue;
+                            }
+                            if field_header_mapped.get(f).copied().unwrap_or(false) {
+                                if let Some(h) = &line_header_label[l] {
+                                    let owner_of_line = header_to_field_map.get(h.as_str()).map(|o| o.as_str());
+                                    if owner_of_line != Some(fields[f].0.as_str()) {
+                                        column_contract_blocked += 1;
+                                        continue;
+                                    }
+                                }
+                            }
 
                             raw[f][l] = weighted_max_pool_sim(
                                 &item_embeddings[l],
@@ -4252,6 +4516,26 @@ pub async fn process_task(
 
                     (assign, raw)
                 };
+                if enum_value_blocked > 0 || column_contract_blocked > 0 || aux_control_lines > 0 {
+                    crate::utils::score_dynamics::record_baseline("commerce.enum_value_block", enum_value_blocked as f32);
+                    crate::utils::score_dynamics::record_baseline("commerce.column_contract_block", column_contract_blocked as f32);
+                    crate::utils::score_dynamics::record_baseline("commerce.aux_control_block", aux_control_lines as f32);
+                    emit_term(&format!("    🧱 [COLUMN CONTRACT] 열거형 값이 될 수 없는 후보(순수 수치·통화 표지 없음) {}건, 헤더로 컬럼이 확정된 필드의 다른 컬럼 후보 {}건을 배정 행렬에서 제외했고, 데이터 칸에 붙은 보조 버튼/입력 라인 {}개는 후보에서 뺐습니다.", enum_value_blocked, column_contract_blocked, aux_control_lines));
+                }
+                for (f, a) in vector_assignment.iter().enumerate() {
+                    let l = match a { Some((l, _, _)) => *l, None => continue };
+                    if header_forced_assign.contains_key(&fields[f].0) { continue; }
+                    let cands: Vec<f32> = vector_raw_matrix[f].iter().copied().filter(|v| *v > -1.0).collect();
+                    if cands.len() < 3 { continue; }
+                    let n = cands.len() as f32;
+                    let mean = cands.iter().sum::<f32>() / n;
+                    let sd = (cands.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n).sqrt().max(1e-6);
+                    let z = (vector_raw_matrix[f][l] - mean) / sd - gumbel_expected_z(cands.len());
+                    crate::utils::score_dynamics::record_baseline("commerce.value_assign_evt", z);
+                    if z < 0.0 {
+                        emit_term(&format!("    📐 [VALUE ASSIGN EVT] '{}' ← Line {} | 배정된 라인의 유사도가 후보 {}개 분포에서 무작위 최댓값 기대치에 못 미칩니다 (z {:+.3}). 이번 라운드는 관측만 하고 배정은 그대로 둡니다.", fields[f].0, l + 1, cands.len(), z));
+                    }
+                }
 
                 
                 
@@ -4465,11 +4749,8 @@ pub async fn process_task(
                             for other in 0..field_phrase_embs.len() {
                                 if other == f_idx { continue; }
                                 if field_is_analytic[other] { continue; }
-                                let s = weighted_max_pool_sim(
-                                    &item_embeddings[l],
-                                    &field_phrase_embs[other],
-                                    &field_phrase_weights[other],
-                                );
+                                let s = vector_raw_matrix[other][l];
+                                if s < 0.0 { continue; }
                                 if s > rival { rival = s; }
                             }
                             if own <= rival { continue; }
@@ -4499,6 +4780,21 @@ pub async fn process_task(
                                 continue;
                             }
                         }
+                    }
+
+                    if !field_is_analytic[f_idx]
+                        && !has_vector_match
+                        && !is_id_link_field(&field_name)
+                        && !premap_handoff_fields.contains(&field_name)
+                        && field_header_mapped.get(f_idx).copied().unwrap_or(false)
+                    {
+                        emit_term(&format!("    ⛔ [HEADER COLUMN EMPTY] Field: '{}' ({:?}) | 헤더로 컬럼이 확정된 필드인데 이 아이템의 그 칸에 형식을 통과한 값이 없습니다. 다른 칸에서 빌려 오지 않도록 LLM 호출 없이 빈 값으로 확정합니다.", field_name, field_format));
+                        crate::utils::score_dynamics::record_field_reject(
+                            &field_name,
+                            crate::utils::score_dynamics::GateKind::Format,
+                        );
+                        crate::utils::score_dynamics::record_baseline("commerce.header_column_empty", 1.0);
+                        continue;
                     }
 
                     let (_bias_emb, _prej_emb, dynamic_prej_str) = &field_embeddings[f_idx];
@@ -4789,6 +5085,7 @@ pub async fn process_task(
                                                 key_fmt,
                                                 FieldFormat::Date | FieldFormat::TrackingCode | FieldFormat::Text
                                                     | FieldFormat::Numeric | FieldFormat::Enum | FieldFormat::Identifier
+                                                    | FieldFormat::Phone | FieldFormat::Address
                                             );
                                             if strict_post && !extracted_str.is_empty() && !value_matches_format(key_fmt, &extracted_str) {
                                                 emit_term(&format!("    🚫 [FORMAT REJECT] '{}' ({:?}) 에 형식 불일치 값 '{}' 반환. 폐기 후 재시도합니다.", k, key_fmt, extracted_str));
@@ -4797,6 +5094,29 @@ pub async fn process_task(
                                                     k,
                                                     crate::utils::score_dynamics::GateKind::Format,
                                                 );
+                                                requires_retry = true;
+                                                extracted_values_for_retry.push(extracted_str.clone());
+                                                continue;
+                                            }
+                                            let enum_reject = if key_fmt == FieldFormat::Enum { enum_value_reject(k, &extracted_str) } else { None };
+                                            if let Some(why) = enum_reject {
+                                                crate::utils::score_dynamics::record_field_seen(k);
+                                                crate::utils::score_dynamics::record_field_reject(
+                                                    k,
+                                                    crate::utils::score_dynamics::GateKind::Enum,
+                                                );
+                                                let amount_answer = k.to_lowercase().contains("currency") && currency_amount_like(&extracted_str);
+                                                let prior_amount = ignore_list.iter().any(|s| currency_amount_like(s) && !global_ignore_list.contains(s));
+                                                if amount_answer && prior_amount {
+                                                    emit_term(&format!("    💱 [CURRENCY AMOUNT STOP] '{}' 에 금액 '{}' 반환 ({}). 이 필드에서 금액 답을 이미 한 번 버렸는데 다시 금액이 와서, 이 아이템에는 통화 표지가 없다고 보고 재시도를 멈춥니다. 값은 비워 두고, 저장 직전 문서 언어 기본 통화가 들어갑니다.", k, extracted_str, why));
+                                                    crate::utils::score_dynamics::record_baseline("commerce.currency_amount_stop", 1.0);
+                                                    if let Some(o) = parsed_val.as_object_mut() {
+                                                        o.remove(*k);
+                                                    }
+                                                    found_valid_value = true;
+                                                    continue;
+                                                }
+                                                emit_term(&format!("    🚫 [ENUM VALUE GATE] '{}' 에 '{}' 반환 ({}). 열거형 값이 될 수 없어 폐기 후 재시도합니다.", k, extracted_str, why));
                                                 requires_retry = true;
                                                 extracted_values_for_retry.push(extracted_str.clone());
                                                 continue;
@@ -5885,13 +6205,14 @@ pub async fn process_task(
                         
                         
                         
-                        if f_fmt == FieldFormat::Enum && is_pure_numeric_value(pair_val) {
+                        let enum_reject = if f_fmt == FieldFormat::Enum { enum_value_reject(&d_field_names[f], pair_val) } else { None };
+                        if let Some(why) = enum_reject {
                             crate::utils::score_dynamics::record_field_reject(
                                 &d_field_names[f],
                                 crate::utils::score_dynamics::GateKind::Enum,
                             );
-                            emit_term(&format!("    🚫 [ENUM NUMERIC GATE] '{}' → '{}' | 값 \"{}\" 은 순수 수치이므로 열거형 후보가 될 수 없습니다.",
-                                unique_phrases[h], d_field_names[f], pair_val));
+                            emit_term(&format!("    🚫 [ENUM VALUE GATE] '{}' → '{}' | 값 \"{}\" 은 열거형 후보가 될 수 없습니다 ({}).",
+                                unique_phrases[h], d_field_names[f], pair_val, why));
                             continue;
                         }
 
@@ -6058,15 +6379,6 @@ pub async fn process_task(
 
             
             for l in &pair_owned_lines { det_consumed_lines.insert(*l); }
-
-            
-            
-            
-            
-            
-            
-            
-            
             
             let mut enum_resolved: std::collections::HashMap<String, String> = std::collections::HashMap::new();
             {
@@ -6074,16 +6386,8 @@ pub async fn process_task(
                 if select_groups.is_empty() {
                     emit_term("  ⚪ [ENUM SELECT] 문서에 <select> 컨트롤이 없어 상태 선택자 해석을 건너뜁니다.");
                 } else {
-                    let status_keys = enum_status_keys(&page_type);
-                    let mut key_banks: Vec<(String, Vec<Vec<f32>>)> = Vec::new();
-                    for k in &status_keys {
-                        let phrases = status_key_phrases(k);
-                        let e = model.get_embedding_batch(phrases.clone()).await
-                            .unwrap_or_else(|_| vec![vec![0.0; 384]; phrases.len()]);
-                        key_banks.push((k.to_string(), e));
-                    }
+                    let key_banks = status_key_banks(&model, &page_type).await;
 
-                    
                     let rival_phrases: Vec<String> = {
                         let mut v: Vec<String> = vec![
                             "delivery company".to_string(), "courier company".to_string(),
@@ -6221,22 +6525,18 @@ pub async fn process_task(
                     if let Some(gi) = chosen {
                         let g = &select_groups[gi];
                         let sel_emb = model.get_embedding(g.selected.clone()).await.unwrap_or(vec![0.0; 384]);
-                        let mut best_key = String::new();
-                        let mut best = f32::MIN;
-                        let mut second = f32::MIN;
-                        for (k, kb) in &key_banks {
-                            let s = max_pool_sim(&sel_emb, kb);
+                        let key_scores = status_key_scores(&sel_emb, &key_banks);
+                        for (k, s) in key_scores.iter() {
                             emit_term(&format!("      🧭 [STATUS KEY] '{}' ← selected \"{}\" | MaxPool: {:.4}", k, g.selected, s));
-                            if s > best { second = best; best = s; best_key = k.clone(); }
-                            else if s > second { second = s; }
                         }
-                        if !best_key.is_empty() && best > 0.35 && (best - second) > 0.01 {
-                            enum_resolved.insert("status".to_string(), best_key.clone());
+                        let pick = pick_status_key(&key_scores);
+                        if pick.accepted() {
+                            enum_resolved.insert("status".to_string(), pick.key.clone());
                             emit_term(&format!("  ✅ [ENUM SELECT RESOLVED] '{}' (selected: \"{}\") → status = '{}' | Top: {:.4} | Margin: {:+.4}",
-                                g.selector, g.selected, best_key, best, best - second));
+                                g.selector, g.selected, pick.key, pick.top, pick.margin()));
                         } else {
                             emit_term(&format!("  ⚠️ [ENUM SELECT UNRESOLVED] selected \"{}\" 의 캐노니컬 마진 부족 (Top {:.4} / 2nd {:.4}). 기존 경로로 위임합니다.",
-                                g.selected, best, second));
+                                g.selected, pick.top, pick.second));
                         }
                     }
                 }
@@ -6862,6 +7162,29 @@ pub async fn process_task(
                                             extracted_values_for_retry.push(extracted_str.clone());
                                             continue;
                                         }
+                                        let enum_reject = if key_fmt == FieldFormat::Enum { enum_value_reject(k, &extracted_str) } else { None };
+                                        if let Some(why) = enum_reject {
+                                            crate::utils::score_dynamics::record_field_seen(k);
+                                            crate::utils::score_dynamics::record_field_reject(
+                                                k,
+                                                crate::utils::score_dynamics::GateKind::Enum,
+                                            );
+                                            let amount_answer = k.to_lowercase().contains("currency") && currency_amount_like(&extracted_str);
+                                            let prior_amount = ignore_list.iter().any(|s| currency_amount_like(s) && !global_ignore_list.contains(s));
+                                            if amount_answer && prior_amount {
+                                                emit_term(&format!("  💱 [CURRENCY AMOUNT STOP] '{}' 에 금액 '{}' 반환 ({}). 이 필드에서 금액 답을 이미 한 번 버렸는데 다시 금액이 와서, 이 문서에는 통화 표지가 없다고 보고 재시도를 멈춥니다. 값은 비워 두고, 저장 직전 문서 언어 기본 통화가 들어갑니다.", k, extracted_str, why));
+                                                crate::utils::score_dynamics::record_baseline("commerce.currency_amount_stop", 1.0);
+                                                if let Some(o) = item_val.as_object_mut() {
+                                                    o.remove(*k);
+                                                }
+                                                found_valid_value = true;
+                                                continue;
+                                            }
+                                            emit_term(&format!("  🚫 [ENUM VALUE GATE] '{}' 에 '{}' 반환 ({}). 열거형 값이 될 수 없어 폐기 후 재시도합니다.", k, extracted_str, why));
+                                            requires_retry = true;
+                                            extracted_values_for_retry.push(extracted_str.clone());
+                                            continue;
+                                        }
 
                                         found_valid_value = true;
 
@@ -7023,27 +7346,12 @@ pub async fn process_task(
             }
             
 
-            let currency_val = obj.get("currency").and_then(|v| v.as_str()).unwrap_or("").trim();
-            if currency_val.is_empty() || currency_val == "null" {
-                let default_currency = match doc_lang_str.as_str() {
-                    "ko" => "KRW",
-                    "ja" => "JPY",
-                    "zh" | "zh-tw" | "zh-hk" | "zh-hans" => "CNY",
-                    "de" | "fr" | "it" | "es" | "nl" | "pt" | "el" => "EUR",
-                    "cs" => "CZK",
-                    "ru" => "RUB",
-                    "th" => "THB",
-                    "vi" => "VND",
-                    "hi" | "bn" => "INR",
-                    "en" | _ => "USD",
-                };
-                obj.insert("currency".to_string(), json!(default_currency));
-            } else {
-                let canon = crate::logic::canonical_currency_code(currency_val)
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| currency_val.to_uppercase());
-                obj.insert("currency".to_string(), json!(canon));
+            let currency_val = obj.get("currency").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            let currency_norm = normalize_currency_value(&currency_val, &doc_lang_str);
+            if currency_code_of(&currency_val).is_none() && currency_amount_like(&currency_val) {
+                println!("[Scheduler] 💱 [CURRENCY AMOUNT FALLBACK] currency='{}' 는 글자·통화기호 없는 금액 모양이라 통화가 될 수 없어 문서 언어 기본 통화 '{}' 로 대체합니다.", currency_val, currency_norm);
             }
+            obj.insert("currency".to_string(), json!(currency_norm));
             
 
             if let Some(q) = obj.get("quantity").cloned() {
@@ -7139,6 +7447,71 @@ pub async fn process_task(
             }
         }
     };
+
+    {
+        let status_values: Vec<String> = if is_detail {
+            extracted_data.get("status").and_then(|x| x.as_str()).map(|s| vec![s.to_string()]).unwrap_or_default()
+        } else {
+            extracted_data
+                .get("items")
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|it| it.get("status").and_then(|x| x.as_str()).map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let mut status_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut status_pending: Vec<String> = Vec::new();
+        for s in status_values.iter() {
+            let t = s.trim();
+            if t.is_empty() || t == "null" || crate::logic::parse_status(t) != 0 { continue; }
+            if status_map.contains_key(t) || status_pending.iter().any(|p| p == t) { continue; }
+            let lower = t.to_lowercase();
+            if crate::logic::parse_status(&lower) != 0 {
+                status_map.insert(t.to_string(), lower);
+            } else {
+                status_pending.push(t.to_string());
+            }
+        }
+        if !status_pending.is_empty() {
+            let banks = status_key_banks(&model, &page_type).await;
+            for raw in status_pending.iter() {
+                let emb = model.get_embedding(raw.clone()).await.unwrap_or(vec![0.0f32; 384]);
+                let pick = pick_status_key(&status_key_scores(&emb, &banks));
+                if pick.second > f32::MIN {
+                    crate::utils::score_dynamics::record_baseline("commerce.status_canonical_margin", pick.top - pick.second);
+                }
+                if pick.accepted_with(0.35, 0.03) && crate::logic::parse_status(&pick.key) != 0 {
+                    emit_term(&format!("  🧭 [STATUS CANONICAL] '{}' → '{}' | Top: {:.4} | Margin: {:+.4} (parse_status 가 모르는 원문은 저장 시 0 이 되므로 상태 캐노니컬 뱅크로 환산합니다)", raw, pick.key, pick.top, pick.margin()));
+                    status_map.insert(raw.clone(), pick.key.clone());
+                } else {
+                    emit_term(&format!("  ⚪ [STATUS CANONICAL UNRESOLVED] '{}' | '{}' Top: {:.4} / 2nd: {:.4} → 확정 불가, 원문을 유지합니다.", raw, pick.key, pick.top, pick.second));
+                }
+            }
+        }
+        if !status_map.is_empty() {
+            let apply_status = |v: &mut serde_json::Value| {
+                let cur = v.get("status").and_then(|x| x.as_str()).map(|s| s.trim().to_string());
+                if let Some(c) = cur {
+                    if let Some(k) = status_map.get(&c) {
+                        if let Some(o) = v.as_object_mut() {
+                            o.insert("status".to_string(), json!(k));
+                        }
+                    }
+                }
+            };
+            if is_detail {
+                apply_status(&mut extracted_data);
+            } else if let Some(items) = extracted_data.get_mut("items").and_then(|v| v.as_array_mut()) {
+                for it in items.iter_mut() {
+                    apply_status(it);
+                }
+            }
+        }
+    }
 
     if is_detail {
         normalize_data(&mut extracted_data);
@@ -7875,44 +8248,7 @@ pub async fn process_task(
                             .unwrap_or_else(|_| vec![vec![0.0; 384]; phrases.len()])
                     };
 
-                    let fmt_str = {
-                        let lower = fname.to_lowercase();
-                        let keys: Vec<String> = lower.split(',').map(|s| s.trim().to_string()).collect();
-                        let has = |k: &str| keys.iter().any(|x| x == k);
-
-                        if keys.iter().any(|k| k.contains("insight") || k.contains("summary") || k.contains("analysis")) {
-                            "Synthesis".to_string()
-                        } else if keys.iter().any(|k| k.contains("tracking_number") || k == "barcode" || k == "gtin" || k == "mpn") {
-                            "TrackingCode".to_string()
-                        } else if has("id") || has("code") || has("no") || has("index") || has("stock_keeping_unit") {
-                            "Identifier".to_string()
-                        } else if keys.iter().any(|k| k.contains("link") || k.contains("url")) {
-                            "Link".to_string()
-                        } else if keys.iter().any(|k| k.contains("date") || k.ends_with("_at")) {
-                            "Date".to_string()
-                        } else if keys.iter().any(|k| {
-                            k.ends_with("phone") || k == "tel" || k == "telephone" || k == "mobile"
-                                || k == "cellphone" || k == "contact" || k == "number"
-                        }) {
-                            "Phone".to_string()
-                        } else if keys.iter().any(|k| k == "address" || k.ends_with("_address")) {
-                            "Address".to_string()
-                        } else if keys.iter().any(|k| {
-                            k.contains("status") || k.contains("payment_method") || k.contains("payment_origin")
-                                || k.contains("condition") || k.contains("currency") || k == "bank" || k == "card"
-                        }) {
-                            "Enum".to_string()
-                        } else if keys.iter().any(|k| {
-                            k.contains("price") || k.contains("amount") || k.contains("quantity") || k.contains("weight")
-                                || k == "width" || k == "height" || k == "length" || k.contains("fee")
-                                || k.contains("discount") || k.contains("usage_") || k.contains("threshold")
-                                || k.contains("duration")
-                        }) {
-                            "Numeric".to_string()
-                        } else {
-                            "Text".to_string()
-                        }
-                    };
+                    let fmt_str = crate::nl_convert::field_format_to_string(fname);
 
                     idx_field_names.push(fname.clone());
                     idx_field_phrase_embs.push(phrase_embs);
@@ -8511,44 +8847,7 @@ pub async fn process_task(
                                     .unwrap_or_else(|_| vec![vec![0.0; 384]; phrases.len()])
                             };
 
-                            let fmt_str = {
-                                let lower = fname.to_lowercase();
-                                let keys: Vec<String> = lower.split(',').map(|s| s.trim().to_string()).collect();
-                                let has = |k: &str| keys.iter().any(|x| x == k);
-
-                                if keys.iter().any(|k| k.contains("insight") || k.contains("summary") || k.contains("analysis")) {
-                                    "Synthesis".to_string()
-                                } else if keys.iter().any(|k| k.contains("tracking_number") || k == "barcode" || k == "gtin" || k == "mpn") {
-                                    "TrackingCode".to_string()
-                                } else if has("id") || has("code") || has("no") || has("index") || has("stock_keeping_unit") {
-                                    "Identifier".to_string()
-                                } else if keys.iter().any(|k| k.contains("link") || k.contains("url")) {
-                                    "Link".to_string()
-                                } else if keys.iter().any(|k| k.contains("date") || k.ends_with("_at")) {
-                                    "Date".to_string()
-                                } else if keys.iter().any(|k| {
-                                    k.ends_with("phone") || k == "tel" || k == "telephone" || k == "mobile"
-                                        || k == "cellphone" || k == "contact" || k == "number"
-                                }) {
-                                    "Phone".to_string()
-                                } else if keys.iter().any(|k| k == "address" || k.ends_with("_address")) {
-                                    "Address".to_string()
-                                } else if keys.iter().any(|k| {
-                                    k.contains("status") || k.contains("payment_method") || k.contains("payment_origin")
-                                        || k.contains("condition") || k.contains("currency") || k == "bank" || k == "card"
-                                }) {
-                                    "Enum".to_string()
-                                } else if keys.iter().any(|k| {
-                                    k.contains("price") || k.contains("amount") || k.contains("quantity") || k.contains("weight")
-                                        || k == "width" || k == "height" || k == "length" || k.contains("fee")
-                                        || k.contains("discount") || k.contains("usage_") || k.contains("threshold")
-                                        || k.contains("duration")
-                                }) {
-                                    "Numeric".to_string()
-                                } else {
-                                    "Text".to_string()
-                                }
-                            };
+                            let fmt_str = crate::nl_convert::field_format_to_string(fname);
 
                             idx_field_names.push(fname.clone());
                             idx_field_phrase_embs.push(phrase_embs);

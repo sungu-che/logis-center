@@ -1883,15 +1883,6 @@ impl crate::model::LogisModel {
 
 const SHIP_BIND_RADIUS: usize = 6;
 
-const SHIP_CURRENCY_NAMES: &[(&str, &str)] = &[
-    ("USD", "usd, $, dollar, dollars, us-dollar, dólar, dólares, dollaro, dollari, dolar, dolary, dolarů, 달러, 미국달러, 美元, 美金, 米ドル, ドル, دولار, دولارات"),
-    ("EUR", "eur, €, euro, euros, eura, 유로, 欧元, 歐元, ユーロ, يورو"),
-    ("JPY", "jpy, yen, yens, iene, ienes, jeny, jenů, 엔, 엔화, 円, 日元, 日圓, ين, ين ياباني"),
-    ("CNY", "cny, rmb, yuan, yuans, renminbi, iuane, jüan, jüany, jüanů, 위안, 위안화, 元, 人民币, 人民幣, 人民元, يوان"),
-    ("KRW", "krw, ₩, won, wons, wony, wonů, 원, 원화, 韩元, 韓元, ウォン, وون"),
-    ("GBP", "gbp, £, sterling, pound sterling, pounds sterling, britisches pfund, livre sterling, livres sterling, libra esterlina, libras esterlinas, sterlina, sterline, britse pond, libra šterlinků, 영국 파운드, 英镑, 英鎊, 英ポンド, جنيه إسترليني"),
-];
-
 fn ship_normalize_token(s: &str) -> String {
     crate::utils::ai_utils::lower_alnum(s)
 }
@@ -1917,33 +1908,11 @@ fn ship_bank_centroid(bank: &[Vec<f32>]) -> Vec<f32> {
 }
 
 fn ship_currency_name_exact(core: &str) -> Option<&'static str> {
-    let norm = ship_normalize_token(core);
-    if norm.is_empty() { return None; }
-    for (code, raw) in SHIP_CURRENCY_NAMES.iter() {
-        for p in raw.split(',') {
-            let p = ship_normalize_token(p);
-            if p.is_empty() { continue; }
-            if norm == p { return Some(*code); }
-            if p.chars().count() < 2 { continue; }
-            if let Some(rest) = norm.strip_prefix(p.as_str()) {
-                if crate::utils::ai_utils::short_tail_ok(rest, 2) {
-                    return Some(*code);
-                }
-            }
-        }
-    }
-    None
+    crate::utils::ai_utils::currency_name_exact(core)
 }
 
 fn ship_currency_symbol(raw: &str) -> Option<&'static str> {
-    for (code, list) in SHIP_CURRENCY_NAMES.iter() {
-        for p in list.split(',') {
-            let p = p.trim();
-            if p.is_empty() || p.chars().any(|c| c.is_alphanumeric()) { continue; }
-            if raw.contains(p) { return Some(*code); }
-        }
-    }
-    None
+    crate::utils::ai_utils::currency_symbol_in(raw)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

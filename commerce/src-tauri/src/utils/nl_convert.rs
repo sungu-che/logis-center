@@ -206,8 +206,8 @@ pub fn split_natural_language_to_chunks(text: &str) -> Vec<(String, String, bool
             let property = context_raw.to_lowercase().replace(' ', "_");
 
             // 콤마로 배열 값 분할
-            let values: Vec<&str> = values_part
-                .split(',')
+            let values: Vec<&str> = split_clause_commas(values_part)
+                .into_iter()
                 .map(|v| v.trim())
                 .filter(|v| !v.is_empty())
                 .collect();
@@ -304,8 +304,8 @@ pub fn split_natural_language_to_chunks(text: &str) -> Vec<(String, String, bool
     for (chunk_text, property, confirmed) in &chunks {
         if chunk_text.chars().count() > 150 {
             // 콤마 기준으로 분할 시도
-            let parts: Vec<&str> = chunk_text
-                .split(',')
+            let parts: Vec<&str> = split_clause_commas(chunk_text)
+                .into_iter()
                 .map(|p| p.trim())
                 .filter(|p| !p.is_empty())
                 .collect();
@@ -381,6 +381,23 @@ pub fn log_chunk_split_result(chunks: &[(String, String, bool)]) {
         let flag = if *confirmed { "✓" } else { "?" };
         println!("    [{}] {} property='{}' | text='{}'", i, flag, prop, text);
     }
+}
+
+pub fn split_clause_commas(s: &str) -> Vec<&str> {
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let mut out: Vec<&str> = Vec::new();
+    let mut start = 0usize;
+    for k in 0..chars.len() {
+        let (bi, ch) = chars[k];
+        if ch != ',' { continue; }
+        let prev_digit = k > 0 && chars[k - 1].1.is_ascii_digit();
+        let next_digit = chars.get(k + 1).map_or(false, |x| x.1.is_ascii_digit());
+        if prev_digit && next_digit { continue; }
+        out.push(&s[start..bi]);
+        start = bi + ch.len_utf8();
+    }
+    out.push(&s[start..]);
+    out
 }
 
 // =====================================================================

@@ -14,6 +14,12 @@ impl crate::model::LogisModel {
         };
 
         emit_term("[ENGINE] 🚀 Starting Commerce Search Pipeline...");
+        crate::utils::score_dynamics::enter_scope(
+            "",
+            crate::utils::score_dynamics::Track::Search,
+            "all",
+            "",
+        );
 
         // 🌟 [최초 초기화] VRAM 확보 및 불필요한 제너레이터 선제적 언로드 (캔슬 개입 포함)
         emit_term("[ENGINE] 🧹 Pre-purging memory before loading embedding model...");
@@ -1544,15 +1550,31 @@ impl crate::model::LogisModel {
                     fields.iter().any(|n| n == "started_at") && fields.iter().any(|n| n == "expired_at")
                 };
                 let period_words_owned: Vec<String> = words.iter().map(|w| w.to_string()).collect();
-                let exact_period = crate::utils::ai_utils::exact_absolute_period(&period_words_owned, period_today)
-                    .filter(|_| validity_axes);
+                let raw_exact_period = crate::utils::ai_utils::exact_absolute_period(&period_words_owned, period_today);
+                let exact_period = raw_exact_period
+                    .clone()
+                    .filter(|p| validity_axes || crate::utils::ai_utils::exact_period_tail_closed(&period_words_owned, p));
+                if exact_period.is_none() {
+                    if let Some(p) = raw_exact_period.as_ref() {
+                        emit_term(&format!(
+                            "  ⚪ [EXACT PERIOD OPEN TAIL] 토큰 {:?} 는 기간 모양이지만 '{}' 도메인에는 유효 기간 축이 없고 꼬리가 닫힌 어휘(조사·시간 연산자)가 아니어서 기간으로 확정하지 않고 속성 배정에 그대로 둡니다. (예: 연식·모델명)",
+                            p.tokens.iter().filter_map(|&i| period_words_owned.get(i).cloned()).collect::<Vec<_>>(),
+                            seg_type
+                        ));
+                    }
+                }
                 let period_words: std::collections::HashSet<String> = exact_period
                     .as_ref()
                     .map(|p| p.tokens.iter().filter_map(|&i| period_words_owned.get(i).cloned()).collect())
                     .unwrap_or_default();
                 if let Some(p) = exact_period.as_ref() {
+                    let axis_note = if validity_axes {
+                        format!("기간은 LLM 이 아니라 결정론 시간 가이드가 '{}' 도메인의 유효 기간 축(started_at·expired_at)에 겁니다.", seg_type)
+                    } else {
+                        format!("'{}' 도메인에는 유효 기간 축이 없어 기간을 하드 조건으로 싣지 않습니다(DATE FIELD SCOPE 와 같은 규칙). 꼬리가 전부 닫힌 어휘라 기간 조각으로만 확정해 수치·문자 속성 배정에서 빼고 FTS 검색어로 남깁니다.", seg_type)
+                    };
                     emit_term(&format!(
-                        "  📅 [EXACT PERIOD] {} ~ {} | op={} | 단위={} | 연도명시={} | 토큰={:?} | 근거={:?} — analytic·shipping 과 같은 12개 언어 닫힌 어휘 표(연·월·일 단위, 시간 연산자)로 확정했습니다. 이 토큰들은 속성 배정에서 빠지고, 기간은 LLM 이 아니라 결정론 시간 가이드가 '{}' 도메인의 유효 기간 축(started_at·expired_at)에 겁니다.",
+                        "  📅 [EXACT PERIOD] {} ~ {} | op={} | 단위={} | 연도명시={} | 토큰={:?} | 근거={:?} — analytic·shipping 과 같은 12개 언어 닫힌 어휘 표(연·월·일 단위, 시간 연산자)로 확정했습니다. 이 토큰들은 속성 배정에서 빠지고, {}",
                         p.start,
                         p.end,
                         p.operator,
@@ -1560,8 +1582,12 @@ impl crate::model::LogisModel {
                         p.year_explicit,
                         p.tokens.iter().filter_map(|&i| period_words_owned.get(i).cloned()).collect::<Vec<_>>(),
                         p.evidence,
-                        seg_type
+                        axis_note
                     ));
+                    crate::utils::score_dynamics::record_baseline(
+                        "search.exact_period_axisless",
+                        if validity_axes { 0.0 } else { 1.0 },
+                    );
                 }
 
                 // 🌟 [DOMAIN TYPE WORD DETECTION]
@@ -3032,10 +3058,17 @@ impl crate::model::LogisModel {
                     Some(p) => {
                         let (start, end) = crate::utils::time_guide::anchor_exact_period(p.start, p.end, p.year_explicit, &exact_time_key, period_today, false);
                         let (cond_start, cond_end, _) = crate::utils::time_guide::exact_with_season(start, end, p.granularity, &verified_season, period_southern);
-                        llm_temporal_guide = format!(
-                            "- [DETERMINISTIC OVERRIDE] Exact period {} ~ {} detected. DO NOT extract date properties (like started_at, expired_at, date). The system will auto-inject them.",
-                            cond_start, cond_end
-                        );
+                        llm_temporal_guide = if validity_axes {
+                            format!(
+                                "- [DETERMINISTIC OVERRIDE] Exact period {} ~ {} detected. DO NOT extract date properties (like started_at, expired_at, date). The system will auto-inject them.",
+                                cond_start, cond_end
+                            )
+                        } else {
+                            format!(
+                                "- [DETERMINISTIC OVERRIDE] Exact period {} ~ {} detected. DO NOT extract date properties (like started_at, expired_at, date). This domain has no validity period axis, so the period stays a search keyword and no date condition is added.",
+                                cond_start, cond_end
+                            )
+                        };
                         Some((
                             cond_start,
                             cond_end,
@@ -3518,6 +3551,84 @@ impl crate::model::LogisModel {
                         }
                         if !relocked.is_empty() {
                             emit_term(&format!("      🔒 [EXACT OPERATOR LOCK] 닫힌 비교 어휘로 확정한 연산자를 LLM 출력 위에 다시 고정했습니다: {:?}", relocked));
+                        }
+
+                        {
+                            let cur_raw: Option<(String, String)> = structured_cond.get("currency").map(|c| (
+                                c.get("operator").and_then(|o| o.as_str()).unwrap_or("").trim().to_lowercase(),
+                                match c.get("value") {
+                                    Some(Value::String(s)) => s.trim().to_string(),
+                                    Some(Value::Number(n)) => n.to_string(),
+                                    _ => String::new(),
+                                },
+                            ));
+                            if let Some((cur_op, v)) = cur_raw.filter(|(_, v)| !v.is_empty() && v != "null") {
+                                let negated = cur_op.starts_with("not") || cur_op.starts_with("neq");
+                                match crate::utils::ai_utils::currency_code_of(&v) {
+                                    Some(code) => {
+                                        let new_op = if negated { "neq" } else { "eq" };
+                                        if let Some(o) = structured_cond.get_mut("currency").and_then(|c| c.as_object_mut()) {
+                                            o.insert("operator".to_string(), json!(new_op));
+                                            o.insert("value".to_string(), json!(code));
+                                        }
+                                        emit_term(&format!("      💱 [CLOSED VOCAB / CURRENCY] '{}' ({}) → ISO '{}' ({}) — 통화 코드·통화명·기호 닫힌 표 일치", v, cur_op, code, new_op));
+                                    }
+                                    None => {
+                                        structured_cond.remove("currency");
+                                        if !unassigned_chunks.iter().any(|e| e == &v) { unassigned_chunks.push(v.clone()); }
+                                        crate::utils::score_dynamics::record_baseline("search.closed_vocab_drop", 1.0);
+                                        emit_term(&format!("      🗑️ [CLOSED VOCAB DROP] currency='{}' 는 통화 코드·통화명·기호 어느 것과도 닫힌 일치가 없어 조건에서 제외하고 FTS 검색어로만 남깁니다.", v));
+                                    }
+                                }
+                            }
+                            let st_raw: Option<(String, String)> = structured_cond.get("status").map(|c| (
+                                c.get("operator").and_then(|o| o.as_str()).unwrap_or("").trim().to_lowercase(),
+                                match c.get("value") {
+                                    Some(Value::String(s)) => s.trim().to_string(),
+                                    Some(Value::Number(n)) => n.to_string(),
+                                    _ => String::new(),
+                                },
+                            ));
+                            if let Some((st_op, v)) = st_raw.filter(|(_, v)| !v.is_empty() && v != "null") {
+                                let key = v.to_lowercase();
+                                let numeric_code = key.parse::<i32>().ok().filter(|n| (1..=12).contains(n));
+                                let code = numeric_code.unwrap_or_else(|| crate::logic::parse_status(&key));
+                                let negated = st_op.starts_with("not") || st_op.starts_with("neq");
+                                if code != 0 && (negated || numeric_code.is_some()) {
+                                    let keep_op = if negated { "neq" } else { "eq" };
+                                    structured_cond.insert("status".to_string(), json!({ "operator": keep_op, "value": code }));
+                                    if negated {
+                                        let axis_code = obj
+                                            .get("status")
+                                            .and_then(|s| s.as_str())
+                                            .map(|s| crate::logic::parse_status(s.trim()))
+                                            .unwrap_or(0);
+                                        if axis_code == code {
+                                            obj.insert("status".to_string(), json!(""));
+                                            emit_term(&format!("      🔁 [CLOSED VOCAB / STATUS] 상태 축 값이 부정 조건과 같은 코드 {} 라 모순을 피하려고 축을 비웁니다.", code));
+                                        }
+                                    }
+                                    emit_term(&format!("      🔁 [CLOSED VOCAB / STATUS] status {} '{}' → 저장 규약 코드 {} 로 {} 수치 조건을 유지합니다.", st_op, key, code, keep_op));
+                                } else if code != 0 {
+                                    structured_cond.remove("status");
+                                    let axis_empty = obj
+                                        .get("status")
+                                        .and_then(|s| s.as_str())
+                                        .map_or(true, |s| {
+                                            let t = s.trim();
+                                            t.is_empty() || t == "null" || crate::logic::parse_status(t) == 0
+                                        });
+                                    if axis_empty {
+                                        obj.insert("status".to_string(), json!(key.clone()));
+                                    }
+                                    emit_term(&format!("      🔁 [CLOSED VOCAB / STATUS] status='{}' 는 캐노니컬 상태 키라 속성 조건 대신 상태 축(status)으로 옮깁니다. (상태 축 {})", key, if axis_empty { "비어 있어 채움" } else { "이미 확정되어 유지" }));
+                                } else {
+                                    structured_cond.remove("status");
+                                    if !unassigned_chunks.iter().any(|e| e == &v) { unassigned_chunks.push(v.clone()); }
+                                    crate::utils::score_dynamics::record_baseline("search.closed_vocab_drop", 1.0);
+                                    emit_term(&format!("      🗑️ [CLOSED VOCAB DROP] status='{}' 는 캐노니컬 상태 키가 아니어서 조건에서 제외합니다. 저장된 status 는 정수 코드라 문자열 조건은 어떤 문서와도 맞지 않고, 상태 의도는 상태 필터 축이 따로 판정합니다. (FTS 검색어로는 보존)", v));
+                                }
+                            }
                         }
 
                         // 🌟 [EMPTY CONDITION SWEEP] 끝내 값을 확보하지 못한 조건은 필터가 아니라 노이즈입니다.

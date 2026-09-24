@@ -1259,24 +1259,9 @@ pub(crate) fn normalize_trading_data(item: &mut Value, doc_lang: &str) {
     if let Some(obj) = item.as_object_mut() {
         let cur = obj.get("currency").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
         if crate::model::merge::is_schema_echo(&cur) {
-            let def = match doc_lang {
-                "ko" => "KRW",
-                "ja" => "JPY",
-                "zh" | "zh-tw" | "zh-hk" | "zh-hans" => "CNY",
-                "de" | "fr" | "it" | "es" | "nl" | "pt" | "el" => "EUR",
-                "cs" => "CZK",
-                "ru" => "RUB",
-                "th" => "THB",
-                "vi" => "VND",
-                "hi" | "bn" => "INR",
-                _ => "USD",
-            };
-            obj.insert("currency".to_string(), json!(def));
+            obj.insert("currency".to_string(), json!(crate::utils::ai_utils::default_currency_for_lang(doc_lang)));
         } else {
-            let canon = crate::logic::canonical_currency_code(&cur)
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| cur.to_uppercase());
-            obj.insert("currency".to_string(), json!(canon));
+            obj.insert("currency".to_string(), json!(crate::utils::ai_utils::normalize_currency_value(&cur, doc_lang)));
         }
 
         if obj.get("started_at").is_none() {

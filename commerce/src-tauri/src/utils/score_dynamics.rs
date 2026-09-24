@@ -231,14 +231,7 @@ fn effective_scope_key() -> (String, usize) {
 
 fn current_track() -> Option<Track> {
     let s = current_scope()?;
-    Some(match s.track_name.as_str() {
-        "vision" => Track::Vision,
-        "trading" => Track::Trading,
-        "commerce" => Track::Commerce,
-        "analytic" => Track::Analytic,
-        "search" => Track::Search,
-        _ => return None,
-    })
+    Track::from_name(s.track_name.as_str())
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

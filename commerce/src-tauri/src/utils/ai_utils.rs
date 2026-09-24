@@ -2749,6 +2749,55 @@ pub fn status_key_phrases(key: &str) -> Vec<String> {
     v
 }
 
+pub async fn status_key_banks(model: &crate::model::LogisModel, page_type: &str) -> Vec<(String, Vec<Vec<f32>>)> {
+    let mut key_banks: Vec<(String, Vec<Vec<f32>>)> = Vec::new();
+    for k in enum_status_keys(page_type).iter() {
+        let phrases = status_key_phrases(k);
+        let e = model.get_embedding_batch(phrases.clone()).await
+            .unwrap_or_else(|_| vec![vec![0.0; 384]; phrases.len()]);
+        key_banks.push((k.to_string(), e));
+    }
+    key_banks
+}
+
+pub fn status_key_scores(emb: &[f32], banks: &[(String, Vec<Vec<f32>>)]) -> Vec<(String, f32)> {
+    banks.iter().map(|(k, kb)| (k.clone(), max_pool_sim(emb, kb))).collect()
+}
+
+#[derive(Debug, Clone)]
+pub struct StatusKeyPick {
+    pub key: String,
+    pub top: f32,
+    pub second: f32,
+}
+
+impl StatusKeyPick {
+    pub fn margin(&self) -> f32 {
+        if self.second == f32::MIN { self.top } else { self.top - self.second }
+    }
+    pub fn accepted_with(&self, min_top: f32, min_margin: f32) -> bool {
+        !self.key.is_empty() && self.top > min_top && (self.top - self.second) > min_margin
+    }
+    pub fn accepted(&self) -> bool {
+        self.accepted_with(0.35, 0.01)
+    }
+}
+
+pub fn pick_status_key(scores: &[(String, f32)]) -> StatusKeyPick {
+    let mut key = String::new();
+    let mut top = f32::MIN;
+    let mut second = f32::MIN;
+    for (k, s) in scores.iter() {
+        if *s > top {
+            second = top;
+            top = *s;
+            key = k.clone();
+        } else if *s > second {
+            second = *s;
+        }
+    }
+    StatusKeyPick { key, top, second }
+}
 // 🌟 [FORMAT FAMILY] 스키마 필드가 물리적으로 어떤 "생김새"의 값을 가져야 하는지 분류합니다.
 // 다국어 임베딩은 짧은 한국어 문자열끼리 기본 유사도가 0.5를 넘기 때문에
 // ("번호" vs "운송장번호" = 0.67) 코사인 임계치만으로는 컬럼을 절대 분리할 수 없습니다.
@@ -3873,6 +3922,26 @@ pub fn exact_absolute_period(words: &[String], today: chrono::NaiveDate) -> Opti
     })
 }
 
+pub fn exact_period_tail_closed(words: &[String], p: &ExactPeriod) -> bool {
+    if p.tokens.is_empty() { return false; }
+    for &ti in p.tokens.iter() {
+        let w = match words.get(ti) { Some(w) => w, None => return false };
+        let core = normalize_digits_ascii(w.trim_matches(|c: char| !c.is_alphanumeric()));
+        let residue: String = core.trim_start_matches(|c: char| c.is_ascii_digit()).to_string();
+        if residue.is_empty() { continue; }
+        if month_from_name(&residue).is_some() { continue; }
+        let (_, tail) = match time_unit_split(&residue) { Some(x) => x, None => continue };
+        if tail.is_empty() { continue; }
+        let norm = lower_alnum(&residue);
+        if tail.len() > norm.len() { return false; }
+        let surface = &norm[..norm.len() - tail.len()];
+        if closed_tail_fits(surface, &tail) { continue; }
+        if period_operator_exact(&[tail.clone()]).is_some() { continue; }
+        return false;
+    }
+    true
+}
+
 pub fn has_date_shape(s: &str) -> bool {
     if has_date_literal(s) { return true; }
     let norm = normalize_digits_ascii(s);
@@ -3998,6 +4067,278 @@ pub fn is_pure_numeric_value(value: &str) -> bool {
     if digits == 0 { return false; }
     let letters = v.chars().filter(|c| c.is_alphabetic()).count();
     letters <= 1
+}
+
+pub fn enum_value_reject(field_name: &str, value: &str) -> Option<&'static str> {
+    let t = value.trim();
+    if t.is_empty() { return None; }
+    if field_name.to_lowercase().contains("currency") {
+        if has_currency_signal(t) { return None; }
+        return Some(if is_pure_numeric_value(t) { "순수 수치" } else { "통화 표지 없음" });
+    }
+    if is_pure_numeric_value(t) { Some("순수 수치") } else { None }
+}
+
+pub const CURRENCY_NAMES_ML: &[(&str, &str)] = &[
+    ("USD", "usd, $, dollar, dollars, us-dollar, dólar, dólares, dollaro, dollari, dolar, dolary, dolarů, 달러, 미국달러, 美元, 美金, 米ドル, ドル, دولار, دولارات"),
+    ("EUR", "eur, €, euro, euros, eura, 유로, 欧元, 歐元, ユーロ, يورو"),
+    ("JPY", "jpy, yen, yens, iene, ienes, jeny, jenů, 엔, 엔화, 円, 日元, 日圓, ين, ين ياباني"),
+    ("CNY", "cny, rmb, yuan, yuans, renminbi, iuane, jüan, jüany, jüanů, 위안, 위안화, 元, 人民币, 人民幣, 人民元, يوان"),
+    ("KRW", "krw, ₩, won, wons, wony, wonů, 원, 원화, 韩元, 韓元, ウォン, وون"),
+    ("GBP", "gbp, £, sterling, pound sterling, pounds sterling, britisches pfund, livre sterling, livres sterling, libra esterlina, libras esterlinas, sterlina, sterline, britse pond, libra šterlinků, 영국 파운드, 英镑, 英鎊, 英ポンド, جنيه إسترليني"),
+];
+
+pub fn currency_name_exact(core: &str) -> Option<&'static str> {
+    let norm = lower_alnum(core);
+    if norm.is_empty() { return None; }
+    for (code, raw) in CURRENCY_NAMES_ML.iter() {
+        for p in raw.split(',') {
+            let p = lower_alnum(p);
+            if p.is_empty() { continue; }
+            if norm == p { return Some(*code); }
+            if p.chars().count() < 2 { continue; }
+            if let Some(rest) = norm.strip_prefix(p.as_str()) {
+                if short_tail_ok(rest, 2) {
+                    return Some(*code);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn currency_symbol_in(raw: &str) -> Option<&'static str> {
+    for (code, list) in CURRENCY_NAMES_ML.iter() {
+        for p in list.split(',') {
+            let p = p.trim();
+            if p.is_empty() || p.chars().any(|c| c.is_alphanumeric()) { continue; }
+            if raw.contains(p) { return Some(*code); }
+        }
+    }
+    None
+}
+
+pub fn currency_symbol_strict(raw: &str) -> Option<&'static str> {
+    let chars: Vec<char> = raw.chars().collect();
+    for (code, list) in CURRENCY_NAMES_ML.iter() {
+        for p in list.split(',') {
+            let p = p.trim();
+            if p.is_empty() || p.chars().any(|c| c.is_alphanumeric()) { continue; }
+            let pc: Vec<char> = p.chars().collect();
+            if pc.is_empty() || chars.len() < pc.len() { continue; }
+            for i in 0..=(chars.len() - pc.len()) {
+                if chars[i..i + pc.len()] != pc[..] { continue; }
+                if i > 0 && chars[i - 1].is_alphabetic() { continue; }
+                return Some(*code);
+            }
+        }
+    }
+    None
+}
+
+pub fn currency_code_of(raw: &str) -> Option<&'static str> {
+    let t = raw.trim();
+    if t.is_empty() { return None; }
+    if let Some(c) = crate::logic::canonical_currency_code(t) { return Some(c); }
+    let mut words: Vec<String> = Vec::new();
+    for tok in t.split(|c: char| !c.is_alphanumeric()).filter(|s| !s.is_empty()) {
+        let mut cur = String::new();
+        let mut cur_digit: Option<bool> = None;
+        for ch in tok.chars() {
+            let d = ch.is_ascii_digit();
+            if cur_digit.map_or(false, |x| x != d) && !cur.is_empty() {
+                if cur_digit == Some(false) { words.push(std::mem::take(&mut cur)); } else { cur.clear(); }
+            }
+            cur.push(ch);
+            cur_digit = Some(d);
+        }
+        if !cur.is_empty() && cur_digit == Some(false) { words.push(cur); }
+    }
+    for w in words.iter() {
+        if w.chars().count() == 3 && w.chars().all(|c| c.is_ascii_alphabetic()) {
+            if let Some(c) = crate::logic::canonical_currency_code(w) { return Some(c); }
+        }
+    }
+    match words.len() {
+        0 => currency_symbol_strict(t),
+        1 => {
+            if let Some(c) = crate::logic::canonical_currency_code(&words[0]).or_else(|| currency_name_exact(&words[0])) {
+                return Some(c);
+            }
+            let compact: String = t
+                .chars()
+                .filter(|c| !c.is_whitespace() && !c.is_ascii_digit() && !",.-+".contains(*c))
+                .collect();
+            crate::logic::canonical_currency_code(&compact)
+        }
+        _ => None,
+    }
+}
+
+pub fn default_currency_for_lang(doc_lang: &str) -> &'static str {
+    match doc_lang {
+        "ko" => "KRW",
+        "ja" => "JPY",
+        "zh" | "zh-tw" | "zh-hk" | "zh-hans" => "CNY",
+        "de" | "fr" | "it" | "es" | "nl" | "pt" | "el" => "EUR",
+        "cs" => "CZK",
+        "ru" => "RUB",
+        "th" => "THB",
+        "vi" => "VND",
+        "hi" | "bn" => "INR",
+        _ => "USD",
+    }
+}
+
+pub const ISO_4217_ACTIVE: &str = "AED AFN ALL AMD ANG AOA ARS AUD AWG AZN BAM BBD BDT BGN BHD BIF BMD BND BOB BRL BSD BTN BWP BYN BZD CAD CDF CHF CLP CNY COP CRC CUP CVE CZK DJF DKK DOP DZD EGP ERN ETB EUR FJD FKP GBP GEL GHS GIP GMD GNF GTQ GYD HKD HNL HTG HUF IDR ILS INR IQD IRR ISK JMD JOD JPY KES KGS KHR KMF KPW KRW KWD KYD KZT LAK LBP LKR LRD LSL LYD MAD MDL MGA MKD MMK MNT MOP MRU MUR MVR MWK MXN MYR MZN NAD NGN NIO NOK NPR NZD OMR PAB PEN PGK PHP PKR PLN PYG QAR RON RSD RUB RWF SAR SBD SCR SDG SEK SGD SHP SLE SLL SOS SRD SSP STN SVC SYP SZL THB TJS TMT TND TOP TRY TTD TWD TZS UAH UGX USD UYU UZS VES VND VUV WST XAF XCD XOF XPF YER ZAR ZMW ZWL";
+
+pub const CURRENCY_NOUNS_ML: &str = "franc, francs, rupee, rupees, peso, pesos, baht, ringgit, krona, krone, kronor, kroner, lira, dinar, dinars, dirham, dirhams, riyal, riyals, rupiah, zloty, złoty, forint, shekel, shekels, hryvnia, ruble, rubles, rouble, roubles, 프랑, 루피, 페소, 바트, 링깃, 크로나, 크로네, 리라, 디나르, 디르함, 리얄, 루피아, 즈워티, 포린트, 셰켈, 흐리브냐, 루블";
+
+pub fn has_currency_symbol(value: &str) -> bool {
+    value.chars().any(|c| {
+        c == '$'
+            || ('\u{00A2}'..='\u{00A5}').contains(&c)
+            || ('\u{20A0}'..='\u{20CF}').contains(&c)
+            || c == '\u{0E3F}'
+            || c == '\u{FDFC}'
+    })
+}
+
+pub fn has_currency_signal(value: &str) -> bool {
+    let t = value.trim();
+    if t.is_empty() { return false; }
+    if currency_code_of(t).is_some() || has_currency_symbol(t) { return true; }
+    let words: Vec<String> = t
+        .split(|c: char| !c.is_alphanumeric())
+        .map(|tok| tok.chars().filter(|c| c.is_alphabetic()).collect::<String>())
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.is_empty() || words.len() > 3 { return false; }
+    let word = &words[words.len() - 1];
+    if word.chars().count() == 3
+        && word.chars().all(|c| c.is_ascii_uppercase())
+        && ISO_4217_ACTIVE.split_whitespace().any(|c| c == word.as_str())
+    {
+        return true;
+    }
+    if currency_name_exact(word).is_some() { return true; }
+    let lower = word.to_lowercase();
+    CURRENCY_NOUNS_ML
+        .split(',')
+        .map(|n| n.trim())
+        .chain(CURRENCY_NAMES_ML.iter().flat_map(|(_, list)| list.split(',').map(|n| n.trim())))
+        .any(|n| {
+            if n.is_empty() || !n.chars().any(|c| c.is_alphabetic()) { return false; }
+            if lower == n { return true; }
+            !n.is_ascii() && n.chars().count() >= 2 && lower.ends_with(n)
+        })
+}
+
+pub fn currency_amount_like(value: &str) -> bool {
+    let t = value.trim();
+    !t.is_empty() && !t.chars().any(|c| c.is_alphabetic()) && !has_currency_symbol(t)
+}
+
+pub fn normalize_currency_value(raw: &str, doc_lang: &str) -> String {
+    let t = raw.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("null") {
+        return default_currency_for_lang(doc_lang).to_string();
+    }
+    if let Some(code) = currency_code_of(t) {
+        return code.to_string();
+    }
+    if currency_amount_like(t) {
+        return default_currency_for_lang(doc_lang).to_string();
+    }
+    t.to_uppercase()
+}
+
+pub fn is_bracket_annotation(s: &str) -> bool {
+    let t = s.trim();
+    if t.chars().count() < 2 { return false; }
+    let first = match t.chars().next() { Some(c) => c, None => return false };
+    let last = match t.chars().last() { Some(c) => c, None => return false };
+    matches!(
+        (first, last),
+        ('(', ')') | ('[', ']') | ('（', '）') | ('【', '】') | ('〔', '〕')
+    )
+}
+
+pub fn pug_line_is_ui_control(line: &str) -> bool {
+    let t = line.trim_start();
+    let tag_end = t.find(|c: char| c == '[' || c == ' ' || c == '|').unwrap_or(t.len());
+    let tag = &t[..tag_end];
+    if tag == "button" { return true; }
+    if tag == "input" {
+        let lower = t.to_lowercase();
+        return ["type=\"button\"", "type=\"submit\"", "type=\"reset\"", "type='button'", "type='submit'", "type='reset'"]
+            .iter()
+            .any(|p| lower.contains(p));
+    }
+    false
+}
+
+pub fn pug_line_visible_data(line: &str) -> bool {
+    if pug_line_is_ui_control(line) { return false; }
+    let (head, text) = match line.find('|') {
+        Some(p) => (&line[..p], line[p + 1..].trim()),
+        None => return false,
+    };
+    if text.is_empty() { return false; }
+    let h = head.trim_start();
+    if h.starts_with("input") {
+        let lower = h.to_lowercase();
+        return !["hidden", "checkbox", "radio"].iter().any(|t| {
+            lower.contains(&format!("type=\"{}\"", t)) || lower.contains(&format!("type='{}'", t))
+        });
+    }
+    true
+}
+
+pub fn pug_cell_sole_value(lines: &[String], idxs: &[usize]) -> Option<String> {
+    let mut found: Option<String> = None;
+    for &li in idxs {
+        let line = match lines.get(li) { Some(l) => l, None => continue };
+        if pug_line_is_ui_control(line) { continue; }
+        let (head, text) = match line.find('|') {
+            Some(p) => (&line[..p], line[p + 1..].trim()),
+            None => (line.as_str(), ""),
+        };
+        let h = head.trim_start();
+        if h.starts_with("input") {
+            let lower = h.to_lowercase();
+            if lower.contains("type=\"hidden\"") || lower.contains("type='hidden'") { continue; }
+            return None;
+        }
+        if h.starts_with("select")
+            || h.starts_with("textarea")
+            || h.contains("href=")
+            || h.contains("onclick")
+            || h.contains("data-url")
+        {
+            return None;
+        }
+        if text.is_empty() { continue; }
+        if found.is_some() { return None; }
+        found = Some(text.to_string());
+    }
+    found
+}
+
+pub fn premap_rep_better(new: (u8, u8, i32, f32, usize), old: (u8, u8, i32, f32, usize)) -> bool {
+    if new.0 != old.0 { return new.0 < old.0; }
+    let new_note = new.2 == 0;
+    let old_note = old.2 == 0;
+    if new_note != old_note { return old_note; }
+    if new.1 != old.1 { return new.1 < old.1; }
+    if new.1 == 1 {
+        if (new.3 - old.3).abs() > 0.01 { return new.3 > old.3; }
+        if new.2 != old.2 { return new.2 > old.2; }
+        return new.4 > old.4;
+    }
+    if new.2 != old.2 { return new.2 > old.2; }
+    if (new.3 - old.3).abs() > 0.01 { return new.3 > old.3; }
+    new.4 > old.4
 }
 
 pub fn is_document_number_shaped(value: &str) -> bool {

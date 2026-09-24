@@ -762,6 +762,9 @@ pub fn format_gate_for_indexing(mut chunks: Vec<ChunkMetadata>) -> Vec<ChunkMeta
             continue;
         }
 
+        let identifier_like = chunk.property_format == "Text"
+            && crate::utils::ai_utils::query_value_format(&chunk.property)
+                == crate::utils::ai_utils::FieldFormat::Identifier;
         let passes = match chunk.property_format.as_str() {
             "Numeric" => val.chars().any(|c| c.is_ascii_digit()),
             "Date" => {
@@ -780,7 +783,13 @@ pub fn format_gate_for_indexing(mut chunks: Vec<ChunkMetadata>) -> Vec<ChunkMeta
             },
             "Link" => val.contains('/') || val.to_lowercase().starts_with("http"),
             "Enum" => true, // Enum 은 어떤 값이든 허용
-            "Text" => val.chars().any(|c| c.is_alphabetic()),
+            "Text" => {
+                val.chars().any(|c| c.is_alphabetic())
+                    || (identifier_like
+                        && val
+                            .split(|c: char| !c.is_alphanumeric())
+                            .any(|tok| tok.chars().count() >= 4 && tok.chars().any(|c| c.is_ascii_digit())))
+            },
             "Address" => val.chars().any(|c| c.is_alphabetic()) && val.split_whitespace().count() >= 2,
             "Synthesis" => true,
             _ => true,
@@ -795,7 +804,7 @@ pub fn format_gate_for_indexing(mut chunks: Vec<ChunkMetadata>) -> Vec<ChunkMeta
                 println!(
                     "  🛡️ [FORMAT GATE BYPASS] '{}' (property='{}', format='{}') 형식 불일치이지만 JSON 구조 확정이므로 보호",
                     if chunk.chunk_text.chars().count() > 60 {
-                        format!("{}...", &chunk.chunk_text[..57])
+                        format!("{}...", chunk.chunk_text.chars().take(57).collect::<String>())
                     } else {
                         chunk.chunk_text.clone()
                     },
@@ -1988,12 +1997,36 @@ where
         // 라우팅 / 서식 코드 에코
         "table", "doc_type", "mode",
     ];
+    const SYSTEM_HASH_PROPERTIES: [&str; 6] = ["id", "ref", "cc", "bcc", "from", "to"];
+    let is_system_hash = |t: &str| -> bool {
+        let w = t.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        w.len() == 42
+            && (w.starts_with("0x") || w.starts_with("0X"))
+            && w[2..].chars().all(|c| c.is_ascii_hexdigit())
+    };
+    let mut hash_dropped = 0usize;
     let filtered_chunks: Vec<&(String, String, bool)> = raw_chunks
         .iter()
-        .filter(|(_, property, _)| {
-            !SYSTEM_PROPERTIES.iter().any(|s| *s == property.as_str())
+        .filter(|(text, property, _)| {
+            if SYSTEM_PROPERTIES.iter().any(|s| *s == property.as_str()) {
+                return false;
+            }
+            if SYSTEM_HASH_PROPERTIES.iter().any(|s| *s == property.as_str())
+                && text.split_whitespace().any(|t| is_system_hash(t))
+            {
+                hash_dropped += 1;
+                return false;
+            }
+            true
         })
         .collect();
+    crate::utils::score_dynamics::record_baseline("indexing.system_hash_drop", hash_dropped as f32);
+    if hash_dropped > 0 {
+        println!(
+            "  🚫 [PHASE A FILTER / SYSTEM HASH] 저장소가 발급한 해시 식별자(0x + 16진 40자리)를 값으로 가진 청크 {}개를 뺍니다. 문서에 인쇄된 사실이 아니라서 검색이 만날 이유가 없고, 인덱싱 역검증에서 매번 doc_number 에 밀려 CONFIRM FLAG 와 혼동 사전(id,link ↔ doc_number)에 같은 잡음을 문서마다 남깁니다. 인쇄된 번호(상품 코드 등)는 이 모양이 아니므로 남습니다.",
+            hash_dropped
+        );
+    }
 
     let removed_count = raw_chunks.len() - filtered_chunks.len();
     if removed_count > 0 {

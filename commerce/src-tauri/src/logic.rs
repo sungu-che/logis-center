@@ -1414,6 +1414,19 @@ pub const TRADE_LABEL_SUPPLEMENT_ML: &[(&str, &str, &str)] = &[
       正味重量, 純重量, ネット重量, \
       净重, 总净重, \
       순중량, 순 중량"),
+    ("item_net_weight",
+     "unit weight, unit net weight, net weight per unit, weight per unit, net weight per piece, weight per piece, unit wt.",
+     "Stückgewicht, Einzelgewicht, Gewicht pro Einheit, Nettogewicht pro Stück, \
+      poids unitaire, poids net unitaire, poids par unité, \
+      peso unitario, peso neto unitario, peso por unidad, \
+      peso netto unitario, peso per unità, \
+      peso unitário, peso líquido unitário, peso por unidade, \
+      eenheidsgewicht, gewicht per stuk, nettogewicht per stuk, \
+      jednotková hmotnost, hmotnost za kus, čistá hmotnost za kus, \
+      وزن الوحدة, الوزن الصافي للوحدة, الوزن لكل وحدة, \
+      単位重量, 単重, 正味単重, \
+      单位重量, 单重, 每件重量, 单件净重, \
+      단위 중량, 단위중량, 개당 중량, 단위 순중량"),
     ("package_count",
      "total number of packages, total packages, total no. of packages, total no. of pkgs, total cartons, total number of cartons, packages in total, total package count",
      "Gesamtzahl der Packstücke, Packstücke insgesamt, Gesamtanzahl der Kartons, \
@@ -2655,6 +2668,11 @@ pub fn is_trade_array_category(category: &str) -> bool {
             | "test_results" | "findings_and_damage" | "account_ledger"
     )
 }
+
+pub const TRADE_FLATTEN_GROUPS: [&str; 8] = [
+    "header", "parties", "other_parties", "logistics",
+    "financials", "conditions", "settlement", "cargo",
+];
 
 pub const TRADE_EXTRACTION_CATEGORIES: [&str; 20] = [
     // ── base (전 서식 공통) ──

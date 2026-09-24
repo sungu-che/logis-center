@@ -725,10 +725,7 @@ pub async fn probe_trade_document(
     }
     // ── ⑥ 게이트 3 : 마진이 극값 잡음대 안이면 구조 증거를 요구 ──
     let margin = trade_score - commerce_score;
-    let evt_sd = |n: usize| -> f32 {
-        let z = crate::utils::ai_utils::gumbel_expected_z(n);
-        if z <= 0.0 { 0.0 } else { (std::f32::consts::PI / 6.0f32.sqrt()) / z }
-    };
+    let evt_sd = |n: usize| -> f32 { crate::utils::ai_utils::gumbel_max_sd(n) };
     let noise_band = evt_sd(trade_draws).max(evt_sd(commerce_draws));
     crate::utils::score_dynamics::record_baseline("mode_probe.noise_band", noise_band);
     crate::utils::score_dynamics::record_baseline("mode_probe.margin", margin);
@@ -3951,28 +3948,10 @@ pub async fn process_trading_task(
     {
         // 🌟 other_parties / settlement 추가. 비전 경로는 이미 party_name 을 루트에 올리고
         //    있어 두 경로의 루트 축이 어긋나 있었습니다.
-        const TRADE_GROUPS_FLAT: [&str; 8] = [
-            "header", "parties", "other_parties", "logistics",
-            "financials", "conditions", "settlement", "cargo",
-        ];
+        const TRADE_GROUPS_FLAT: [&str; 8] = crate::logic::TRADE_FLATTEN_GROUPS;
 
         fn canonical_name(raw: &str) -> String {
-            let k = raw.trim();
-            if let Some(alias_obj) = crate::parsing::BIAS_DICT
-                .get("search_bridge")
-                .and_then(|sb| sb.get("path_alias"))
-                .and_then(|v| v.as_object())
-            {
-                for (canonical, list) in alias_obj {
-                    if canonical == k { return canonical.clone(); }
-                    if let Some(arr) = list.as_array() {
-                        if arr.iter().any(|a| a.as_str().map_or(false, |s| s == k)) {
-                            return canonical.clone();
-                        }
-                    }
-                }
-            }
-            k.to_string()
+            crate::utils::bias_schema::canonical_field_name(raw)
         }
 
         let source = extracted_data.clone();

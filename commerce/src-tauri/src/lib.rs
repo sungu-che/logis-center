@@ -1301,26 +1301,7 @@ fn build_dexie_plan(ctx: &Value, search_mode: &str) -> Value {
     //
     //   노드가 없으면 별칭 없이 그대로 통과하므로, 기존 동작을 깨지 않습니다.
     fn normalize_path(key: &str) -> String {
-        let k = key.trim();
-
-        if let Some(alias_obj) = crate::parsing::BIAS_DICT
-            .get("search_bridge")
-            .and_then(|sb| sb.get("path_alias"))
-            .and_then(|v| v.as_object())
-        {
-            for (canonical, list) in alias_obj {
-                if canonical == k {
-                    return format!("data.{}", canonical);
-                }
-                if let Some(arr) = list.as_array() {
-                    if arr.iter().any(|a| a.as_str().map_or(false, |s| s == k)) {
-                        return format!("data.{}", canonical);
-                    }
-                }
-            }
-        }
-
-        format!("data.{}", k)
+        format!("data.{}", crate::utils::bias_schema::canonical_field_name(key))
     }
 
     // 🌟 [KIND] Dexie 실행 엔진이 인덱스 쿼리를 쓸지 .filter() 를 쓸지 판정하는 힌트입니다.
@@ -1662,14 +1643,14 @@ fn evaluate_dexie_plan(
 ///   힌트는 결과 집합을 좁히지 않으므로 all_pass 계산에 넣으면 안 됩니다.
 ///   그러나 '그 축을 힌트로 내린 판단이 옳았는가' 는 다음 회차의 강등·치환 판정에
 ///   직접 쓰이는 정보인데, 지금은 evaluated 가 0 이라 관측 자체가 없습니다.
-fn evaluate_dexie_hints(plan: &Value, docs: &[Value]) -> Vec<(String, usize, usize)> {
+fn evaluate_dexie_hints(plan: &Value, docs: &[Value]) -> Vec<(String, usize, usize, usize)> {
     use crate::utils::canonical::{kind_of, CanonKind};
     let alternates = plan.get("alternates").cloned().unwrap_or(json!({}));
     let hints = match plan.get("hints").and_then(|v| v.as_object()) {
         Some(h) => h.clone(),
         None => return Vec::new(),
     };
-    let mut out: Vec<(String, usize, usize)> = Vec::new();
+    let mut out: Vec<(String, usize, usize, usize)> = Vec::new();
     for (field, spec) in hints.iter() {
         let op = spec.get("operator").and_then(|v| v.as_str()).unwrap_or("contains");
         let want = spec.get("value").cloned().unwrap_or(Value::Null);
@@ -1692,8 +1673,10 @@ fn evaluate_dexie_hints(plan: &Value, docs: &[Value]) -> Vec<(String, usize, usi
         }
         let negative = op == "neq" || op == "not_contains";
         let ranking = op == "top" || op == "bottom";
+        let want_script = want.as_str().map(|s| dominant_script(s)).unwrap_or("none");
         let mut present = 0usize;
         let mut satisfied = 0usize;
+        let mut cross_script = 0usize;
         for d in docs.iter() {
             let values: Vec<&Value> = axes
                 .iter()
@@ -1711,8 +1694,19 @@ fn evaluate_dexie_hints(plan: &Value, docs: &[Value]) -> Vec<(String, usize, usi
                 values.iter().any(|v| dexie_value_passes(op, kind, v, &want))
             };
             if pass { satisfied += 1; }
+            let foreign = kind == "string"
+                && !pass
+                && !values.is_empty()
+                && want_script != "none"
+                && values.iter().all(|v| {
+                    v.as_str().map_or(false, |s| {
+                        let sc = dominant_script(s);
+                        sc != "none" && sc != want_script
+                    })
+                });
+            if foreign { cross_script += 1; }
         }
-        out.push((field.clone(), satisfied, present));
+        out.push((field.clone(), satisfied, present, cross_script));
     }
     out
 }
@@ -1860,7 +1854,7 @@ async fn nearest_storage_axis(
     let schema: Vec<String> = crate::parsing::get_detail_schema_fields(page_type, "", "en")
         .into_iter()
         .map(|(f, _, _, _)| f)
-        .filter(|f| f != "id,link" && f != "status" && f != "doc_type")
+        .filter(|f| !crate::utils::bias_schema::is_system_axis(f))
         .collect();
     if schema.is_empty() {
         println!(
@@ -2067,7 +2061,7 @@ fn bank_excess(sims: &[f32]) -> Option<(f32, f32, usize)> {
         if *s > sims[ti] { ti = i; }
     }
     let z = (sims[ti] - mean) / sd;
-    let expected = (2.0 * n.ln()).sqrt();
+    let expected = crate::utils::ai_utils::gumbel_expected_z(sims.len());
     Some((z - expected, sims[ti], ti))
 }
 
@@ -3146,7 +3140,12 @@ async fn ai_search_complex(
                     .get("started_at")
                     .and_then(|v| v.as_i64())
                     .unwrap_or(0)
-                    > 0;
+                    > 0
+                    || structured_query
+                        .get("expired_at")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0)
+                        > 0;
                 if explicit_period {
                     emit_term("[AI-SEARCH] ⏱️ [RECENCY] 질의에 명시적 기간이 있어 시간 감쇠를 적용하지 않습니다. (구간은 이미 SQL 이 잘랐고, 그 안에서 앞부분을 누르면 부당합니다)");
                 } else if let Some(store) = store_opt.as_ref() {
@@ -3484,18 +3483,32 @@ async fn ai_search_complex(
                     let hint_eval = evaluate_dexie_hints(plan, &docs);
                     if !hint_eval.is_empty() {
                         let mut hint_detail: Vec<String> = Vec::new();
-                        for (field, satisfied, present) in hint_eval.iter() {
+                        for (field, satisfied, present, cross_script) in hint_eval.iter() {
+                            let unobservable = *satisfied == 0 && *present > 0 && *cross_script == *present;
                             if !docs.is_empty() {
-                                crate::utils::score_dynamics::record_search_outcome(field, *satisfied > 0, false);
+                                crate::utils::score_dynamics::record_baseline(
+                                    "search.hint_cross_script",
+                                    if unobservable { 1.0 } else { 0.0 },
+                                );
+                                if !unobservable {
+                                    crate::utils::score_dynamics::record_search_outcome(field, *satisfied > 0, false);
+                                }
                                 crate::utils::score_dynamics::record_baseline(
                                     "search.hint_present_ratio",
                                     *present as f32 / docs.len() as f32,
                                 );
                             }
-                            hint_detail.push(format!(
-                                "{}(만족 {} / 축 보유 {} / 회수 {})",
-                                field, satisfied, present, docs.len()
-                            ));
+                            hint_detail.push(if unobservable {
+                                format!(
+                                    "{}(평가 보류: 축 보유 {}건 전부가 힌트 값과 문자 체계가 달라 문자열 비교가 성립하지 않음 / 회수 {})",
+                                    field, present, docs.len()
+                                )
+                            } else {
+                                format!(
+                                    "{}(만족 {} / 축 보유 {} / 회수 {})",
+                                    field, satisfied, present, docs.len()
+                                )
+                            });
                         }
                         println!(
                             "[AI-SEARCH] 📈 [SDS / HINT OUTCOME] 힌트 축 {}개를 결과 집합과 무관하게 관측만 합니다: {} — 힌트는 필터가 아니므로 통과 여부가 결과를 바꾸지 않지만, '그 축을 힌트로 내린 판단이 옳았는가' 는 다음 회차의 강등·치환 판정에 쓰입니다. 지금까지는 evaluated 가 0 이라 이 정보가 원장에 전혀 쌓이지 않았습니다.",
@@ -3824,14 +3837,17 @@ async fn ai_search_complex(
                     let time_intent = structured_query.get("time_intent").and_then(|v| v.as_str()).unwrap_or("");
                     let season_intent = structured_query.get("season_intent").and_then(|v| v.as_str()).unwrap_or("");
 
-                    let period_str = if started_at > 0 {
-                        let s = chrono::DateTime::from_timestamp_millis(started_at)
-                            .map(|dt| dt.naive_utc().format("%Y-%m-%d").to_string())
-                            .unwrap_or_default();
-                        let e = chrono::DateTime::from_timestamp_millis(expired_at)
-                            .map(|dt| dt.naive_utc().format("%Y-%m-%d").to_string())
-                            .unwrap_or_default();
-                        format!("{} ~ {}", s, e)
+                    let period_str = if started_at > 0 || expired_at > 0 {
+                        let (period_clock, _) = crate::utils::time_guide::lang_clock(&language);
+                        let day = |ms: i64| -> String {
+                            if ms <= 0 {
+                                return String::new();
+                            }
+                            crate::utils::time_guide::date_of_ms(&period_clock, ms)
+                                .map(|d| d.format("%Y-%m-%d").to_string())
+                                .unwrap_or_default()
+                        };
+                        format!("{} ~ {}", day(started_at), day(expired_at))
                     } else {
                         "all time".to_string()
                     };

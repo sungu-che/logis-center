@@ -845,8 +845,8 @@ pub fn query_chunk_matches_property(field_name: &str, chunk: &str) -> bool {
         FieldFormat::Date => {
             if v.chars().any(|c| c.is_ascii_digit()) { return true; }
             v.split_whitespace().any(|w| {
-                exact_match_filter_key("time_filters", w).is_some()
-                    || exact_match_filter_key("season_filters", w).is_some()
+                !exact_match_filter_keys("time_filters", w).is_empty()
+                    || !exact_match_filter_keys("season_filters", w).is_empty()
             })
         },
         FieldFormat::Phone => v.chars().filter(|c| c.is_ascii_digit()).count() >= 7,
@@ -910,8 +910,8 @@ pub fn query_chunk_matches_property_ext(
             //    '올해' 와 embed("current year") 의 코사인은 multilingual 모델에서 0.6+ 입니다.
             if temporal_semantic_match(v) { return true; }
             v.split_whitespace().any(|w| {
-                exact_match_filter_key("time_filters", w).is_some()
-                    || exact_match_filter_key("season_filters", w).is_some()
+                !exact_match_filter_keys("time_filters", w).is_empty()
+                    || !exact_match_filter_keys("season_filters", w).is_empty()
             })
         },
         FieldFormat::Phone => v.chars().filter(|c| c.is_ascii_digit()).count() >= 7,
@@ -1100,6 +1100,15 @@ pub struct SurprisalScore {
 }
 pub fn gumbel_expected_z(n: usize) -> f32 {
     if n <= 1 { 0.0 } else { (2.0f32 * (n as f32).ln()).sqrt() }
+}
+
+pub fn gumbel_max_sd(n: usize) -> f32 {
+    let z = gumbel_expected_z(n);
+    if z <= 1e-6 { 0.0 } else { std::f32::consts::PI / 6.0f32.sqrt() / z }
+}
+
+pub fn gumbel_decision_z(n: usize) -> f32 {
+    gumbel_expected_z(n) + gumbel_max_sd(n)
 }
 pub fn axis_snr(scores: &[f32]) -> Option<f32> {
     let mut v: Vec<f32> = scores.iter().cloned().filter(|s| s.is_finite()).collect();
@@ -1829,23 +1838,32 @@ pub fn is_functional_word_chunk(
 //    그 결과 계절 감지 LLM 이 오염된 컨텍스트를 받아 'autumn' 을 환각했습니다.
 //    코사인 경쟁 이전에 완전일치(==)로 확정하면 이 경로가 물리적으로 사라집니다.
 //    부분문자열 포함(contains)이 아니라 배열 원소 완전일치이므로 의미 판정이 아닙니다.
-pub fn exact_match_filter_key(category: &str, chunk: &str) -> Option<String> {
+pub fn exact_match_filter_keys(category: &str, chunk: &str) -> Vec<String> {
     let c = chunk.trim();
-    if c.is_empty() { return None; }
+    if c.is_empty() { return Vec::new(); }
     let lower = c.to_lowercase();
 
-    let node = crate::parsing::BIAS_DICT.get(category)?.as_object()?;
+    let node = match crate::parsing::BIAS_DICT.get(category).and_then(|v| v.as_object()) {
+        Some(n) => n,
+        None => return Vec::new(),
+    };
+    let mut keys: Vec<String> = Vec::new();
     for (key, val) in node {
         let arr = match val.get("exact_match").and_then(|v| v.as_array()) { Some(a) => a, None => continue };
-        for item in arr {
-            if let Some(s) = item.as_str() {
-                if s == c || s.to_lowercase() == lower {
-                    return Some(key.clone());
-                }
-            }
+        let hit = arr
+            .iter()
+            .any(|item| item.as_str().map_or(false, |s| s == c || s.to_lowercase() == lower));
+        if hit && !keys.contains(key) {
+            keys.push(key.clone());
         }
     }
-    None
+    keys
+}
+
+pub fn exact_match_filter_key(category: &str, chunk: &str) -> Option<String> {
+    let mut keys = exact_match_filter_keys(category, chunk);
+    if keys.len() != 1 { return None; }
+    keys.pop()
 }
 
 // 🌟 [AGGLUTINATIVE PREFIX MATCH] exact_match 배열을 '접두 사전' 으로 재사용합니다.
@@ -1870,6 +1888,7 @@ pub fn prefix_match_filter_stem(category: &str, chunk: &str) -> Option<(String, 
     let node = crate::parsing::BIAS_DICT.get(category)?.as_object()?;
     let mut best_key = String::new();
     let mut best_stem = String::new();
+    let mut tied = false;
 
     for (key, val) in node {
         let arr = match val.get("exact_match").and_then(|v| v.as_array()) { Some(a) => a, None => continue };
@@ -1880,14 +1899,19 @@ pub fn prefix_match_filter_stem(category: &str, chunk: &str) -> Option<(String, 
             if sl.chars().count() < 2 { continue; }
             if sl.chars().count() >= lower.chars().count() { continue; }
             if !lower.starts_with(&sl) { continue; }
-            if sl.chars().count() > best_stem.chars().count() {
+            let n = sl.chars().count();
+            let cur = best_stem.chars().count();
+            if n > cur {
                 best_stem = s.to_string();
                 best_key = key.clone();
+                tied = false;
+            } else if n == cur && *key != best_key {
+                tied = true;
             }
         }
     }
 
-    if best_stem.is_empty() { None } else { Some((best_key, best_stem)) }
+    if best_stem.is_empty() || tied { None } else { Some((best_key, best_stem)) }
 }
 // =====================================================================
 // 🌟 [COUNT-UNIT SPLIT] '30 PLTS' 처럼 수량과 포장단위가 한 셀에 붙은 값을 분해합니다.
@@ -2161,7 +2185,7 @@ pub fn prejudice_phrase_bank_multilingual(primary_lang: &str, page_type: &str, f
 /// 전문 비교 키: 소문자 + 각 언어의 문자·숫자만 남깁니다.
 /// "Air Waybill" / "AIRWAYBILL" / "Air-Waybill" 이 같은 키가 됩니다.
 pub fn trade_title_key(s: &str) -> String {
-    s.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect()
+    lower_alnum(s)
 }
 
 fn build_all_trade_doc_titles() -> Vec<(String, String)> {
@@ -2908,11 +2932,17 @@ pub const MONTH_NAMES_ML: [&str; 12] = [
 
 const DATE_UNIT_MARKERS: [&str; 8] = ["年", "月", "日", "년", "월", "일", "号", "號"];
 
-fn lower_alnum(s: &str) -> String {
+pub fn lower_alnum(s: &str) -> String {
     s.chars()
         .filter(|c| c.is_alphanumeric())
         .flat_map(|c| c.to_lowercase())
         .collect()
+}
+
+pub fn short_tail_ok(rest: &str, max_chars: usize) -> bool {
+    !rest.is_empty()
+        && rest.chars().count() <= max_chars
+        && !rest.chars().any(|c| c.is_ascii_alphabetic())
 }
 
 pub fn month_from_name(core: &str) -> Option<u32> {
@@ -2926,16 +2956,921 @@ pub fn month_from_name(core: &str) -> Option<u32> {
             let cjk = p.chars().any(|c| (c as u32) >= 0x2E80);
             if p.chars().count() < 3 && !cjk { continue; }
             if let Some(rest) = norm.strip_prefix(p.as_str()) {
-                if !rest.is_empty()
-                    && rest.chars().count() <= 3
-                    && !rest.chars().any(|c| c.is_ascii_alphabetic())
-                {
+                if short_tail_ok(rest, 3) {
                     return Some(mi as u32 + 1);
                 }
             }
         }
     }
     None
+}
+
+pub const TEMPORAL_OPERATOR_PIVOTS_ML: [(&str, &str, &str); 2] = [
+    (
+        "gte",
+        "after, since, onward, later than, on or after",
+        "nach, seit, später als, am oder nach, \
+         después de, desde, a partir de, posterior a, en o después de, \
+         après, depuis, à partir de, postérieur à, le ou après, \
+         dopo, a partire da, successivo a, il o dopo, \
+         depois de, a partir de, posterior a, em ou depois de, \
+         sinds, vanaf, later dan, op of na, \
+         počínaje, později než, v den nebo po, \
+         بعد, منذ, اعتبارا من, لاحقا لـ, في أو بعد, \
+         以降, 以後, 以来, より後, それ以降, \
+         之后, 以后, 晚于, 自此之后, \
+         이후, 부터, 이래, 보다 늦은, 그 이후",
+    ),
+    (
+        "lte",
+        "before, until, earlier than, no later than, on or before",
+        "vor, bis, früher als, spätestens, am oder vor, \
+         antes de, hasta, anterior a, a más tardar, en o antes de, \
+         avant, jusqu'à, antérieur à, au plus tard, le ou avant, \
+         prima di, fino a, precedente a, entro, il o prima, \
+         antes de, até, anterior a, no máximo até, em ou antes de, \
+         voor, tot, eerder dan, uiterlijk, op of voor, \
+         před, dříve než, nejpozději, v den nebo před, \
+         قبل, حتى, أبكر من, في موعد أقصاه, في أو قبل, \
+         以前, まで, より前, 遅くとも, それ以前, \
+         之前, 以前, 早于, 最迟, 截至, \
+         이전, 까지, 보다 이른, 늦어도, 그 이전",
+    ),
+];
+
+pub const TIME_UNIT_PIVOTS_ML: [(&str, &str); 3] = [
+    (
+        "year",
+        "year, years, yr, calendar year, annual, \
+         Jahr, Jahre, Jahres, Kalenderjahr, \
+         año, años, \
+         année, années, \
+         anno, anni, \
+         ano, anos, \
+         jaar, jaren, kalenderjaar, \
+         rok, roku, roky, \
+         سنة, سنوات, عام, أعوام, \
+         년, 년도, 연도, 해, \
+         年, 年度, 年份, ねん",
+    ),
+    (
+        "month",
+        "month, months, calendar month, \
+         Monat, Monate, Monats, Kalendermonat, \
+         mes, meses, \
+         mois, \
+         mese, mesi, \
+         mês, \
+         maand, maanden, \
+         měsíc, měsíce, měsíců, \
+         شهر, شهور, أشهر, \
+         월, \
+         月, 月份, がつ",
+    ),
+    (
+        "day",
+        "day, days, \
+         Tag, Tage, Tages, \
+         día, días, \
+         jour, jours, \
+         giorno, giorni, \
+         dia, dias, \
+         dag, dagen, \
+         den, dny, dní, dne, \
+         يوم, أيام, \
+         일, 일자, 날, \
+         日, 号, にち",
+    ),
+];
+
+pub const COMPARATOR_PIVOTS_ML: [(&str, &str); 4] = [
+    (
+        "gte",
+        "at least, no less than, not less than, minimum, or more, or above, or higher, and above, \
+         mindestens, wenigstens, nicht weniger als, oder mehr, \
+         al menos, como mínimo, mínimo, no menos de, o más, \
+         au moins, au minimum, pas moins de, ou plus, \
+         almeno, come minimo, non meno di, o più, \
+         pelo menos, no mínimo, não menos que, ou mais, \
+         minstens, ten minste, minimaal, niet minder dan, of meer, \
+         alespoň, nejméně, minimálně, a více, \
+         على الأقل, كحد أدنى, لا يقل عن, أو أكثر, \
+         이상, 최소, 최소한, 적어도, \
+         以上, 最低, 最小, 少なくとも, \
+         至少, 不少于, 不低于, 最少",
+    ),
+    (
+        "gt",
+        "more than, greater than, higher than, larger than, exceeding, in excess of, \
+         mehr als, größer als, höher als, \
+         más de, mayor que, superior a, \
+         plus de, supérieur à, supérieure à, \
+         più di, maggiore di, superiore a, \
+         mais de, maior que, acima de, \
+         meer dan, groter dan, hoger dan, \
+         více než, víc než, vyšší než, větší než, \
+         أكثر من, أعلى من, أكبر من, يتجاوز, \
+         초과, 초과하는, 초과한, 넘는, 넘은, 넘게, 넘어가는, 넘어서는, \
+         超, 超える, 超過, より多い, より大きい, \
+         超过, 大于, 多于, 高于",
+    ),
+    (
+        "lte",
+        "at most, no more than, not more than, not exceeding, up to, maximum, or less, or below, or lower, or under, \
+         höchstens, bis zu, nicht mehr als, oder weniger, \
+         como máximo, a lo sumo, máximo, no más de, hasta, o menos, \
+         au plus, au maximum, pas plus de, jusqu'à, ou moins, \
+         al massimo, massimo, non più di, fino a, o meno, \
+         no máximo, não mais que, até, ou menos, \
+         hoogstens, ten hoogste, maximaal, niet meer dan, of minder, \
+         nejvýše, maximálně, nanejvýš, a méně, \
+         على الأكثر, كحد أقصى, لا يزيد عن, أو أقل, \
+         이하, 이내, 최대, 넘지 않는, 넘지 않은, \
+         以下, 以内, 最大, 多くとも, \
+         至多, 最多, 不超过, 不多于, 不高于",
+    ),
+    (
+        "lt",
+        "less than, fewer than, lower than, smaller than, \
+         weniger als, kleiner als, niedriger als, \
+         menos de, menor que, inferior a, \
+         moins de, inférieur à, inférieure à, \
+         meno di, minore di, inferiore a, \
+         menos que, abaixo de, \
+         minder dan, kleiner dan, lager dan, \
+         méně než, míň než, nižší než, menší než, \
+         أقل من, أدنى من, أصغر من, \
+         미만, 미달, \
+         未満, より少ない, より小さい, \
+         小于, 少于, 低于, 不足",
+    ),
+];
+
+pub const NOMINAL_TAILS_ML: &[&str] = &[
+    "이", "가", "을", "를", "은", "는", "과", "와", "으로", "로",
+    "의", "에", "에서", "도", "만", "들", "들을", "들의", "들이", "과의", "와의",
+    "の", "で", "は", "が", "を", "に", "と", "や", "も", "から",
+    "的", "和", "与",
+];
+
+pub const COPULA_TAILS_ML: &[&str] = &[
+    "이고", "이며", "이면", "인데", "인지", "이다", "입니다", "이어야", "이라면", "이거나",
+    "だ", "です",
+];
+
+pub const OPERATOR_TAILS_ML: &[&str] = &["인", "일", "な", "了"];
+
+pub const LOCATIVE_TAILS_ML: &[&str] = &["에", "에서", "으로", "로", "から", "で", "に"];
+
+fn hangul_tail_agrees(stem: &str, tail: &str) -> bool {
+    let last = match stem.chars().last() {
+        Some(c) => c as u32,
+        None => return false,
+    };
+    if !(0xAC00..=0xD7A3).contains(&last) {
+        return true;
+    }
+    let jong = (last - 0xAC00) % 28;
+    let has_final = jong != 0;
+    let rieul = jong == 8;
+    match tail {
+        "이" | "을" | "은" | "과" | "과의" => has_final,
+        "가" | "를" | "는" | "와" | "와의" => !has_final,
+        "으로" => has_final && !rieul,
+        "로" => !has_final || rieul,
+        _ => true,
+    }
+}
+
+fn tail_is_allomorphic(tail: &str) -> bool {
+    hangul_tail_agrees("가", tail) != hangul_tail_agrees("각", tail)
+}
+
+pub fn noun_tail_fits(stem: &str, rest: &str) -> bool {
+    if COPULA_TAILS_ML.iter().any(|t| *t == rest) {
+        return !stem.is_empty();
+    }
+    NOMINAL_TAILS_ML.iter().any(|t| *t == rest) && hangul_tail_agrees(stem, rest)
+}
+
+pub fn closed_suffix_fits(stem: &str, rest: &str) -> bool {
+    if noun_tail_fits(stem, rest) {
+        return true;
+    }
+    NOMINAL_TAILS_ML.iter().any(|inner| {
+        rest.strip_prefix(inner).map_or(false, |outer| {
+            !outer.is_empty()
+                && noun_tail_fits(stem, inner)
+                && noun_tail_fits(&format!("{}{}", stem, inner), outer)
+        })
+    })
+}
+
+pub fn closed_tail_fits(stem: &str, rest: &str) -> bool {
+    OPERATOR_TAILS_ML.iter().any(|t| *t == rest) || closed_suffix_fits(stem, rest)
+}
+
+pub fn closed_class_exact(norm: &str, key: &str) -> bool {
+    if key.is_empty() { return false; }
+    if norm == key { return true; }
+    match norm.strip_prefix(key) {
+        Some(rest) => closed_suffix_fits(key, rest),
+        None => false,
+    }
+}
+
+fn tails_longest_first(with_copula: bool) -> Vec<&'static str> {
+    let mut tails: Vec<&'static str> = NOMINAL_TAILS_ML.to_vec();
+    if with_copula {
+        tails.extend_from_slice(COPULA_TAILS_ML);
+    }
+    tails.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()));
+    tails
+}
+
+fn closed_tail_parses(core: &str, with_copula: bool) -> Vec<(&str, &'static str)> {
+    let mut out = Vec::new();
+    let mut outer: Option<&'static str> = None;
+    for t in tails_longest_first(with_copula) {
+        let stem = match core.strip_suffix(t) {
+            Some(s) => s.trim_end_matches(|c: char| !c.is_alphanumeric()),
+            None => continue,
+        };
+        if let Some(o) = outer {
+            let stacked = o.strip_suffix(t).map_or(false, |lead| {
+                NOMINAL_TAILS_ML.contains(&lead) && tail_is_allomorphic(lead)
+            });
+            if !stacked {
+                break;
+            }
+        }
+        outer = Some(t);
+        if !stem.is_empty() && noun_tail_fits(stem, t) {
+            out.push((stem, t));
+        }
+    }
+    out
+}
+
+fn closed_tail_peel(core: &str) -> Vec<(&str, &'static str)> {
+    let mut out: Vec<(&str, &'static str)> = Vec::new();
+    for (stem, t) in closed_tail_parses(core, true) {
+        if !out.iter().any(|(s, _)| *s == stem) {
+            out.push((stem, t));
+        }
+        for (inner, it) in closed_tail_parses(stem, false) {
+            if !out.iter().any(|(s, _)| *s == inner) {
+                out.push((inner, it));
+            }
+        }
+    }
+    out
+}
+
+pub fn closed_tail_stems(word: &str) -> Vec<(String, &'static str)> {
+    let core = word.trim_matches(|c: char| !c.is_alphanumeric());
+    closed_tail_peel(core)
+        .into_iter()
+        .filter(|(stem, _)| stem.chars().count() >= 2)
+        .map(|(stem, t)| (stem.to_string(), t))
+        .collect()
+}
+
+pub fn exact_match_filter_key_tailed(category: &str, chunk: &str) -> Option<String> {
+    if let Some(k) = exact_match_filter_key(category, chunk) {
+        return Some(k);
+    }
+    let core = chunk.trim_matches(|c: char| !c.is_alphanumeric());
+    if let Some(k) = exact_match_filter_key(category, core) {
+        return Some(k);
+    }
+    closed_tail_peel(core)
+        .into_iter()
+        .find_map(|(stem, _)| exact_match_filter_key(category, stem))
+}
+
+pub const STANZA_DROP_TAGS: [&str; 7] = ["VERB", "ADP", "PUNCT", "PART", "SCONJ", "CCONJ", "PRON"];
+
+fn time_unit_prefix(norm: &str) -> Option<(&'static str, String)> {
+    let mut best: Option<(&'static str, usize, String)> = None;
+    for (unit, raw) in TIME_UNIT_PIVOTS_ML.iter() {
+        for p in raw.split(',') {
+            let p = lower_alnum(p);
+            if p.is_empty() { continue; }
+            let rest = match norm.strip_prefix(p.as_str()) {
+                Some(r) => r,
+                None => continue,
+            };
+            if rest.chars().any(|c| c.is_ascii_alphabetic()) { continue; }
+            let len = p.chars().count();
+            if best.as_ref().map_or(true, |b| len > b.1) {
+                best = Some((*unit, len, rest.to_string()));
+            }
+        }
+    }
+    best.map(|(unit, _, rest)| (unit, rest))
+}
+
+pub fn time_unit_exact(residue: &str) -> Option<&'static str> {
+    let norm = lower_alnum(residue);
+    if norm.is_empty() { return None; }
+    match time_unit_prefix(&norm) {
+        Some((unit, rest)) if rest.chars().count() <= 3 => Some(unit),
+        _ => None,
+    }
+}
+
+pub fn time_unit_split(residue: &str) -> Option<(&'static str, String)> {
+    let norm = lower_alnum(residue);
+    if norm.is_empty() { return None; }
+    time_unit_prefix(&norm)
+}
+
+pub fn comparator_exact(parts: &[String]) -> Option<&'static str> {
+    if parts.is_empty() { return None; }
+    let norm: String = parts.iter().map(|p| lower_alnum(p)).collect();
+    if norm.is_empty() { return None; }
+    for (key, raw) in COMPARATOR_PIVOTS_ML.iter() {
+        for p in raw.split(',') {
+            let p = lower_alnum(p);
+            if p.is_empty() { continue; }
+            let ascii = p.chars().all(|c| c.is_ascii());
+            if ascii && p.chars().count() < 2 { continue; }
+            if norm == p { return Some(*key); }
+            if parts.len() != 1 || ascii || p.chars().count() < 2 { continue; }
+            if let Some(rest) = norm.strip_prefix(p.as_str()) {
+                if closed_tail_fits(&p, rest) {
+                    return Some(*key);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn comparator_exact_in_text(text: &str) -> Option<&'static str> {
+    let norm = normalize_digits_ascii(text);
+    let mut segs: Vec<Vec<String>> = vec![Vec::new()];
+    for raw in norm.split(|c: char| c.is_whitespace() || c == '|') {
+        let mut piece = String::new();
+        let mut in_num = false;
+        for ch in raw.chars() {
+            if ch.is_ascii_digit() {
+                if !in_num {
+                    let t = piece.trim_matches(|c: char| !c.is_alphanumeric()).to_string();
+                    if !t.is_empty() {
+                        if let Some(last) = segs.last_mut() { last.push(t); }
+                    }
+                    piece.clear();
+                    segs.push(Vec::new());
+                }
+                in_num = true;
+            } else if in_num && (ch == '.' || ch == ',') {
+                continue;
+            } else {
+                in_num = false;
+                piece.push(ch);
+            }
+        }
+        let t = piece.trim_matches(|c: char| !c.is_alphanumeric()).to_string();
+        if !t.is_empty() {
+            if let Some(last) = segs.last_mut() { last.push(t); }
+        }
+    }
+    for seg in segs.iter() {
+        for s in 0..seg.len() {
+            for w in (1..=3usize).rev() {
+                if s + w > seg.len() { continue; }
+                if let Some(k) = comparator_exact(&seg[s..s + w]) {
+                    return Some(k);
+                }
+            }
+            let t = &seg[s];
+            let cjk_lead = t.chars().next().map_or(false, |c| (c as u32) >= 0x1100);
+            if !cjk_lead { continue; }
+            for skip in 1..=2usize {
+                if t.chars().count() <= skip + 1 { break; }
+                let tail: String = t.chars().skip(skip).collect();
+                if let Some(k) = comparator_exact(&[tail]) {
+                    return Some(k);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn numeric_comparator_exact(chunk: &str) -> Option<&'static str> {
+    if !normalize_digits_ascii(chunk).chars().any(|c| c.is_ascii_digit()) { return None; }
+    comparator_exact_in_text(chunk)
+}
+
+pub fn temporal_operator_exact(parts: &[String]) -> Option<&'static str> {
+    if parts.is_empty() { return None; }
+    let norm: String = parts.iter().map(|p| lower_alnum(p)).collect();
+    if norm.is_empty() { return None; }
+    for (key, en, ml) in TEMPORAL_OPERATOR_PIVOTS_ML.iter() {
+        for raw in [*en, *ml] {
+            for p in raw.split(',') {
+                let p = lower_alnum(p);
+                if p.is_empty() { continue; }
+                let ascii = p.chars().all(|c| c.is_ascii());
+                if ascii && p.chars().count() < 2 { continue; }
+                if norm == p { return Some(*key); }
+                if parts.len() != 1 || ascii || p.chars().count() < 2 { continue; }
+                if let Some(rest) = norm.strip_prefix(p.as_str()) {
+                    if closed_tail_fits(&p, rest) {
+                        return Some(*key);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn temporal_operator_phrases(key: &str) -> Vec<String> {
+    for (k, en, ml) in TEMPORAL_OPERATOR_PIVOTS_ML.iter() {
+        if *k == key {
+            return crate::logic::anchor_phrases(en, ml);
+        }
+    }
+    Vec::new()
+}
+
+pub fn period_operator_exact(parts: &[String]) -> Option<&'static str> {
+    if let Some(k) = temporal_operator_exact(parts) {
+        return Some(k);
+    }
+    match comparator_exact(parts) {
+        Some("gte") | Some("gt") => Some("gte"),
+        Some("lte") | Some("lt") => Some("lte"),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExactTimePart {
+    Year(i32),
+    Month(u32),
+    Day(u32),
+}
+
+#[derive(Clone, Debug)]
+pub struct ExactPeriod {
+    pub start: chrono::NaiveDate,
+    pub end: chrono::NaiveDate,
+    pub operator: &'static str,
+    pub granularity: &'static str,
+    pub year_explicit: bool,
+    pub range: bool,
+    pub tokens: Vec<usize>,
+    pub evidence: Vec<String>,
+}
+
+fn exact_numeric_date(core: &str) -> Option<(i32, u32, u32)> {
+    let groups: Vec<&str> = core.split(|c: char| c == '-' || c == '/' || c == '.').collect();
+    if groups.len() != 3 { return None; }
+    if !groups.iter().all(|g| !g.is_empty() && g.len() <= 4 && g.chars().all(|c| c.is_ascii_digit())) {
+        return None;
+    }
+    let n: Vec<u32> = groups.iter().filter_map(|g| g.parse::<u32>().ok()).collect();
+    if n.len() != 3 { return None; }
+    let ymd = if groups[0].len() == 4 && groups[1].len() <= 2 && groups[2].len() <= 2 {
+        (n[0] as i32, n[1], n[2])
+    } else if groups[2].len() == 4 && groups[0].len() <= 2 && groups[1].len() <= 2 {
+        let (a, b) = (n[0], n[1]);
+        if a > 12 && b <= 12 {
+            (n[2] as i32, b, a)
+        } else if b > 12 && a <= 12 {
+            (n[2] as i32, a, b)
+        } else {
+            (n[2] as i32, b, a)
+        }
+    } else {
+        return None;
+    };
+    chrono::NaiveDate::from_ymd_opt(ymd.0, ymd.1, ymd.2)?;
+    Some(ymd)
+}
+
+fn exact_year_month(core: &str) -> Option<(i32, u32)> {
+    let groups: Vec<&str> = core.split(|c: char| c == '-' || c == '/').collect();
+    if groups.len() != 2 { return None; }
+    if groups[0].len() != 4 || groups[1].is_empty() || groups[1].len() > 2 { return None; }
+    if !groups.iter().all(|g| g.chars().all(|c| c.is_ascii_digit())) { return None; }
+    let y: i32 = groups[0].parse().ok()?;
+    let m: u32 = groups[1].parse().ok()?;
+    if !(1..=12).contains(&m) || !(1900..=2100).contains(&y) { return None; }
+    Some((y, m))
+}
+
+fn exact_compose(
+    parts: &[(usize, ExactTimePart)],
+    inherit: Option<(i32, Option<u32>)>,
+    today: chrono::NaiveDate,
+) -> Option<(chrono::NaiveDate, chrono::NaiveDate, &'static str, bool)> {
+    use chrono::Datelike;
+    let (mut y, mut m, mut d): (Option<i32>, Option<u32>, Option<u32>) = (None, None, None);
+    for (_, p) in parts.iter() {
+        match p {
+            ExactTimePart::Year(v) => { if y.is_none() { y = Some(*v); } }
+            ExactTimePart::Month(v) => { if m.is_none() { m = Some(*v); } }
+            ExactTimePart::Day(v) => { if d.is_none() { d = Some(*v); } }
+        }
+    }
+    let explicit = y.is_some();
+    if y.is_none() {
+        if let Some((iy, _)) = inherit { y = Some(iy); }
+    }
+    if m.is_none() && d.is_some() {
+        if let Some((_, Some(im))) = inherit { m = Some(im); }
+    }
+    let yy = y.unwrap_or(today.year());
+    let month_end = |yv: i32, mv: u32| -> Option<chrono::NaiveDate> {
+        let next = if mv == 12 {
+            chrono::NaiveDate::from_ymd_opt(yv + 1, 1, 1)?
+        } else {
+            chrono::NaiveDate::from_ymd_opt(yv, mv + 1, 1)?
+        };
+        next.pred_opt()
+    };
+    match (y.is_some(), m, d) {
+        (_, Some(mm), Some(dd)) => {
+            let day = chrono::NaiveDate::from_ymd_opt(yy, mm, dd)?;
+            Some((day, day, "day", explicit))
+        }
+        (_, Some(mm), None) => {
+            let s = chrono::NaiveDate::from_ymd_opt(yy, mm, 1)?;
+            Some((s, month_end(yy, mm)?, "month", explicit))
+        }
+        (true, None, _) => {
+            let s = chrono::NaiveDate::from_ymd_opt(yy, 1, 1)?;
+            let e = chrono::NaiveDate::from_ymd_opt(yy, 12, 31)?;
+            Some((s, e, "year", explicit))
+        }
+        _ => None,
+    }
+}
+
+pub fn exact_absolute_period(words: &[String], today: chrono::NaiveDate) -> Option<ExactPeriod> {
+    #[derive(Clone)]
+    enum Piece {
+        Num(i64, usize),
+        Word(String),
+    }
+    let core_of = |w: &str| -> String {
+        normalize_digits_ascii(w.trim_matches(|c: char| !c.is_alphanumeric()))
+    };
+    let mut parts: Vec<(usize, ExactTimePart)> = Vec::new();
+    let mut tail_ops: Vec<(usize, &'static str)> = Vec::new();
+    let mut evidence: Vec<String> = Vec::new();
+    let mut pieces: Vec<(usize, Piece)> = Vec::new();
+    for (ti, w) in words.iter().enumerate() {
+        let core = core_of(w);
+        if core.is_empty() { continue; }
+        if let Some((y, m, d)) = exact_numeric_date(&core) {
+            parts.push((ti, ExactTimePart::Year(y)));
+            parts.push((ti, ExactTimePart::Month(m)));
+            parts.push((ti, ExactTimePart::Day(d)));
+            evidence.push(format!("\"{}\"→{:04}-{:02}-{:02}", core, y, m, d));
+            continue;
+        }
+        if let Some((y, m)) = exact_year_month(&core) {
+            parts.push((ti, ExactTimePart::Year(y)));
+            parts.push((ti, ExactTimePart::Month(m)));
+            evidence.push(format!("\"{}\"→{:04}-{:02}", core, y, m));
+            continue;
+        }
+        for sub in core.split(|c: char| !c.is_alphanumeric()).filter(|s| !s.is_empty()) {
+            let mut cur = String::new();
+            let mut cur_digit: Option<bool> = None;
+            for ch in sub.chars().chain(std::iter::once('\u{0}')) {
+                let is_end = ch == '\u{0}';
+                let d = ch.is_ascii_digit();
+                if !cur.is_empty() && (is_end || cur_digit != Some(d)) {
+                    let piece = if cur_digit == Some(true) {
+                        match cur.parse::<i64>() {
+                            Ok(v) => Piece::Num(v, cur.chars().count()),
+                            Err(_) => Piece::Word(cur.clone()),
+                        }
+                    } else {
+                        Piece::Word(cur.clone())
+                    };
+                    pieces.push((ti, piece));
+                    cur.clear();
+                }
+                if is_end { break; }
+                cur.push(ch);
+                cur_digit = Some(d);
+            }
+        }
+    }
+
+    let mut piece_part: Vec<Option<ExactTimePart>> = vec![None; pieces.len()];
+    for k in 0..pieces.len() {
+        let (ti, v, digits) = match &pieces[k] {
+            (ti, Piece::Num(v, d)) => (*ti, *v, *d),
+            _ => continue,
+        };
+        let word = match pieces.get(k + 1) {
+            Some((tj, Piece::Word(w))) if *tj == ti => w.clone(),
+            _ => continue,
+        };
+        let (unit, tail) = match time_unit_split(&word) {
+            Some(x) => x,
+            None => continue,
+        };
+        let tail_len = tail.chars().count();
+        let tail_hit: Option<(String, &'static str)> = (1..=tail_len).rev().find_map(|n| {
+            let head: String = tail.chars().take(n).collect();
+            period_operator_exact(&[head.clone()]).map(|op| (head, op))
+        });
+        let tail_op = tail_hit.as_ref().map(|(_, op)| *op);
+        let cjk_unit = word.chars().next().map_or(false, |c| {
+            let u = c as u32;
+            (0x3040..=0x30FF).contains(&u) || (0x4E00..=0x9FFF).contains(&u)
+        });
+        if tail_len > 3 && tail_op.is_none() && !cjk_unit { continue; }
+        let part = match unit {
+            "year" if digits == 4 && (1900..=2100).contains(&v) => ExactTimePart::Year(v as i32),
+            "month" if (1..=12).contains(&v) => ExactTimePart::Month(v as u32),
+            "day" if (1..=31).contains(&v) => ExactTimePart::Day(v as u32),
+            _ => continue,
+        };
+        evidence.push(format!(
+            "\"{}{}\"→{:?}{}",
+            v, word, part,
+            match tail_hit.as_ref() { Some((head, op)) => format!(" + 꼬리 '{}'={}", head, op), None => String::new() }
+        ));
+        parts.push((ti, part.clone()));
+        piece_part[k] = Some(part.clone());
+        piece_part[k + 1] = Some(part);
+        if let Some(op) = tail_op { tail_ops.push((ti, op)); }
+    }
+    let token_pure: Vec<bool> = (0..words.len())
+        .map(|ti| {
+            let t = words[ti].trim_matches(|c: char| "?!:;\"'(),.…".contains(c));
+            if t.is_empty() || !t.chars().all(|c| c.is_alphanumeric() || "-/.·".contains(c)) {
+                return false;
+            }
+            pieces.iter().enumerate().filter(|(_, (tj, _))| *tj == ti).all(|(k, (_, p))| match p {
+                Piece::Num(_, _) => true,
+                Piece::Word(w) => month_from_name(w).is_some() || piece_part[k].is_some(),
+            })
+        })
+        .collect();
+    loop {
+        let mut changed = false;
+        for k in 0..pieces.len() {
+            if piece_part[k].is_some() { continue; }
+            let is_num = |j: usize| matches!(pieces.get(j), Some((_, Piece::Num(_, _))));
+            let is_month = |j: usize, pp: &Vec<Option<ExactTimePart>>| {
+                matches!(pp.get(j), Some(Some(ExactTimePart::Month(_))))
+            };
+            match pieces[k].clone() {
+                (ti, Piece::Word(w)) => {
+                    let pure_num = |j: usize| {
+                        is_num(j) && pieces.get(j).map_or(false, |(tj, _)| token_pure.get(*tj).copied().unwrap_or(false))
+                    };
+                    let adj_num = (k > 0 && pure_num(k - 1)) || pure_num(k + 1);
+                    if !adj_num { continue; }
+                    if let Some(m) = month_from_name(&w) {
+                        parts.push((ti, ExactTimePart::Month(m)));
+                        piece_part[k] = Some(ExactTimePart::Month(m));
+                        evidence.push(format!("\"{}\"→Month({})", w, m));
+                        changed = true;
+                        continue;
+                    }
+                    if time_unit_exact(&w) == Some("year") {
+                        for j in [k.wrapping_sub(1), k + 1] {
+                            if let Some((tj, Piece::Num(v, d))) = pieces.get(j).cloned() {
+                                if piece_part[j].is_none()
+                                    && d == 4
+                                    && (1900..=2100).contains(&v)
+                                    && token_pure.get(tj).copied().unwrap_or(false)
+                                {
+                                    parts.push((tj.min(ti), ExactTimePart::Year(v as i32)));
+                                    if tj != ti { parts.push((tj.max(ti), ExactTimePart::Year(v as i32))); }
+                                    piece_part[j] = Some(ExactTimePart::Year(v as i32));
+                                    piece_part[k] = Some(ExactTimePart::Year(v as i32));
+                                    evidence.push(format!("\"{} {}\"→Year({})", w, v, v));
+                                    changed = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                (ti, Piece::Num(v, d)) => {
+                    if !token_pure.get(ti).copied().unwrap_or(false) { continue; }
+                    let is_day = |j: usize, pp: &Vec<Option<ExactTimePart>>| {
+                        matches!(pp.get(j), Some(Some(ExactTimePart::Day(_))))
+                    };
+                    let is_month_name = |j: usize, pp: &Vec<Option<ExactTimePart>>| {
+                        is_month(j, pp)
+                            && matches!(pieces.get(j), Some((_, Piece::Word(w))) if month_from_name(w).is_some())
+                    };
+                    let near_month = (k > 0 && is_month(k - 1, &piece_part)) || is_month(k + 1, &piece_part);
+                    let near_day = (k > 0 && is_day(k - 1, &piece_part)) || is_day(k + 1, &piece_part);
+                    let year_follows = matches!(
+                        pieces.get(k + 2),
+                        Some((tj, Piece::Num(yv, 4))) if (1900..=2100).contains(yv) && token_pure.get(*tj).copied().unwrap_or(false)
+                    );
+                    let day_slot = (k > 0 && is_month_name(k - 1, &piece_part))
+                        || (is_month_name(k + 1, &piece_part) && year_follows);
+                    let part = if d == 4 && (1900..=2100).contains(&v) && (near_month || near_day) {
+                        ExactTimePart::Year(v as i32)
+                    } else if d <= 2 && (1..=31).contains(&v) && day_slot {
+                        ExactTimePart::Day(v as u32)
+                    } else {
+                        continue;
+                    };
+                    evidence.push(format!("\"{}\"→{:?} (월·일 조각과 맞닿음)", v, part));
+                    parts.push((ti, part.clone()));
+                    piece_part[k] = Some(part);
+                    changed = true;
+                }
+            }
+        }
+        if !changed { break; }
+    }
+    if parts.is_empty() { return None; }
+    parts.sort_by_key(|(t, _)| *t);
+
+    let mut groups: Vec<Vec<(usize, ExactTimePart)>> = Vec::new();
+    for p in parts.into_iter() {
+        let joins = match groups.last() {
+            Some(g) => {
+                let last = g.last().map(|x| x.0).unwrap_or(0);
+                p.0 == last || p.0 == last + 1
+            }
+            None => false,
+        };
+        if joins {
+            if let Some(g) = groups.last_mut() { g.push(p); }
+        } else {
+            groups.push(vec![p]);
+        }
+    }
+    let part_tokens: Vec<usize> = groups.iter().flat_map(|g| g.iter().map(|(t, _)| *t)).collect();
+    let window = |s: usize, e: usize| -> Vec<String> {
+        words[s..e].iter().map(|w| core_of(w)).collect()
+    };
+    let adjacent_op = |first: usize, last: usize| -> Option<(&'static str, Vec<usize>)> {
+        for w in (1..=3usize).rev() {
+            let (s, e) = (last + 1, last + 1 + w);
+            if e > words.len() || (s..e).any(|k| part_tokens.contains(&k)) { continue; }
+            if let Some(op) = period_operator_exact(&window(s, e)) {
+                return Some((op, (s..e).collect()));
+            }
+        }
+        for w in (1..=3usize).rev() {
+            if first < w { continue; }
+            let (s, e) = (first - w, first);
+            if (s..e).any(|k| part_tokens.contains(&k)) { continue; }
+            if let Some(op) = period_operator_exact(&window(s, e)) {
+                return Some((op, (s..e).collect()));
+            }
+        }
+        None
+    };
+    let span_of = |g: &Vec<(usize, ExactTimePart)>| -> (usize, usize) {
+        (g.first().map(|x| x.0).unwrap_or(0), g.last().map(|x| x.0).unwrap_or(0))
+    };
+    let inherit_of = |parts: &[(usize, ExactTimePart)], start: chrono::NaiveDate| -> Option<(i32, Option<u32>)> {
+        use chrono::Datelike;
+        let has_month = parts.iter().any(|(_, p)| matches!(p, ExactTimePart::Month(_)));
+        Some((start.year(), if has_month { Some(start.month()) } else { None }))
+    };
+    let tokens_of = |g: &[(usize, ExactTimePart)]| -> Vec<usize> {
+        let mut t: Vec<usize> = Vec::new();
+        for (k, _) in g.iter() {
+            if !t.contains(k) { t.push(*k); }
+        }
+        t
+    };
+
+    let g1 = groups[0].clone();
+    let (f1, l1) = span_of(&g1);
+    let mut segs: Vec<Vec<(usize, ExactTimePart)>> = vec![Vec::new()];
+    for p in g1.iter() {
+        let repeat = segs.last().map_or(false, |cur| {
+            cur.iter().any(|(_, q)| {
+                std::mem::discriminant(q) == std::mem::discriminant(&p.1) && *q != p.1
+            })
+        });
+        if repeat { segs.push(Vec::new()); }
+        if let Some(cur) = segs.last_mut() { cur.push(p.clone()); }
+    }
+    if segs.len() >= 2 {
+        let left = segs[0].clone();
+        let right = segs[segs.len() - 1].clone();
+        let (ls, _, lg, lx) = exact_compose(&left, None, today)?;
+        let (_, re, _, _) = exact_compose(&right, inherit_of(&left, ls), today)?;
+        if re >= ls {
+            let mut tokens = tokens_of(&g1[..]);
+            if let Some((_, ts)) = adjacent_op(f1, l1) {
+                let lte_after = ts.iter().all(|t| *t > l1);
+                if lte_after {
+                    for t in ts.into_iter() {
+                        if !tokens.contains(&t) { tokens.push(t); }
+                    }
+                }
+            }
+            tokens.sort();
+            evidence.push(format!("같은 단위가 {}번 나와 첫 조각을 시작, 마지막 조각을 끝으로 묶음", segs.len()));
+            return Some(ExactPeriod {
+                start: ls,
+                end: re,
+                operator: "between",
+                granularity: lg,
+                year_explicit: lx,
+                range: true,
+                tokens,
+                evidence,
+            });
+        }
+    }
+    let g1_tails: Vec<(usize, &'static str)> = tail_ops
+        .iter()
+        .filter(|(t, _)| *t >= f1 && *t <= l1)
+        .cloned()
+        .collect();
+    let split_at = g1_tails.iter().find(|(_, op)| *op == "gte").map(|x| x.0);
+    let close_at = split_at.and_then(|a| g1_tails.iter().find(|(t, op)| *t > a && *op == "lte").map(|x| x.0));
+    if let (Some(a), Some(b)) = (split_at, close_at) {
+        let left: Vec<(usize, ExactTimePart)> = g1.iter().filter(|(t, _)| *t <= a).cloned().collect();
+        let right: Vec<(usize, ExactTimePart)> = g1.iter().filter(|(t, _)| *t > a && *t <= b).cloned().collect();
+        let (ls, _, lg, lx) = exact_compose(&left, None, today)?;
+        let (_, re, _, _) = exact_compose(&right, inherit_of(&left, ls), today)?;
+        if re < ls { return None; }
+        evidence.push(format!("꼬리 연산자 gte(토큰 {}) · lte(토큰 {}) → 한 구간", a, b));
+        return Some(ExactPeriod {
+            start: ls,
+            end: re,
+            operator: "between",
+            granularity: lg,
+            year_explicit: lx,
+            range: true,
+            tokens: tokens_of(&g1[..]),
+            evidence,
+        });
+    }
+    let (s1, e1, gran1, ex1) = exact_compose(&g1, None, today)?;
+    let mut tokens = tokens_of(&g1[..]);
+    let (op1, op1_tokens) = match g1_tails.last() {
+        Some((_, op)) => (*op, Vec::new()),
+        None => adjacent_op(f1, l1).unwrap_or(("between", Vec::new())),
+    };
+    for t in op1_tokens.iter() {
+        if !tokens.contains(t) { tokens.push(*t); }
+    }
+    if op1 == "gte" {
+        if let Some(g2) = groups.get(1).cloned() {
+            let (f2, l2) = span_of(&g2);
+            let anchor = op1_tokens.iter().copied().max().unwrap_or(l1).max(l1);
+            if f2 <= anchor + 2 {
+                let g2_tail = tail_ops.iter().filter(|(t, _)| *t >= f2 && *t <= l2).map(|x| x.1).last();
+                let g2_op = match g2_tail {
+                    Some(op) => Some((op, Vec::new())),
+                    None => adjacent_op(f2, l2).filter(|(_, ts)| ts.iter().all(|t| !op1_tokens.contains(t))),
+                };
+                if let Some(("lte", op2_tokens)) = g2_op {
+                    if let Some((_, e2, _, _)) = exact_compose(&g2, inherit_of(&g1, s1), today) {
+                        if e2 >= s1 {
+                            for t in tokens_of(&g2[..]).into_iter().chain(op2_tokens.into_iter()) {
+                                if !tokens.contains(&t) { tokens.push(t); }
+                            }
+                            tokens.sort();
+                            evidence.push("시작 조각 gte + 끝 조각 lte → 한 구간".to_string());
+                            return Some(ExactPeriod {
+                                start: s1,
+                                end: e2,
+                                operator: "between",
+                                granularity: gran1,
+                                year_explicit: ex1,
+                                range: true,
+                                tokens,
+                                evidence,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    tokens.sort();
+    Some(ExactPeriod {
+        start: s1,
+        end: e1,
+        operator: op1,
+        granularity: gran1,
+        year_explicit: ex1,
+        range: false,
+        tokens,
+        evidence,
+    })
 }
 
 pub fn has_date_shape(s: &str) -> bool {

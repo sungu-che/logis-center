@@ -1461,13 +1461,14 @@ fn detect_label_script(text: &str) -> LabelScript {
 ///  doc_lang 이 빈 문자열이면(미확정) 전체 매칭으로 폴백합니다.
 fn alias_lang_matches(alias: &str, doc_lang: &str) -> bool {
     if doc_lang.is_empty() { return true; }
+    let code = crate::utils::bias_schema::lang_code_of(doc_lang);
     let script = detect_label_script(alias);
     match script {
         LabelScript::Latin   => true,
-        LabelScript::Korean  => doc_lang == "ko",
-        LabelScript::Japanese=> doc_lang == "ja",
-        LabelScript::Chinese => doc_lang.starts_with("zh"),
-        LabelScript::Arabic  => doc_lang == "ar",
+        LabelScript::Korean  => code == "ko",
+        LabelScript::Japanese=> code == "ja",
+        LabelScript::Chinese => code.starts_with("zh") || code == "ja",
+        LabelScript::Arabic  => code == "ar",
     }
 }
 
@@ -2201,7 +2202,7 @@ pub fn extract_trade_relay_keys_for(data: &Value, doc_lang: &str, doc_type: &str
 }
 
 pub fn resolve_trade_doc_identity(doc_type: &str, data: &Value, doc_lang: &str) -> (String, u32, bool) {
-    let keys = extract_trade_relay_keys(data, doc_lang);
+    let keys = extract_trade_relay_keys_for(data, doc_lang, doc_type);
 
     // 🌟 [DOC NUMBER DIRECT] extracted_data에서 doc_number를 직접 확인합니다.
     //    extract_trade_relay_keys의 "self" 역할 매핑이 유효성 검사에서

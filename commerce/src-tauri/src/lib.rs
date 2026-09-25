@@ -1987,8 +1987,7 @@ fn dominant_script(s: &str) -> &'static str {
 }
 
 fn is_relay_draft(doc: &Value) -> bool {
-    doc.get("updated_at").and_then(|v| v.as_i64()) == Some(0)
-        && doc.get("digest").and_then(|v| v.as_str()).map_or(false, |s| s.is_empty())
+    crate::store::is_relay_draft(doc)
 }
 
 // =====================================================================
@@ -2108,6 +2107,27 @@ async fn probe_trade_query<E: Fn(&str)>(
     }
 
     // ② 서식 전문 뱅크 vs 커머스 개념 뱅크
+    let mentions = crate::utils::ai_utils::trade_doc_mentions_exact(query);
+    let listed: Vec<String> = mentions
+        .iter()
+        .map(|m| {
+            format!(
+                "{}→{:?}{}",
+                m.text,
+                m.codes,
+                if !m.by_title { "·코드" } else if m.partial { "·부분" } else { "·전문" }
+            )
+        })
+        .collect();
+    crate::utils::score_dynamics::record_baseline("search.query_trade_mentions", mentions.len() as f32);
+    if let Some((code, why)) = crate::utils::ai_utils::trade_mentions_decisive(&mentions) {
+        crate::utils::score_dynamics::record_baseline("search.query_reroute_exact", 1.0);
+        emit(&format!(
+            "[TRADE QUERY PROBE] 🔒 질의에 서로 다른 허브 서식(PO·CI·BL·LC) 두 가지가 닫힌 어휘로 적혀 있습니다: {} | 전체 {:?}. 허브 서식은 무역 참조 그래프의 중심이라 서로 다른 둘이 함께 적히면 무역 서식 질의로 확정합니다. 같은 허브를 코드와 이름으로 두 번 적은 경우와 공백 없는 중국어·일본어 서식명이 다른 글자에 이어 붙은 부분 일치는 여기서 세지 않고 코사인 확인을 거칩니다. 서식 코드·서식 이름 표는 shipping 질의 해석과 같은 표를 쓰되, 질의 분류용이라 처격 조사가 붙은 허브 코드(CI에)도 셉니다.",
+            why, listed
+        ));
+        return Some(code);
+    }
     let (title_bank, comm_bank) = trade_query_banks(model).await?;
     let q = model.get_embedding(query.to_string()).await.ok()?;
     if q.is_empty() { return None; }
@@ -2123,9 +2143,22 @@ async fn probe_trade_query<E: Fn(&str)>(
         ));
         return Some(code);
     }
+    let top_named = mentions
+        .iter()
+        .find(|m| crate::utils::ai_utils::trade_mention_is_hub(m) && m.codes.iter().any(|c| *c == code));
+    if let Some(m) = top_named {
+        if t_ex > c_ex {
+            crate::utils::score_dynamics::record_baseline("search.query_reroute_exact", 1.0);
+            emit(&format!(
+                "[TRADE QUERY PROBE] 🔒 허브 서식 '{}' {:?}{} 이 질의에 적혀 있고, 서식 전문 뱅크 최고 '{}' (cos {:.4}) 가 바로 그 서식입니다. 서식 뱅크 초과분 {:+.3} 이 커머스 뱅크 초과분 {:+.3} 을 앞서므로(뱅크 크기 보정 뒤 비교) 음수여도 전환합니다. 서식 이름에 조건을 여럿 붙인 긴 질의는 서식 뱅크 전체와 두루 닮아 평균이 올라가므로 최댓값의 z 초과분이 작게 나옵니다. 글자 근거가 초과분의 절대 기준을 대신합니다.",
+                m.text, m.codes, if m.partial { " (공백 없이 다른 글자에 이어 붙은 부분 일치라 코사인 확인을 함께 봅니다)" } else { " (닫힌 어휘 완전 일치)" }, code, t_top, t_ex, c_ex
+            ));
+            return Some(code);
+        }
+    }
     emit(&format!(
-        "[TRADE QUERY PROBE] 🛒 커머스 유지 — 서식 전문 초과분 {:+.3} (최고 '{}' cos {:.4}) vs 커머스 개념 초과분 {:+.3} (cos {:.4}). 서식 접두 번호도 없습니다.",
-        t_ex, code, t_top, c_ex, c_top
+        "[TRADE QUERY PROBE] 🛒 커머스 유지 — 서식 전문 초과분 {:+.3} (최고 '{}' cos {:.4}) vs 커머스 개념 초과분 {:+.3} (cos {:.4}). 서식 접두 번호도 없고, 닫힌 어휘 서식 이름 {:?} 도 전환 근거가 되지 못했습니다.",
+        t_ex, code, t_top, c_ex, c_top, listed
     ));
     None
 }
@@ -2930,7 +2963,8 @@ async fn ai_search_complex(
                             );
                             if value_bearing {
                                 let qs = dominant_script(&query);
-                                let cs = dominant_script(&chunk_text);
+                                let chunk_value = crate::nl_convert::extract_value_from_chunk(&chunk_text);
+                                let cs = dominant_script(if chunk_value.trim().is_empty() { &chunk_text } else { &chunk_value });
                                 let script_gap = qs != "none" && cs != "none" && qs != cs;
                                 if script_gap {
                                     let cross_lingual_track = raw_cosine * 2.0;

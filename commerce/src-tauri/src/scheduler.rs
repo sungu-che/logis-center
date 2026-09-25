@@ -3694,6 +3694,33 @@ pub async fn process_task(
             );
 
             let mut header_to_field_map = std::collections::HashMap::new();
+            let mut header_evaluated: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut header_plausible: std::collections::HashMap<String, std::collections::HashSet<String>> =
+                std::collections::HashMap::new();
+            let list_field_vocab: Vec<Vec<String>> = fields
+                .iter()
+                .map(|(n, _, _, _)| crate::utils::ai_utils::field_value_vocabulary(&doc_lang, &page_type, n))
+                .collect();
+            let list_status_pivot = if fields.iter().any(|(n, _, _, _)| n == "status") {
+                crate::utils::ai_utils::status_pivot_bank(&model, &page_type, &doc_lang).await
+            } else {
+                None
+            };
+            if let Some(p) = list_status_pivot.as_ref() {
+                crate::utils::score_dynamics::record_baseline("commerce.status_pivot_align_z", p.align_z);
+                emit_term(&format!(
+                    "  🌉 [STATUS PIVOT BANK] '{}' 상태 목록 {}개 ↔ 'en' 같은 자리 | 정렬 z {:+.2} (기준 {:.1}) → {}",
+                    p.lang,
+                    p.src.len(),
+                    p.align_z,
+                    crate::utils::ai_utils::STATUS_PIVOT_ALIGN_Z,
+                    if p.usable() {
+                        "같은 자리끼리 번역 쌍으로 확인되어, 상태 원문을 영어 캐노니컬 어휘로 옮기는 데 씁니다"
+                    } else {
+                        "자리 대응이 확인되지 않아 쓰지 않습니다"
+                    }
+                ));
+            }
 
             if !unique_headers.is_empty() {
                 let header_embs: Vec<Vec<f32>> = model
@@ -3811,6 +3838,21 @@ pub async fn process_task(
                     }
                 }
 
+                for h in 0..unique_headers.len() {
+                    if !header_embs[h].iter().all(|&v| v == 0.0) {
+                        header_evaluated.insert(unique_headers[h].clone());
+                    }
+                }
+                for f in 0..hdr_field_names.len() {
+                    if hdr_label_embs[f].iter().all(|e| e.iter().all(|&v| v == 0.0)) {
+                        continue;
+                    }
+                    let set: std::collections::HashSet<String> = (0..unique_headers.len())
+                        .filter(|&h| hdr_matrix[f][h] >= hdr_score_floor)
+                        .map(|h| unique_headers[h].clone())
+                        .collect();
+                    header_plausible.insert(hdr_field_names[f].clone(), set);
+                }
                 let hdr_assign = exclusive_assign(&hdr_matrix, hdr_score_floor, hdr_margin);
                 for (f, a) in hdr_assign.iter().enumerate() {
                     match a {
@@ -4449,6 +4491,7 @@ pub async fn process_task(
                     .collect();
                 let mut enum_value_blocked = 0usize;
                 let mut column_contract_blocked = 0usize;
+                let mut column_absent_blocked = vec![0usize; fields.len()];
                 let aux_control_lines = (0..item_lines_ref.len())
                     .filter(|&l| line_aux_control[l] && !det_consumed_lines.contains(&l) && !line_values[l].is_empty())
                     .count();
@@ -4484,6 +4527,16 @@ pub async fn process_task(
                                         continue;
                                     }
                                 }
+                            } else if crate::utils::ai_utils::header_column_foreign(
+                                &fields[f].0,
+                                line_header_label[l].as_deref(),
+                                value,
+                                &list_field_vocab[f],
+                                &header_evaluated,
+                                &header_plausible,
+                            ) {
+                                column_absent_blocked[f] += 1;
+                                continue;
                             }
 
                             raw[f][l] = weighted_max_pool_sim(
@@ -4509,6 +4562,19 @@ pub async fn process_task(
                             .collect();
                         if cands.len() == 1 {
                             let l = cands[0];
+                            let lone_foreign = column_absent_blocked[f] > 0
+                                || (!list_field_vocab[f].is_empty()
+                                    && crate::utils::ai_utils::header_judged_foreign(
+                                        &fields[f].0,
+                                        line_header_label[l].as_deref(),
+                                        &header_evaluated,
+                                        &header_plausible,
+                                    ));
+                            if lone_foreign
+                                && !crate::utils::ai_utils::value_equals_vocabulary(&line_values[l], &list_field_vocab[f])
+                            {
+                                continue;
+                            }
                             assign[f] = Some((l, centered[f][l], 0.0));
                             claimed[l] = true;
                         }
@@ -4521,6 +4587,17 @@ pub async fn process_task(
                     crate::utils::score_dynamics::record_baseline("commerce.column_contract_block", column_contract_blocked as f32);
                     crate::utils::score_dynamics::record_baseline("commerce.aux_control_block", aux_control_lines as f32);
                     emit_term(&format!("    🧱 [COLUMN CONTRACT] 열거형 값이 될 수 없는 후보(순수 수치·통화 표지 없음) {}건, 헤더로 컬럼이 확정된 필드의 다른 컬럼 후보 {}건을 배정 행렬에서 제외했고, 데이터 칸에 붙은 보조 버튼/입력 라인 {}개는 후보에서 뺐습니다.", enum_value_blocked, column_contract_blocked, aux_control_lines));
+                }
+                let column_absent_total: usize = column_absent_blocked.iter().sum();
+                if column_absent_total > 0 {
+                    crate::utils::score_dynamics::record_baseline("commerce.column_absent_block", column_absent_total as f32);
+                    let per_field: Vec<String> = fields
+                        .iter()
+                        .enumerate()
+                        .filter(|(f, _)| column_absent_blocked[*f] > 0)
+                        .map(|(f, (n, _, _, _))| format!("{}:{}", n, column_absent_blocked[f]))
+                        .collect();
+                    emit_term(&format!("    🧱 [COLUMN ABSENT] 헤더 매핑이 없는 닫힌 어휘 필드(열거형·색상 등)의 후보 중, 헤더 판정에서 그 필드의 칸이 될 수 없다고 나왔고 값도 그 필드의 어휘에 걸리지 않는 라인 {}건을 배정 행렬에서 뺐습니다. {:?} (헤더가 없는 라인, 값이 어휘에 걸리는 라인, 자유 글자 필드와 통화·id,link·링크 필드는 그대로 둡니다)", column_absent_total, per_field));
                 }
                 for (f, a) in vector_assignment.iter().enumerate() {
                     let l = match a { Some((l, _, _)) => *l, None => continue };
@@ -4709,6 +4786,43 @@ pub async fn process_task(
                         }
                     }
 
+                    let currency_ev = if field_name.to_lowercase().contains("currency") {
+                        let texts: Vec<String> = (0..item_lines_ref.len())
+                            .map(|l| {
+                                if line_enriched_texts[l].is_empty() {
+                                    line_values[l].clone()
+                                } else {
+                                    line_enriched_texts[l].clone()
+                                }
+                            })
+                            .collect();
+                        Some(crate::utils::ai_utils::currency_evidence(&texts))
+                    } else {
+                        None
+                    };
+                    if let Some(ev) = currency_ev.as_ref() {
+                        let unmarked_price_line = (0..item_lines_ref.len()).any(|l| {
+                            let price_owned = line_owner_field[l].as_deref().map_or(false, |o| {
+                                let lo = o.to_lowercase();
+                                lo.contains("price") || lo.contains("amount")
+                            });
+                            let text = if line_enriched_texts[l].is_empty() { &line_values[l] } else { &line_enriched_texts[l] };
+                            price_owned && line_sole_value[l] && crate::utils::ai_utils::currency_line_unmarked(text)
+                        });
+                        if let Some(code) = ev.single().filter(|_| !unmarked_price_line) {
+                            item_val.as_object_mut().unwrap().insert(field_name.clone(), json!(code));
+                            crate::utils::score_dynamics::record_field_assigned(&field_name, 0.0);
+                            crate::utils::score_dynamics::record_baseline("commerce.currency_grounded", 1.0);
+                            emit_term(&format!("    💱 [CURRENCY GROUNDED] '{}' ← '{}' | 이 아이템 라인의 통화 표지가 금액에 붙은 한 가지 코드로만 풀립니다 ({}). LLM 없이 확정합니다.", field_name, code, ev.describe()));
+                            continue;
+                        }
+                        if ev.is_silent() {
+                            crate::utils::score_dynamics::record_baseline("commerce.currency_silent_default", 1.0);
+                            emit_term(&format!("    💱 [CURRENCY GROUNDED / DEFAULT] '{}' | 이 아이템 라인 어디에도 통화 표지가 없습니다. LLM 에게 묻지 않고 비워 두며, 저장 직전 문서 언어 기본 통화가 들어갑니다.", field_name));
+                            continue;
+                        }
+                    }
+
                     
                     let (best_item_idx, best_item_contrast, best_item_margin, has_vector_match) = match vector_assignment[f_idx] {
                         Some((l, contrast, margin)) => (l, contrast, margin, true),
@@ -4795,6 +4909,34 @@ pub async fn process_task(
                         );
                         crate::utils::score_dynamics::record_baseline("commerce.header_column_empty", 1.0);
                         continue;
+                    }
+
+                    if !field_is_analytic[f_idx]
+                        && !has_vector_match
+                        && !is_id_link_field(&field_name)
+                        && !premap_handoff_fields.contains(&field_name)
+                        && !field_header_mapped.get(f_idx).copied().unwrap_or(false)
+                        && column_absent_blocked.get(f_idx).copied().unwrap_or(0) > 0
+                        && vector_raw_matrix[f_idx].iter().all(|v| *v < 0.0)
+                    {
+                        emit_term(&format!("    ⛔ [HEADER ABSENT SKIP] Field: '{}' ({:?}) | 이 필드에 매핑된 헤더가 없고 후보 라인이 모두 막혔습니다. 그중 {}건은 헤더 판정에서 이 필드의 칸이 될 수 없다고 나왔고 값도 이 필드의 어휘에 걸리지 않은 라인입니다. 다른 칸에서 빌려 오지 않도록 LLM 호출 없이 빈 값으로 확정합니다.", field_name, field_format, column_absent_blocked[f_idx]));
+                        crate::utils::score_dynamics::record_field_reject(
+                            &field_name,
+                            crate::utils::score_dynamics::GateKind::Prejudice,
+                        );
+                        crate::utils::score_dynamics::record_baseline("commerce.header_absent_skip", 1.0);
+                        continue;
+                    }
+
+                    if field_name == "status" && has_vector_match {
+                        let raw_status = line_values.get(best_item_idx).map(|s| s.trim().to_string()).unwrap_or_default();
+                        if let Some((key, route)) = crate::utils::ai_utils::status_canonical_exact(&raw_status, &page_type, list_status_pivot.as_ref()) {
+                            item_val.as_object_mut().unwrap().insert(field_name.clone(), json!(key.clone()));
+                            crate::utils::score_dynamics::record_field_assigned(&field_name, 0.0);
+                            crate::utils::score_dynamics::record_baseline("commerce.status_pivot_hit", 1.0);
+                            emit_term(&format!("    🌉 [STATUS EXACT] '{}' ← Item Line {} (\"{}\") → '{}' | {} | 배정된 상태 칸의 값 전체가 닫힌 상태 어휘와 정확히 맞아 LLM 없이 확정합니다.", field_name, best_item_idx + 1, raw_status, key, route));
+                            continue;
+                        }
                     }
 
                     let (_bias_emb, _prej_emb, dynamic_prej_str) = &field_embeddings[f_idx];
@@ -5120,6 +5262,20 @@ pub async fn process_task(
                                                 requires_retry = true;
                                                 extracted_values_for_retry.push(extracted_str.clone());
                                                 continue;
+                                            }
+
+                                            if k.to_lowercase().contains("currency") {
+                                                if let Some(ev) = currency_ev.as_ref() {
+                                                    if !crate::utils::ai_utils::currency_answer_admitted(&extracted_str, ev) {
+                                                        emit_term(&format!("    🚫 [CURRENCY UNGROUNDED] '{}' 에 '{}' 반환. 이 아이템 라인의 통화 표지({})로 뒷받침되지 않아 채우지 않습니다. 재시도하지 않고 저장 직전 문서 언어 기본 통화에 맡깁니다.", k, extracted_str, ev.describe()));
+                                                        crate::utils::score_dynamics::record_baseline("commerce.currency_ungrounded", 1.0);
+                                                        if let Some(o) = parsed_val.as_object_mut() {
+                                                            o.remove(*k);
+                                                        }
+                                                        found_valid_value = true;
+                                                        continue;
+                                                    }
+                                                }
                                             }
 
                                             found_valid_value = true;
@@ -7478,7 +7634,19 @@ pub async fn process_task(
         }
         if !status_pending.is_empty() {
             let banks = status_key_banks(&model, &page_type).await;
+            let pivot = crate::utils::ai_utils::status_pivot_bank(&model, &page_type, &doc_lang).await;
+            if is_detail {
+                if let Some(p) = pivot.as_ref() {
+                    crate::utils::score_dynamics::record_baseline("commerce.status_pivot_align_z", p.align_z);
+                }
+            }
             for raw in status_pending.iter() {
+                if let Some((key, route)) = crate::utils::ai_utils::status_canonical_exact(raw, &page_type, pivot.as_ref()) {
+                    emit_term(&format!("  🌉 [STATUS PIVOT] '{}' → '{}' | {} | 닫힌 상태 어휘와 정확히 맞아 코사인 비교 없이 확정합니다.", raw, key, route));
+                    crate::utils::score_dynamics::record_baseline("commerce.status_pivot_hit", 1.0);
+                    status_map.insert(raw.clone(), key);
+                    continue;
+                }
                 let emb = model.get_embedding(raw.clone()).await.unwrap_or(vec![0.0f32; 384]);
                 let pick = pick_status_key(&status_key_scores(&emb, &banks));
                 if pick.second > f32::MIN {
@@ -7717,6 +7885,15 @@ pub async fn process_task(
     if is_detail {
         
 
+        let fresh_keys: std::collections::HashSet<String> = extracted_data
+            .as_object()
+            .map(|o| {
+                o.iter()
+                    .filter(|(k, v)| !crate::utils::canonical::relay_value_is_placeholder(k, v))
+                    .map(|(k, _)| k.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
         let text_to_embed = extracted_data.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| parsing::json_to_natural_language(&extracted_data));
         let item_digest = crate::utils::hash::digest(&text_to_embed); 
         let mut target_id = generated_id.clone(); 
@@ -7832,34 +8009,57 @@ pub async fn process_task(
         for foreign_type in related_types {
             if let Some((queries, merge_rule)) = crate::logic::relay(foreign_type, &extracted_data) {
                 for q in queries {
+                    if crate::utils::canonical::relay_key_is_empty(&q.value) {
+                        crate::utils::score_dynamics::record_baseline("commerce.relay_key_empty", 1.0);
+                        emit_term(&format!(
+                            "  ⚪ [RELAY KEY EMPTY] {} → {} 릴레이 조회 값이 비어 있어(0·빈 값·false) 조회와 초안 생성을 건너뜁니다. 비어 있는 값으로 index 를 조회하면 index 가 0 인 다른 문서가 걸립니다.",
+                            page_type, foreign_type
+                        ));
+                        continue;
+                    }
                     match store.find_item_by_property("items", "index", &q.value).await {
                         Ok(Some((foreign_id, mut foreign_data))) => {
                             let was_foreign_draft = foreign_data.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) == 0;
                             let mut needs_update = false;
-
-
+                            if foreign_id == target_id {
+                                continue;
+                            }
+                            if !crate::utils::canonical::relay_type_matches(foreign_type, &foreign_data) {
+                                crate::utils::score_dynamics::record_baseline("commerce.relay_type_guard", 1.0);
+                                emit_term(&format!(
+                                    "  🔀 [RELAY TYPE GUARD] {} → {} 릴레이 조회(index={})가 '{}' 타입 문서를 찾았습니다. 조회가 index 만 보고 타입을 보지 않아 생긴 교차 적중이라 병합하지 않습니다.",
+                                    page_type, foreign_type, q.value,
+                                    foreign_data.get("type").and_then(|v| v.as_str()).unwrap_or("")
+                                ));
+                                continue;
+                            }
+                            let foreign_is_draft = crate::store::is_relay_draft(&foreign_data);
+                            let mut own_log = crate::utils::canonical::RelayWriteLog::default();
+                            let mut far_log = crate::utils::canonical::RelayWriteLog::default();
                             if let Some(update) = &merge_rule.update {
                                 for field in &update.includes {
                                     if update.from == page_type {
                                         if let Some(val) = extracted_data.get(field).cloned() {
-                                            foreign_data.as_object_mut().unwrap().insert(field.clone(), val);
-                                            needs_update = true;
+                                            if crate::utils::canonical::relay_write(&mut foreign_data, field, val, foreign_is_draft, &mut far_log) {
+                                                needs_update = true;
+                                            }
                                         }
                                     } else if update.to == page_type {
                                         if let Some(val) = foreign_data.get(field).cloned() {
-                                            extracted_data.as_object_mut().unwrap().insert(field.clone(), val);
+                                            crate::utils::canonical::relay_write(&mut extracted_data, field, val, !fresh_keys.contains(field), &mut own_log);
                                         }
                                     }
                                 }
                                 if let Some(foreign_info) = &update.foreign {
                                     if update.from == page_type {
                                         if let Some(val) = extracted_data.get(&foreign_info.to).cloned() {
-                                            foreign_data.as_object_mut().unwrap().insert(foreign_info.from.clone(), val);
-                                            needs_update = true;
+                                            if crate::utils::canonical::relay_write(&mut foreign_data, &foreign_info.from, val, foreign_is_draft, &mut far_log) {
+                                                needs_update = true;
+                                            }
                                         }
                                     } else if update.to == page_type {
                                         if let Some(val) = foreign_data.get(&foreign_info.to).cloned() {
-                                            extracted_data.as_object_mut().unwrap().insert(foreign_info.from.clone(), val);
+                                            crate::utils::canonical::relay_write(&mut extracted_data, &foreign_info.from, val, !fresh_keys.contains(&foreign_info.from), &mut own_log);
                                         }
                                     }
                                 }
@@ -7870,15 +8070,23 @@ pub async fn process_task(
                                 for field in &upsert.includes {
                                     if upsert.from == page_type {
                                         if let Some(val) = extracted_data.get(field).cloned() {
-                                            foreign_data.as_object_mut().unwrap().insert(field.clone(), val);
-                                            needs_update = true;
+                                            if crate::utils::canonical::relay_write(&mut foreign_data, field, val, foreign_is_draft, &mut far_log) {
+                                                needs_update = true;
+                                            }
                                         }
                                     } else if upsert.to == page_type {
                                         if let Some(val) = foreign_data.get(field).cloned() {
-                                            extracted_data.as_object_mut().unwrap().insert(field.clone(), val);
+                                            crate::utils::canonical::relay_write(&mut extracted_data, field, val, !fresh_keys.contains(field), &mut own_log);
                                         }
                                     }
                                 }
+                            }
+                            if !own_log.kept.is_empty() || !far_log.kept.is_empty() {
+                                crate::utils::score_dynamics::record_baseline("commerce.relay_write_guard", (own_log.kept.len() + far_log.kept.len()) as f32);
+                                emit_term(&format!(
+                                    "  🛡️ [RELAY WRITE GUARD] {} ↔ {} (조회 값 {}) | {} 문서: 지킨 칸 {:?} · 채운 칸 {:?} | {} 문서: 지킨 칸 {:?} · 기록한 칸 {:?} | 식별자(id·index)는 릴레이로 바꾸지 않고, 값이 있는 연결 키(goods·order·tracking)도 유지합니다. 지금 처리 중인 문서는 이번 추출에서 읽은 값을 지키고 나머지 칸만 채우거나 갱신하며, 상대 문서는 릴레이 초안(updated_at 0·digest 빈 값·embed 아님)일 때만 기존 값을 갱신합니다.",
+                                    page_type, foreign_type, q.value, page_type, own_log.kept, own_log.written, foreign_type, far_log.kept, far_log.written
+                                ));
                             }
 
 
@@ -8491,32 +8699,56 @@ pub async fn process_task(
                 for foreign_type in related_types {
                     if let Some((queries, merge_rule)) = crate::logic::relay(foreign_type, &single_item) {
                         for q in queries {
+                            if crate::utils::canonical::relay_key_is_empty(&q.value) {
+                                crate::utils::score_dynamics::record_baseline("commerce.relay_key_empty", 1.0);
+                                emit_term(&format!(
+                                    "  ⚪ [RELAY KEY EMPTY] {} → {} 릴레이 조회 값이 비어 있어(0·빈 값·false) 조회와 초안 생성을 건너뜁니다. 비어 있는 값으로 index 를 조회하면 index 가 0 인 다른 문서가 걸립니다.",
+                                    page_type, foreign_type
+                                ));
+                                continue;
+                            }
                             match store.find_item_by_property("items", "index", &q.value).await {
                                 Ok(Some((foreign_id, mut foreign_data))) => {
                                     let mut needs_update = false;
-
+                                    if foreign_id == hashed_item_id {
+                                        continue;
+                                    }
+                                    if !crate::utils::canonical::relay_type_matches(foreign_type, &foreign_data) {
+                                        crate::utils::score_dynamics::record_baseline("commerce.relay_type_guard", 1.0);
+                                        emit_term(&format!(
+                                            "  🔀 [RELAY TYPE GUARD] {} → {} 릴레이 조회(index={})가 '{}' 타입 문서를 찾았습니다. 조회가 index 만 보고 타입을 보지 않아 생긴 교차 적중이라 병합하지 않습니다.",
+                                            page_type, foreign_type, q.value,
+                                            foreign_data.get("type").and_then(|v| v.as_str()).unwrap_or("")
+                                        ));
+                                        continue;
+                                    }
+                                    let foreign_is_draft = crate::store::is_relay_draft(&foreign_data);
+                                    let mut own_log = crate::utils::canonical::RelayWriteLog::default();
+                                    let mut far_log = crate::utils::canonical::RelayWriteLog::default();
                                     if let Some(update) = &merge_rule.update {
                                         for field in &update.includes {
                                             if update.from == page_type {
                                                 if let Some(val) = single_item.get(field).cloned() {
-                                                    foreign_data.as_object_mut().unwrap().insert(field.clone(), val);
-                                                    needs_update = true;
+                                                    if crate::utils::canonical::relay_write(&mut foreign_data, field, val, foreign_is_draft, &mut far_log) {
+                                                        needs_update = true;
+                                                    }
                                                 }
                                             } else if update.to == page_type {
                                                 if let Some(val) = foreign_data.get(field).cloned() {
-                                                    single_item.as_object_mut().unwrap().insert(field.clone(), val);
+                                                    crate::utils::canonical::relay_write(&mut single_item, field, val, false, &mut own_log);
                                                 }
                                             }
                                         }
                                         if let Some(foreign_info) = &update.foreign {
                                             if update.from == page_type {
                                                 if let Some(val) = single_item.get(&foreign_info.to).cloned() {
-                                                    foreign_data.as_object_mut().unwrap().insert(foreign_info.from.clone(), val);
-                                                    needs_update = true;
+                                                    if crate::utils::canonical::relay_write(&mut foreign_data, &foreign_info.from, val, foreign_is_draft, &mut far_log) {
+                                                        needs_update = true;
+                                                    }
                                                 }
                                             } else if update.to == page_type {
                                                 if let Some(val) = foreign_data.get(&foreign_info.to).cloned() {
-                                                    single_item.as_object_mut().unwrap().insert(foreign_info.from.clone(), val);
+                                                    crate::utils::canonical::relay_write(&mut single_item, &foreign_info.from, val, false, &mut own_log);
                                                 }
                                             }
                                         }
@@ -8527,15 +8759,23 @@ pub async fn process_task(
                                         for field in &upsert.includes {
                                             if upsert.from == page_type {
                                                 if let Some(val) = single_item.get(field).cloned() {
-                                                    foreign_data.as_object_mut().unwrap().insert(field.clone(), val);
-                                                    needs_update = true;
+                                                    if crate::utils::canonical::relay_write(&mut foreign_data, field, val, foreign_is_draft, &mut far_log) {
+                                                        needs_update = true;
+                                                    }
                                                 }
                                             } else if upsert.to == page_type {
                                                 if let Some(val) = foreign_data.get(field).cloned() {
-                                                    single_item.as_object_mut().unwrap().insert(field.clone(), val);
+                                                    crate::utils::canonical::relay_write(&mut single_item, field, val, false, &mut own_log);
                                                 }
                                             }
                                         }
+                                    }
+                                    if !own_log.kept.is_empty() || !far_log.kept.is_empty() {
+                                        crate::utils::score_dynamics::record_baseline("commerce.relay_write_guard", (own_log.kept.len() + far_log.kept.len()) as f32);
+                                        emit_term(&format!(
+                                            "  🛡️ [RELAY WRITE GUARD] {} ↔ {} (조회 값 {}) | {} 문서: 지킨 칸 {:?} · 채운 칸 {:?} | {} 문서: 지킨 칸 {:?} · 기록한 칸 {:?} | 식별자(id·index)는 릴레이로 바꾸지 않고, 값이 있는 연결 키(goods·order·tracking)도 유지합니다. 지금 처리 중인 문서는 이번 추출에서 읽은 값을 지키고 나머지 칸만 채우거나 갱신하며, 상대 문서는 릴레이 초안(updated_at 0·digest 빈 값·embed 아님)일 때만 기존 값을 갱신합니다.",
+                                            page_type, foreign_type, q.value, page_type, own_log.kept, own_log.written, foreign_type, far_log.kept, far_log.written
+                                        ));
                                     }
 
                                     if needs_update {

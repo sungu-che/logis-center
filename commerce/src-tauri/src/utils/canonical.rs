@@ -92,3 +92,108 @@ pub fn iso_to_epoch_ms(t: &str) -> Option<i64> {
     }
     None
 }
+
+pub const RELAY_INDEX_KEYS: &[&str] = &["goods", "order", "tracking"];
+
+pub fn is_relay_index_key(key: &str) -> bool {
+    let k = key.trim().to_lowercase();
+    RELAY_INDEX_KEYS.iter().any(|x| *x == k)
+}
+
+pub fn relay_text_is_content(s: &str) -> bool {
+    let t = s.trim();
+    !t.is_empty()
+        && !t.eq_ignore_ascii_case("null")
+        && !t.eq_ignore_ascii_case("n/a")
+        && t.chars().any(|c| c.is_alphabetic())
+}
+
+pub fn relay_value_is_content(v: &serde_json::Value) -> bool {
+    v.as_str().map_or(false, relay_text_is_content)
+}
+
+pub const RELAY_IDENTITY_KEYS: &[&str] = &["id", "index"];
+
+pub const RELAY_ZERO_EMPTY_KEYS: &[&str] = &[
+    "goods", "order", "tracking", "event", "status", "index", "created_at", "updated_at",
+    "width", "height", "length", "weight",
+];
+
+pub fn relay_value_is_placeholder(field: &str, v: &serde_json::Value) -> bool {
+    let zero_empty = RELAY_ZERO_EMPTY_KEYS.iter().any(|k| *k == field);
+    match v {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(s) => {
+            let t = s.trim();
+            t.is_empty()
+                || t.eq_ignore_ascii_case("null")
+                || t.eq_ignore_ascii_case("n/a")
+                || (zero_empty && t.parse::<f64>().map_or(false, |x| x == 0.0))
+        }
+        serde_json::Value::Number(n) => zero_empty && n.as_f64() == Some(0.0),
+        serde_json::Value::Array(a) => a.is_empty(),
+        serde_json::Value::Object(o) => o.is_empty(),
+        serde_json::Value::Bool(b) => zero_empty && !*b,
+    }
+}
+
+pub const RELAY_LINK_KEYS: &[&str] = &["goods", "order", "tracking", "event"];
+
+pub fn relay_key_is_empty(v: &serde_json::Value) -> bool {
+    relay_value_is_placeholder("index", v)
+}
+
+pub fn relay_type_family(t: &str) -> String {
+    match t.trim().to_lowercase().as_str() {
+        "receiving" | "shipping" | "tracking" => "tracking".to_string(),
+        "sales" | "order" => "order".to_string(),
+        "coupon" | "event" => "event".to_string(),
+        other => other.to_string(),
+    }
+}
+
+pub fn relay_type_matches(expected: &str, found: &serde_json::Value) -> bool {
+    match found.get("type").and_then(|v| v.as_str()) {
+        Some(t) if !t.trim().is_empty() => relay_type_family(t) == relay_type_family(expected),
+        _ => true,
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct RelayWriteLog {
+    pub written: Vec<String>,
+    pub kept: Vec<String>,
+}
+
+pub fn relay_write(
+    dst: &mut serde_json::Value,
+    field: &str,
+    val: serde_json::Value,
+    overwrite: bool,
+    log: &mut RelayWriteLog,
+) -> bool {
+    if relay_value_is_placeholder(field, &val) {
+        return false;
+    }
+    let obj = match dst.as_object_mut() {
+        Some(o) => o,
+        None => return false,
+    };
+    let identity = RELAY_IDENTITY_KEYS.iter().any(|k| *k == field);
+    let has_value = obj.get(field).map_or(false, |cur| !relay_value_is_placeholder(field, cur));
+    let anchored = has_value && (RELAY_LINK_KEYS.iter().any(|k| *k == field) || !overwrite);
+    if identity || anchored {
+        if obj.get(field) != Some(&val) && !log.kept.iter().any(|f| f == field) {
+            log.kept.push(field.to_string());
+        }
+        return false;
+    }
+    if obj.get(field) == Some(&val) {
+        return false;
+    }
+    obj.insert(field.to_string(), val);
+    if !log.written.iter().any(|f| f == field) {
+        log.written.push(field.to_string());
+    }
+    true
+}

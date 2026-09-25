@@ -175,6 +175,10 @@ impl crate::model::LogisModel {
         //    기존에는 POS 태그를 debug_pos_log 에만 출력하고 실제 판정에는 사용하지 않았습니다.
         //    (log2: '니트' PROPN, '가디건' NOUN 이라는 확정 정보가 코사인 경쟁에서 무시됨)
         let mut stanza_pos_tags: Option<Vec<String>> = None;
+        let mut stanza_negated: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut stanza_downward: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut stanza_order: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut stanza_bound: std::collections::HashSet<String> = std::collections::HashSet::new();
         
         let stanza_lang_code = crate::analytic::stanza_lang_code(query_lang.as_str());
 
@@ -416,6 +420,20 @@ impl crate::model::LogisModel {
                                         let mut filtered_deprels = Vec::new();
                                         // 🌟 [POS TAG COLLECT] 필터링을 통과한 단어의 POS 태그를 함께 수집합니다.
                                         let mut filtered_pos_tags: Vec<String> = Vec::new();
+                                        {
+                                            let marks = crate::utils::ai_utils::qualifier_marks(&ext_words_string, &|_: usize| false);
+                                            let copy_marks = |idx: &std::collections::HashSet<usize>, set: &mut std::collections::HashSet<String>| {
+                                                for j in idx.iter() {
+                                                    if let Some(t) = ext_words_string.get(*j) {
+                                                        set.insert(t.clone());
+                                                    }
+                                                }
+                                            };
+                                            copy_marks(&marks.negated, &mut stanza_negated);
+                                            copy_marks(&marks.downward, &mut stanza_downward);
+                                            copy_marks(&marks.ordered, &mut stanza_order);
+                                            copy_marks(&marks.price_bound, &mut stanza_bound);
+                                        }
                                         for (i, word) in ext_words_string.iter().enumerate() {
                                             let tag = pos_tags[i];
                                             let lemma = if let Some(l) = lemma_words.get(i) { l.clone() } else { String::new() };
@@ -1729,6 +1747,61 @@ impl crate::model::LogisModel {
                         .unwrap_or_else(|_| vec![vec![0.0; 384]; action_verb_phrases.len()])
                 };
 
+                let marks = crate::utils::ai_utils::qualifier_marks(&words, &|j: usize| period_words.contains(words[j]));
+                let negated_words: std::collections::HashSet<&str> = words
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, w)| {
+                        (marks.negated.contains(&i) || stanza_negated.contains(*w))
+                            && !crate::utils::ai_utils::is_negation_marker(w)
+                    })
+                    .map(|(_, w)| *w)
+                    .collect();
+                let downward_words: std::collections::HashSet<&str> = words
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, w)| marks.downward.contains(&i) || stanza_downward.contains(*w))
+                    .map(|(_, w)| *w)
+                    .collect();
+                let qualifier_bound: std::collections::HashSet<&str> = words
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, w)| marks.price_bound.contains(&i) || stanza_bound.contains(*w))
+                    .map(|(_, w)| *w)
+                    .collect();
+                let qualifier_order: std::collections::HashSet<&str> = words
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, w)| marks.ordered.contains(&i) || stanza_order.contains(*w))
+                    .map(|(_, w)| *w)
+                    .collect();
+                let qualifier_field: std::collections::HashMap<&str, String> = words
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, w)| {
+                        let mut near: Vec<String> = Vec::new();
+                        if i > 0 {
+                            near.push(words[i - 1].to_string());
+                            if i > 1 {
+                                near.push(format!("{} {}", words[i - 2], words[i - 1]));
+                            }
+                        }
+                        if i + 1 < words.len() {
+                            near.push(words[i + 1].to_string());
+                            if i + 2 < words.len() {
+                                near.push(format!("{} {}", words[i + 1], words[i + 2]));
+                            }
+                        }
+                        near.iter()
+                            .find_map(|n| {
+                                crate::utils::ai_utils::exact_match_filter_key_tailed("substantial_filters", n)
+                                    .filter(|k| k != "sale_price")
+                            })
+                            .map(|k| (*w, k))
+                    })
+                    .collect();
+                let mut qualifier_forced_find: Option<String> = None;
+                let mut qualifier_conflict = false;
                 let mut retained_words = Vec::new();
 
                 for word in words {
@@ -1764,6 +1837,82 @@ impl crate::model::LogisModel {
                     }
                     if let Some(k) = crate::utils::ai_utils::exact_match_filter_key_tailed("time_filters", word) {
                         emit_term(&format!("      ✂️ [FILTER TERM DROP] '{}' 는 time_filters.{}.exact_match 확정어(닫힌 조사·어미가 붙은 형태 포함)이므로 속성 배정에서 제외합니다. (FTS 검색어로는 보존)", word, k));
+                        retained_words.push(word);
+                        if !unassigned_chunks.iter().any(|e| e == word) {
+                            unassigned_chunks.push(word.to_string());
+                        }
+                        continue;
+                    }
+                    let sub_key = crate::utils::ai_utils::exact_match_filter_key_tailed("substantial_filters", word);
+                    let find_key = crate::utils::ai_utils::exact_match_filter_key_tailed("find_filters", word);
+                    if let (Some(sk), Some(fk)) = (sub_key, find_key) {
+                        let hold: Option<(&str, &str, &str)> = if negated_words.contains(word) {
+                            Some((
+                                "NEGATED",
+                                "search.qualifier_negated",
+                                "바로 앞이나 뒤 어절이 부정 표지(안·않은·없는·not·nicht·pas 등)입니다. '비싸지 않다' 는 '싸다' 와 같은 뜻이 아니므로 방향(상위·하위 20%)을 정하지 않습니다",
+                            ))
+                        } else if qualifier_order.contains(word) {
+                            Some((
+                                "ORDER",
+                                "search.qualifier_order",
+                                "바로 앞이나 뒤 어절이 정렬 요청('순으로'·'것부터'·sort·first)입니다. 정렬은 상위·하위 20% 필터와 다르므로 문서를 거르지 않습니다",
+                            ))
+                        } else if qualifier_bound.contains(word) {
+                            Some((
+                                "BOUND",
+                                "search.qualifier_bound",
+                                "앞뒤 두 어절 안에 가격 비교 수치(통화가 붙은 값, 또는 비교어·통화어 옆의 단위 없는 숫자)가 있습니다. 가격 조건은 그 수치가 만들고, 형용사로 상위·하위 20% 를 겹치면 결과가 지나치게 줄어듭니다",
+                            ))
+                        } else {
+                            None
+                        };
+                        if let Some((tag, axis, why)) = hold {
+                            crate::utils::score_dynamics::record_baseline(axis, 1.0);
+                            emit_term(&format!(
+                                "      🚫 [ABSTRACT QUALIFIER {}] '{}' (substantial_filters.{} + find_filters.{}) {}. 코사인 라우팅으로 넘기면 같은 방향으로 확정될 수 있으므로 속성 배정과 필터 라우팅에서 모두 뺍니다. (FTS 검색어로는 보존)",
+                                tag, word, sk, fk, why
+                            ));
+                            retained_words.push(word);
+                            if !unassigned_chunks.iter().any(|e| e == word) {
+                                unassigned_chunks.push(word.to_string());
+                            }
+                            continue;
+                        }
+                        let flipped = downward_words.contains(word);
+                        let fk = match (flipped, fk.as_str()) {
+                            (true, "much") => "little".to_string(),
+                            (true, "little") => "much".to_string(),
+                            _ => fk.clone(),
+                        };
+                        let field = qualifier_field.get(word).cloned();
+                        let sk = field.clone().unwrap_or(sk);
+                        if qualifier_conflict || qualifier_forced_find.as_ref().map_or(false, |prev| *prev != fk) {
+                            if !qualifier_conflict {
+                                forced_filter_routes.retain(|(_, c, _, s)| {
+                                    !((c == "substantial_filters" || c == "find_filters") && *s == f32::MAX)
+                                });
+                                crate::utils::score_dynamics::record_baseline("search.qualifier_conflict", 1.0);
+                                emit_term(&format!(
+                                    "      ⚖️ [ABSTRACT QUALIFIER CONFLICT] '{}' → find_filters.{} 가 앞서 확정한 find_filters.{} 와 반대 방향입니다. 한 질의에 싼 쪽과 비싼 쪽이 함께 적혀 있으면(비교·범위 요청) 어느 20% 도 맞지 않으므로 두 확정을 모두 취소합니다. (FTS 검색어로는 보존)",
+                                    word, fk, qualifier_forced_find.clone().unwrap_or_default()
+                                ));
+                            }
+                            qualifier_conflict = true;
+                        } else {
+                            qualifier_forced_find = Some(fk.clone());
+                            crate::utils::score_dynamics::record_baseline("search.qualifier_exact", 1.0);
+                            emit_term(&format!(
+                                "      🧲 [ABSTRACT QUALIFIER EXACT] '{}' → substantial_filters.{} + find_filters.{} | 두 필터의 exact_match 닫힌 어휘에 함께 있는 가격 방향 형용사이고, 곁에 부정 표지·정렬 요청·가격 비교 수치가 없어 추상 수식어입니다.{}{} 스키마 속성(통화·상태 등)과 코사인으로 겨루지 않고 확정합니다. (FTS 검색어로는 보존)",
+                                word,
+                                sk,
+                                fk,
+                                if flipped { " 앞 어절이 하향 표지(덜·less·least·moins·menos·weniger)라 방향을 뒤집었습니다." } else { "" },
+                                if field.is_some() { " 곁의 어절이 다른 금액 칸 이름(substantial_filters exact_match)이라 그 칸을 꾸밉니다." } else { "" }
+                            ));
+                            forced_filter_routes.push((word.to_string(), "substantial_filters".to_string(), sk, f32::MAX));
+                            forced_filter_routes.push((word.to_string(), "find_filters".to_string(), fk, f32::MAX));
+                        }
                         retained_words.push(word);
                         if !unassigned_chunks.iter().any(|e| e == word) {
                             unassigned_chunks.push(word.to_string());
@@ -2010,15 +2159,40 @@ impl crate::model::LogisModel {
                                     let claim = ["substantial_filters", "find_filters"];
                                     let is_abstract = claim.iter().any(|c| c == &top.category);
 
-                                    if is_abstract {
-                                        // 🌟 추상 수식어 확정 → substantial / find 양쪽 argmax 를 모두 귀속합니다.
+                                    let abstract_hold: Option<(&str, &str)> = if !is_abstract {
+                                        None
+                                    } else if negated_words.contains(word) {
+                                        Some(("NEGATED", "search.qualifier_negated"))
+                                    } else if qualifier_order.contains(word) || crate::utils::ai_utils::is_ordering_marker(word) {
+                                        Some(("ORDER", "search.qualifier_order"))
+                                    } else if qualifier_bound.contains(word) {
+                                        Some(("BOUND", "search.qualifier_bound"))
+                                    } else {
+                                        None
+                                    };
+                                    if let Some((tag, axis)) = abstract_hold {
+                                        crate::utils::score_dynamics::record_baseline(axis, 1.0);
+                                        emit_term(&format!(
+                                            "      🚫 [ABSTRACT QUALIFIER {}] '{}' → {}.{} | Surprisal: {:+.4} > SchemaTop: {:+.4} 이지만 곁에 부정 표지·정렬 요청·가격 비교 수치 가운데 하나가 있어(닫힌 어휘 경로와 같은 판정) 방향(상위·하위 20%)을 정하지 않습니다. 추상 수식어로 라우팅하지 않고 속성 배정에서도 뺍니다. (FTS 검색어로는 보존)",
+                                            tag, effective_word, top.category, top.key, top.surprisal, schema_top
+                                        ));
+                                    } else if is_abstract {
+                                        let flipped = downward_words.contains(word);
                                         for cat in claim.iter() {
                                             if let Some(b) = f_scores.iter().find(|s| &s.category == cat) {
+                                                let key = match (flipped && *cat == "find_filters", b.key.as_str()) {
+                                                    (true, "much") => "little".to_string(),
+                                                    (true, "little") => "much".to_string(),
+                                                    (true, "many") => "few".to_string(),
+                                                    (true, "few") => "many".to_string(),
+                                                    _ => b.key.clone(),
+                                                };
                                                 emit_term(&format!(
-                                                    "      🧲 [ABSTRACT QUALIFIER ROUTE] '{}' → {}.{} | Surprisal: {:+.4} (cos {:.4}, N={}) > SchemaTop: {:+.4}",
-                                                    effective_word, b.category, b.key, b.surprisal, b.max_cos, b.n, schema_top
+                                                    "      🧲 [ABSTRACT QUALIFIER ROUTE] '{}' → {}.{} | Surprisal: {:+.4} (cos {:.4}, N={}) > SchemaTop: {:+.4}{}",
+                                                    effective_word, b.category, key, b.surprisal, b.max_cos, b.n, schema_top,
+                                                    if key != b.key { " | 앞 어절이 하향 표지(덜·less·moins·menos·weniger)라 방향을 뒤집었습니다" } else { "" }
                                                 ));
-                                                forced_filter_routes.push((word.to_string(), b.category.clone(), b.key.clone(), b.surprisal));
+                                                forced_filter_routes.push((word.to_string(), b.category.clone(), key, b.surprisal));
                                             }
                                         }
                                     } else {
@@ -2595,7 +2769,112 @@ impl crate::model::LogisModel {
                     }
                     key
                 };
-                let mut best_status_global = pick_forced("status_filters");
+                let forced_status_key = pick_forced("status_filters");
+                let mut status_negated: Vec<String> = negated_words
+                    .iter()
+                    .filter(|w| {
+                        forced_filter_routes
+                            .iter()
+                            .any(|(fw, c, _, _)| c == "status_filters" && fw.as_str() == **w)
+                            || crate::utils::ai_utils::status_exact_key(w, &seg_type).is_some()
+                            || crate::utils::ai_utils::status_exact_key(crate::utils::ai_utils::negated_core(w), &seg_type).is_some()
+                    })
+                    .map(|w| w.to_string())
+                    .collect();
+                status_negated.sort();
+                let status_anchored: Vec<String> = forced_filter_routes
+                    .iter()
+                    .filter(|(w, c, _, _)| c == "status_filters" && !negated_words.contains(w.as_str()))
+                    .map(|(w, _, _, _)| w.clone())
+                    .collect();
+                let mut status_stopped: Vec<String> = Vec::new();
+                let status_exact_global: Option<(String, String, String, bool)> = if status_anchored.is_empty() {
+                    None
+                } else {
+                    let pivot = crate::utils::ai_utils::status_pivot_bank(self, &seg_type, &query_lang).await;
+                    let seg_words: Vec<&str> = current_text.split_whitespace().collect();
+                    let mut found: Vec<(String, String, String, bool)> = Vec::new();
+                    for w in status_anchored.iter() {
+                        let joinable = |x: &str| !negated_words.contains(x) && !crate::utils::ai_utils::is_negation_marker(x);
+                        let mut forms: Vec<String> = Vec::new();
+                        for (p, sw) in seg_words.iter().enumerate() {
+                            if *sw != w.as_str() {
+                                continue;
+                            }
+                            if p > 0 && joinable(seg_words[p - 1]) {
+                                forms.push(format!("{} {}", seg_words[p - 1], sw));
+                                forms.push(format!("{}{}", seg_words[p - 1], sw));
+                            }
+                            if let Some(nx) = seg_words.get(p + 1) {
+                                if joinable(nx) {
+                                    forms.push(format!("{} {}", sw, nx));
+                                    forms.push(format!("{}{}", sw, nx));
+                                }
+                            }
+                        }
+                        forms.push(w.clone());
+                        let mut hit: Option<(String, String, String, bool)> = None;
+                        for f in forms.iter() {
+                            if let Some((k, route)) = crate::utils::ai_utils::status_canonical_exact(f, &seg_type, pivot.as_ref()) {
+                                let curated = crate::utils::ai_utils::status_curated_key(f, &seg_type).as_deref() == Some(k.as_str());
+                                if hit.is_none() || (curated && !hit.as_ref().map_or(false, |h| h.3)) {
+                                    hit = Some((k, f.clone(), route, curated));
+                                }
+                                if curated {
+                                    break;
+                                }
+                            }
+                        }
+                        let stop_next = seg_words.iter().enumerate().any(|(p, sw)| {
+                            *sw == w.as_str()
+                                && seg_words.get(p + 1).map_or(false, |nx| crate::utils::ai_utils::is_status_stop_verb(nx))
+                        });
+                        if let Some(h) = hit {
+                            if h.1 == *w && stop_next {
+                                status_stopped.push(w.clone());
+                            } else if !found.iter().any(|(fk, _, _, _)| *fk == h.0) {
+                                found.push(h);
+                            }
+                        }
+                    }
+                    if found.len() == 1 { found.pop() } else { None }
+                };
+                status_negated.extend(status_stopped.iter().cloned());
+                let status_suppressed = !status_negated.is_empty();
+                if status_suppressed {
+                    crate::utils::score_dynamics::record_baseline("search.status_route_negated", status_negated.len() as f32);
+                    emit_term(&format!(
+                        "    🚫 [STATUS ROUTE / NEGATED] {:?} 는 곁의 어절이 부정 표지(안 된·안된·않은·제외·불가·not 등)이거나 바로 뒤에 중지·종료·해제 같은 멈춤 동사가 붙어 '그 상태가 아닌' 문서를 찾는 뜻입니다. 상태 필터는 '그 상태인' 문서를 거르는 조건이므로 그대로 확정하면 뜻이 뒤집힙니다. 이 단어로는 상태를 만들지 않고, 부정이 빠진 문장 조각으로 상태를 고를 수 있는 2차 Plinko 상태 후보와 상태 LLM 검증도 이 질의에서는 쓰지 않습니다. 부정되지 않은 다른 상태 어휘는 그대로 확인합니다. (단어는 FTS 검색어로 남습니다)",
+                        status_negated
+                    ));
+                }
+                let mut best_status_global = match status_exact_global.as_ref() {
+                    Some((k, w, route, curated)) => {
+                        crate::utils::score_dynamics::record_baseline("search.status_route_exact", 1.0);
+                        emit_term(&format!(
+                            "    🌉 [STATUS ROUTE / CLOSED VOCAB] '{}' → '{}' | {} | 목록 어휘={} | 상태 필터로 라우팅된 단어(붙어 있는 앞뒤 어절과 합친 형태 포함) 가운데 닫힌 상태 어휘로 확인된 것만 상태 축의 결정론 값이 됩니다. (Surprisal 1위 '{}')",
+                            w, k, route, curated, forced_status_key
+                        ));
+                        k.clone()
+                    }
+                    None => {
+                        let routed: Vec<String> = forced_filter_routes
+                            .iter()
+                            .filter(|(w, c, _, _)| {
+                                c == "status_filters" && !negated_words.contains(w.as_str()) && !status_negated.iter().any(|x| x == w)
+                            })
+                            .map(|(w, _, k, s)| format!("{}→{}({:+.3})", w, k, s))
+                            .collect();
+                        if !routed.is_empty() {
+                            crate::utils::score_dynamics::record_baseline("search.status_route_unanchored", routed.len() as f32);
+                            emit_term(&format!(
+                                "    ⚪ [STATUS ROUTE / UNANCHORED] 상태 필터로 라우팅된 {:?} 가 닫힌 상태 어휘(status_filters 의 영어 캐노니컬 구·exact_match, 문서 언어 ↔ en 상태 목록 대응)로 하나의 상태에 확인되지 않습니다. Surprisal 은 구 2~5개짜리 작은 상태 뱅크에서 기능어('발행된'·'연결된')도 쉽게 양수가 되므로, 이 라우팅은 상태 결정론 값과 LLM 힌트(Global Status Suggests)로 쓰지 않습니다. 다른 청크에서 나온 상태 후보는 기존 경로(2차 Plinko → LLM 검증)를 그대로 탑니다. (단어는 FTS 검색어로 남습니다)",
+                                routed
+                            ));
+                        }
+                        String::new()
+                    }
+                };
                 let mut best_sub_global    = pick_forced("substantial_filters");
                 let mut best_find_global   = pick_forced("find_filters");
                 let mut best_time_global   = pick_forced("time_filters");
@@ -2680,7 +2959,7 @@ impl crate::model::LogisModel {
                     };
                     let best_metric = local_filter_candidates.get("metrics").and_then(|c| c.first()).map(|c| c.0.clone()).unwrap_or_else(|| "string".to_string());
                     
-                    if let Some(cands) = local_filter_candidates.get("status_filters") {
+                    if let Some(cands) = local_filter_candidates.get("status_filters").filter(|_| !status_suppressed) {
                         if let Some(c) = cands.first() { if best_status_global.is_empty() { best_status_global = c.0.clone(); } }
                         filter_candidates.insert("status_filters".to_string(), cands.clone());
                     }
@@ -3162,20 +3441,26 @@ impl crate::model::LogisModel {
                     //    '질의에 그 의도의 근거가 존재하지 않는다' 는 결정론적 사실입니다.
                     //    근거가 없는 상태에서 0.6B 에게 물으면 반드시 아무 값이나 채워 넣습니다.
                     //    Qwen3 는 '근거가 있을 때 어떤 값인지 고르는' 판정에만 사용합니다.
-                    let res_status = if !best_status_global.is_empty() && filter_candidates.get("status_filters").map_or(true, |c| c.is_empty()) {
+                    let res_status = if !best_status_global.is_empty()
+                        && (status_exact_global.as_ref().map_or(false, |x| x.3)
+                            || filter_candidates.get("status_filters").map_or(true, |c| c.is_empty()))
+                    {
                         emit_term(&format!("  ⚡ [STATUS DETERMINISTIC] 라우팅으로 '{}' 확정. LLM 호출 생략.", best_status_global));
                         format!("{{ \"status\": \"{}\" }}", best_status_global)
                     } else {
-                        match filter_candidates.get("status_filters").filter(|c| !c.is_empty()) {
-                            Some(cands) => {
-                                let alternatives: Vec<(String, f32)> = cands.iter().skip(1).take(3).cloned().collect();
-                                let p = crate::parsing::extract_status_intent_prompt(&current_text, &seg_type, &cands[0].0, cands[0].1, &alternatives);
-                                self.call_qwen3_verification_model(&p, Some(cancel_token.clone())).await?
-                            },
-                            None => {
-                                emit_term("  ⛔ [STATUS EVIDENCE GATE] 후보 없음. LLM 호출 없이 빈 값 확정.");
-                                "{ \"status\": \"\" }".to_string()
-                            }
+                        let mut cands: Vec<(String, f32)> = filter_candidates.get("status_filters").cloned().unwrap_or_default();
+                        if let Some((k, _, _, _)) = status_exact_global.as_ref() {
+                            let s = cands.first().map_or(0.0, |c| c.1);
+                            cands.retain(|(ck, _)| ck != k);
+                            cands.insert(0, (k.clone(), s));
+                        }
+                        if cands.is_empty() {
+                            emit_term("  ⛔ [STATUS EVIDENCE GATE] 후보 없음. LLM 호출 없이 빈 값 확정.");
+                            "{ \"status\": \"\" }".to_string()
+                        } else {
+                            let alternatives: Vec<(String, f32)> = cands.iter().skip(1).take(3).cloned().collect();
+                            let p = crate::parsing::extract_status_intent_prompt(&current_text, &seg_type, &cands[0].0, cands[0].1, &alternatives);
+                            self.call_qwen3_verification_model(&p, Some(cancel_token.clone())).await?
                         }
                     };
 
@@ -3590,8 +3875,16 @@ impl crate::model::LogisModel {
                                 },
                             ));
                             if let Some((st_op, v)) = st_raw.filter(|(_, v)| !v.is_empty() && v != "null") {
-                                let key = v.to_lowercase();
+                                let mut key = v.to_lowercase();
                                 let numeric_code = key.parse::<i32>().ok().filter(|n| (1..=12).contains(n));
+                                if numeric_code.is_none() && crate::logic::parse_status(&key) == 0 {
+                                    let pivot = crate::utils::ai_utils::status_pivot_bank(self, &seg_type, &query_lang).await;
+                                    if let Some((canon, route)) = crate::utils::ai_utils::status_canonical_exact(&v, &seg_type, pivot.as_ref()) {
+                                        emit_term(&format!("      🌉 [CLOSED VOCAB / STATUS PIVOT] status '{}' → '{}' | {}", v, canon, route));
+                                        crate::utils::score_dynamics::record_baseline("search.status_pivot_hit", 1.0);
+                                        key = canon;
+                                    }
+                                }
                                 let code = numeric_code.unwrap_or_else(|| crate::logic::parse_status(&key));
                                 let negated = st_op.starts_with("not") || st_op.starts_with("neq");
                                 if code != 0 && (negated || numeric_code.is_some()) {

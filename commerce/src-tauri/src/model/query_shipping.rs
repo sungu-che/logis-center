@@ -3080,25 +3080,8 @@ impl crate::model::LogisModel {
         let mut doc_mentions: Vec<ShipDocMention> = Vec::new();
         for &i in pending.iter() {
             let core = &cores[i];
-            let is_code = |s: &str| {
-                s.chars().any(|c| c.is_ascii_uppercase())
-                    && s.chars().all(|c| c.is_ascii_uppercase() || c == '_')
-            };
-            let code: String = if is_code(core.as_str()) {
-                core.clone()
-            } else {
-                match crate::utils::ai_utils::closed_tail_stems(core)
-                    .into_iter()
-                    .find(|(stem, tail)| {
-                        is_code(stem.as_str())
-                            && !crate::utils::ai_utils::LOCATIVE_TAILS_ML.contains(tail)
-                    }) {
-                    Some((stem, _)) => stem,
-                    None => continue,
-                }
-            };
-            let title = match crate::logic::TRADE_DOC_TITLES.iter().find(|(c, _)| *c == code.as_str()) {
-                Some((_, t)) => *t,
+            let codes = match crate::utils::ai_utils::trade_code_mention(core) {
+                Some(c) => c,
                 None => continue,
             };
             let next_is_value = matches!(
@@ -3106,11 +3089,6 @@ impl crate::model::LogisModel {
                 Some(ShipTokenRole::Numeric) | Some(ShipTokenRole::Identifier)
             );
             if next_is_value { continue; }
-            let codes: Vec<String> = crate::logic::TRADE_DOC_TITLES
-                .iter()
-                .filter(|(_, t)| *t == title)
-                .map(|(c, _)| c.to_string())
-                .collect();
             roles[i] = ShipTokenRole::DocType;
             logs.push(format!(
                 "   📄 [DOC TYPE / CODE] \"{}\" → {:?} (서식 코드 완전일치)",
@@ -3120,34 +3098,7 @@ impl crate::model::LogisModel {
         }
 
         {
-            let mut title_index: Vec<(String, Vec<String>, bool)> = Vec::new();
-            for (t, codes) in titles.iter() {
-                let k = ship_normalize_token(t);
-                if k.chars().count() < 2 { continue; }
-                let specific = t.split_whitespace().count() >= 2
-                    || k.chars().any(|c| {
-                        c.is_alphabetic() && !(c.is_ascii_alphabetic() || ('\u{00C0}'..='\u{024F}').contains(&c))
-                    });
-                match title_index.iter_mut().find(|(x, _, _)| *x == k) {
-                    Some((_, cs, sp)) => {
-                        for c in codes.iter() {
-                            if !cs.contains(c) { cs.push(c.clone()); }
-                        }
-                        *sp = *sp || specific;
-                    }
-                    None => title_index.push((k, codes.clone(), specific)),
-                }
-            }
-            let max_w = titles.iter().map(|(t, _)| t.split_whitespace().count()).max().unwrap_or(1).max(1);
-            let tail_ok = |key: &str, joined: &str| -> bool {
-                match joined.strip_prefix(key) {
-                    Some(rest) if !rest.is_empty() => {
-                        crate::utils::ai_utils::closed_suffix_fits(key, rest)
-                            || (key.is_ascii() && key.chars().count() >= 6 && (rest == "s" || rest == "es"))
-                    }
-                    _ => false,
-                }
-            };
+            let max_w = crate::utils::ai_utils::trade_title_max_words();
             let mut hits: Vec<String> = Vec::new();
             let mut s = 0usize;
             while s < n {
@@ -3159,12 +3110,8 @@ impl crate::model::LogisModel {
                 for w in (1..=max_w).rev() {
                     if s + w > n || !(s..s + w).all(|k| roles[k] == ShipTokenRole::Content) { continue; }
                     let joined: String = cores[s..s + w].iter().map(|c| ship_normalize_token(c)).collect();
-                    let hit = title_index
-                        .iter()
-                        .find(|(k, _, sp)| *sp && *k == joined)
-                        .or_else(|| title_index.iter().find(|(k, _, sp)| *sp && tail_ok(k, &joined)));
-                    if let Some((_, codes, _)) = hit {
-                        found = Some((w, codes.clone()));
+                    if let Some(codes) = crate::utils::ai_utils::trade_title_exact(&joined) {
+                        found = Some((w, codes));
                         break;
                     }
                 }

@@ -27,8 +27,10 @@ pub fn json_to_natural_language(json_val: &serde_json::Value) -> String {
                     intro.push_str(&format!("Regarding {}.", context_name));
                 }
 
-                if !intro.is_empty() && !sentences.contains(&intro) {
-                    sentences.push(intro);
+                let intro_at = sentences.len();
+                let intro_waits = title.is_empty();
+                if !intro.is_empty() && !intro_waits && !sentences.contains(&intro) {
+                    sentences.push(intro.clone());
                 }
 
                 for (key, v) in map {
@@ -38,17 +40,19 @@ pub fn json_to_natural_language(json_val: &serde_json::Value) -> String {
                         "origin", "mode", "detail",
                         "updated_at", "created_at", "updated_at_ts", "created_at_ts",
                         "digest", "vector", "vision_vec", "from", "to", "cc", "bcc", "ref",
-                        "is_masked", "tier", "score",
-                        // 🌟 [RELAY INDEX] canonical.rs FORCE_NUM 의 릴레이 축.
-                        //    값은 crc32(normalize_identifier(...)) 결과 숫자입니다.
-                        "goods", "order", "tracking", "views",
-                        // 🌟 [SYSTEM FLAG] canonical.rs FORCE_BOOL 의 0|1 플래그.
+                        "is_masked", "tier", "score", "views",
                         "embed", "node", "item",
-                        // 🌟 [TABLE ROUTING] store.rs 의 물리 테이블 라우팅 키.
                         "table",
                         "doc_type",
                     ].contains(&key.as_str()) { continue; }
+                    if crate::store::ENVELOPE_COLUMNS.contains(&key.as_str()) { continue; }
                     if v.is_null() || (v.is_string() && v.as_str().unwrap_or("").trim().is_empty()) { continue; }
+                    if crate::utils::canonical::is_relay_index_key(key)
+                        && (!crate::utils::canonical::relay_value_is_content(v)
+                            || map.iter().any(|(k2, v2)| v2 == v && k2.starts_with(&format!("{}_", key))))
+                    {
+                        continue;
+                    }
 
                     let clean_key = key.replace("_", " ");
 
@@ -72,6 +76,13 @@ pub fn json_to_natural_language(json_val: &serde_json::Value) -> String {
                             sentences.push(format!("Its {} is {}.", clean_key, val_str));
                         }
                     }
+                }
+                if !intro.is_empty()
+                    && intro_waits
+                    && sentences[intro_at..].iter().any(|x| !sentences[..intro_at].contains(x))
+                    && !sentences[..intro_at].contains(&intro)
+                {
+                    sentences.insert(intro_at, intro);
                 }
             },
             serde_json::Value::Array(arr) => {
@@ -313,12 +324,20 @@ pub fn split_natural_language_to_chunks(text: &str) -> Vec<(String, String, bool
             if parts.len() > 1 {
                 // 🌟 [라벨 접두어 추출]
                 let label_prefix = extract_label_prefix(chunk_text);
+                let merge_fragments = crate::utils::ai_utils::detect_field_format(property)
+                    == crate::utils::ai_utils::FieldFormat::Synthesis;
 
                 for (pi, part) in parts.iter().enumerate() {
-                    // 첫 조각은 원본 그대로 (이미 라벨 포함)
                     if pi == 0 {
                         expanded.push((part.to_string(), property.clone(), *confirmed));
                         continue;
+                    }
+                    if merge_fragments && is_clause_fragment(part) {
+                        if let Some(last) = expanded.last_mut() {
+                            last.0.push_str(", ");
+                            last.0.push_str(part);
+                            continue;
+                        }
                     }
                     // 후속 조각에 라벨 접두어 복원
                     let restored = if let Some(prefix) = &label_prefix {
@@ -398,6 +417,23 @@ pub fn split_clause_commas(s: &str) -> Vec<&str> {
     }
     out.push(&s[start..]);
     out
+}
+
+pub fn is_clause_fragment(part: &str) -> bool {
+    let mut body = part.trim();
+    for p in ["and ", "or ", "with ", "but "] {
+        if let Some(rest) = body.strip_prefix(p) {
+            body = rest.trim_start();
+            break;
+        }
+    }
+    let words: Vec<&str> = body.split_whitespace().collect();
+    if words.len() < 3 {
+        return true;
+    }
+    !words
+        .iter()
+        .any(|w| w.chars().filter(|c| c.is_alphabetic()).count() >= 2)
 }
 
 // =====================================================================
@@ -519,7 +555,7 @@ fn get_field_bias_phrases(doc_lang: &str, page_type: &str, field_name: &str) -> 
 ///   "This goods is titled '테스트상품'" → "테스트상품"
 ///   "tags includes 가전"       → "가전"
 ///   매칭 실패 시 전체 텍스트 반환
-fn extract_value_from_chunk(chunk_text: &str) -> String {
+pub fn extract_value_from_chunk(chunk_text: &str) -> String {
     let s = chunk_text.trim();
 
     // "Its {key} is {value}"
@@ -2004,14 +2040,10 @@ where
     Fut: std::future::Future<Output = Vec<f32>>,
 {
     let _sds_index_guard = crate::utils::score_dynamics::indexing_guard();
-    const SYSTEM_PROPERTIES: [&str; 20] = [
+    const SYSTEM_PROPERTIES: [&str; 17] = [
         "masked_text", "text", "unclassified", "context_intro", "json_data",
-        "updated_at", "created_at", "digest", "index",
-        // 릴레이 인덱스 (canonical.rs FORCE_NUM)
-        "goods", "order", "tracking", "views",
-        // 시스템 플래그 (canonical.rs FORCE_BOOL)
+        "updated_at", "created_at", "digest", "index", "views",
         "embed", "node", "item", "detail",
-        // 라우팅 / 서식 코드 에코
         "table", "doc_type", "mode",
     ];
     const SYSTEM_HASH_PROPERTIES: [&str; 6] = ["id", "ref", "cc", "bcc", "from", "to"];
@@ -2021,11 +2053,21 @@ where
             && (w.starts_with("0x") || w.starts_with("0X"))
             && w[2..].chars().all(|c| c.is_ascii_hexdigit())
     };
+    let is_envelope_key = |p: &str| -> bool {
+        crate::store::ENVELOPE_COLUMNS.contains(&p) && !SYSTEM_HASH_PROPERTIES.contains(&p)
+    };
     let mut hash_dropped = 0usize;
+    let mut relay_dropped = 0usize;
     let filtered_chunks: Vec<&(String, String, bool)> = raw_chunks
         .iter()
         .filter(|(text, property, _)| {
-            if SYSTEM_PROPERTIES.iter().any(|s| *s == property.as_str()) {
+            if SYSTEM_PROPERTIES.iter().any(|s| *s == property.as_str()) || is_envelope_key(property.as_str()) {
+                return false;
+            }
+            if crate::utils::canonical::is_relay_index_key(property)
+                && !crate::utils::canonical::relay_text_is_content(&extract_value_from_chunk(text))
+            {
+                relay_dropped += 1;
                 return false;
             }
             if SYSTEM_HASH_PROPERTIES.iter().any(|s| *s == property.as_str())
@@ -2038,6 +2080,13 @@ where
         })
         .collect();
     crate::utils::score_dynamics::record_baseline("indexing.system_hash_drop", hash_dropped as f32);
+    crate::utils::score_dynamics::record_baseline("indexing.relay_literal_drop", relay_dropped as f32);
+    if relay_dropped > 0 {
+        println!(
+            "  🚫 [PHASE A FILTER / RELAY INDEX] 릴레이 인덱스 키(goods·order·tracking)에 숫자 값(crc32 인덱스)을 가진 청크 {}개를 뺍니다. 같은 키라도 글자가 들어 있는 값(주문 목록의 상품명 등)은 문서 내용이므로 남깁니다.",
+            relay_dropped
+        );
+    }
     if hash_dropped > 0 {
         println!(
             "  🚫 [PHASE A FILTER / SYSTEM HASH] 저장소가 발급한 해시 식별자(0x + 16진 40자리)를 값으로 가진 청크 {}개를 뺍니다. 문서에 인쇄된 사실이 아니라서 검색이 만날 이유가 없고, 인덱싱 역검증에서 매번 doc_number 에 밀려 CONFIRM FLAG 와 혼동 사전(id,link ↔ doc_number)에 같은 잡음을 문서마다 남깁니다. 인쇄된 번호(상품 코드 등)는 이 모양이 아니므로 남습니다.",

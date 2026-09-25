@@ -434,26 +434,7 @@ async fn reindex_pending_embeddings(
                 continue;
             }
         }
-        // 🌟 [ORDER SWAP / N+1 제거]
-        //
-        //  ── 무엇이 문제였나 ──
-        //   count_chunks_by_item 을 '가장 먼저' 호출하여 후보 문서 수만큼
-        //   LanceDB 쿼리를 날렸습니다. 500건이면 500회이고,
-        //   item_chunks 에 item_id 인덱스가 없어 각각 full scan 입니다.
-        //   이것이 백그라운드가 CPU 를 붙들고 있던 두 번째 원인입니다.
-        //
-        //  ── 왜 순서를 바꿔도 되는가 ──
-        //   embed 플래그는 메모리에 이미 올라온 json_data 파싱만으로 판정되며
-        //   비용이 0 에 가깝습니다. 대부분의 문서는 여기서 탈락합니다.
-        //   물리적 사실(chunk_count)이 더 신뢰도가 높다는 기존 판단은 옳지만,
-        //   그 검사는 '싼 검사를 통과한 소수' 에만 적용하면 충분합니다.
-        //   두 검사의 결론은 동일하고 순서만 바뀌므로 판정 결과가 달라지지 않습니다.
         if let Ok(data_val) = serde_json::from_str::<Value>(&doc.json_data) {
-            // 🌟 [PAGE CACHE GUARD] 페이지 셀렉터 캐시는 type 이 도메인 타입(tracking/goods/...)
-            //    이라서 EMBED_EXCLUDE_TYPES 문자열 목록으로는 절대 잡히지 않습니다.
-            //    (서버 index.ts 의 home 문서 = { table:'pages', type:'tracking', data:{node,item} })
-            //    그래서 '구조 마커' 로 판정합니다. 셀렉터 캐시는 검색 대상이 아니므로
-            //    임베딩도, 청크 인덱싱도, 음차도 전부 불필요합니다.
             let is_page_cache = data_val.get("table")
                     .and_then(|v| v.as_str())
                     .map_or(false, |t| t == "pages" || t == "page")
@@ -471,13 +452,14 @@ async fn reindex_pending_embeddings(
                 .map(|v| v.as_i64().unwrap_or(0) == 1 || v.as_bool().unwrap_or(false))
                 .unwrap_or(false);
             if already {
-                continue; // 이미 임베딩 완료된 아이템
+                continue;
+            }
+            if (target_mode == "commerce" || target_mode == "shipping")
+                && crate::utils::canonical::is_relay_placeholder(&data_val)
+            {
+                continue;
             }
         }
-        // 🌟 [CHUNK COUNT — 싼 검사 통과분에만] 물리적 사실로 최종 확인합니다.
-        //    embed 마커가 없는데 청크가 존재하는 경우(마커 유실 등)를 잡습니다.
-        //    여기 도달하는 문서 수는 embed 게이트를 통과한 소수이므로
-        //    쿼리 횟수가 후보 전체가 아니라 실제 미처리분으로 줄어듭니다.
         let chunk_count = store.count_chunks_by_item(&doc.id).await.unwrap_or(0);
         if chunk_count > 0 {
             println!(

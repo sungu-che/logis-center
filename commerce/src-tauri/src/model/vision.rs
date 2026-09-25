@@ -4267,7 +4267,9 @@ impl crate::model::LogisModel {
                                     }
                                 }
                                 if needs_update {
-                                    ej.as_object_mut().unwrap().insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
+                                    if !crate::utils::canonical::is_relay_placeholder(&ej) {
+                                        ej.as_object_mut().unwrap().insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
+                                    }
                                     let merged_text = crate::parsing::json_to_natural_language(&ej);
                                     ej.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
                                     ej.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text.clone()));
@@ -4285,26 +4287,41 @@ impl crate::model::LogisModel {
                                 }
                             },
                             None => {
-                                // 🌟 [DRAFT v5] 미발견 시 draft 생성.
-                                //    기존은 `relay_id(&link_value)` 로 타입 미반영 해시를 사용했습니다.
-                                //    25건 릴레이가 전부 같은 `draft_id` 로 서로를 덮어쓰는 사고가 발생했습니다.
-                                //    `relay_id` 에 `target_type` 을 전달하여 릴레이 대상마다 고유한 `draft_id` 를 부여합니다.
-                                let draft_id = if crate::utils::hash::is_valid_relay_key(&link_value) {
-                                    crate::utils::hash::relay_id(&link_value, target_type)
+                                let search_key = search_field.to_string();
+                                if search_key != "doc_number" && search_key != "no" {
+                                    crate::utils::score_dynamics::record_baseline("vision.relay_reverse_no_draft", 1.0);
+                                    emit_term(&format!(
+                                        "  ⚪ [TRADE RELAY v4 / REVERSE NO-DRAFT] {} ← {}='{}' 는 역방향 참조입니다. 이 값은 상대 서식의 문서번호가 아니라 이 문서의 번호라서 상대 자리 초안의 식별자가 될 수 없습니다. 상대 원본이 들어오면 그쪽의 정방향 릴레이가 이 문서를 찾아 연결합니다.",
+                                        target_type, search_key, link_value
+                                    ));
+                                    continue;
+                                }
+                                let draft_index = crate::utils::hash::relay_index(&link_value);
+                                let draft_id = if draft_index > 0 {
+                                    crate::utils::hash::hash_id(&format!("{}{}", team_id, draft_index))
                                 } else {
                                     crate::utils::hash::hash_id(&format!("{}{}{}", team_id, target_type, link_value))
                                 };
+                                if let Ok(Some(occupant)) = db.get_item_by_id("items", &draft_id).await {
+                                    crate::utils::score_dynamics::record_baseline("vision.relay_id_occupied", 1.0);
+                                    emit_term(&format!(
+                                        "  ⚪ [TRADE RELAY v4 / ID OCCUPIED] {} 자리 '{}' 에 이미 '{}' 타입 문서가 있습니다. 이미지 파이프라인의 문서 id 는 번호만으로 정해지므로 같은 번호의 다른 서식일 수 있어 덮어쓰지 않습니다.",
+                                        target_type, draft_id, occupant.r#type
+                                    ));
+                                    continue;
+                                }
                                 let mut draft_data = json!({});
                                 if let Some(obj) = draft_data.as_object_mut() {
                                     obj.insert("id".to_string(), json!(draft_id.clone()));
                                     obj.insert("type".to_string(), json!(target_type));
-                                    // 🌟 [SEARCH FIELD FIX] draft에는 search_field(상대 문서의 검색 대상 필드)에 값을 넣습니다.
-                                    //    기존에는 target_field(=source_field)로 넣어 방향이 뒤집혔습니다.
-                                    obj.insert(search_field.to_string(), json!(link_value.clone()));
+                                    if draft_index > 0 {
+                                        obj.insert("index".to_string(), json!(draft_index));
+                                    }
+                                    obj.insert(search_key.clone(), json!(link_value.clone()));
                                     obj.insert("doc_type".to_string(), json!(target_type));
                                     obj.insert("updated_at".to_string(), json!(0));
                                     obj.insert("mode".to_string(), json!("shipping"));
-                                    obj.insert("text".to_string(), json!(format!("{} draft (ref: {} = {})", target_type, search_field, link_value)));
+                                    obj.insert("text".to_string(), json!(format!("{} draft (ref: {} = {})", target_type, search_key, link_value)));
                                 }
                                 let _ = db.upsert_item(
                                     "items", &draft_id, target_type, draft_data, None,
@@ -4315,7 +4332,7 @@ impl crate::model::LogisModel {
                                 ).await;
                                 emit_term(&format!(
                                     "  📝 [TRADE RELAY v4] {} draft '{}' 생성 ({}: '{}').",
-                                    target_type, draft_id, search_field, link_value
+                                    target_type, draft_id, search_key, link_value
                                 ));
                             },
                         }

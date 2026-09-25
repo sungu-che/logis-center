@@ -80,6 +80,17 @@ pub fn related(item_type: &str) -> Vec<&str> {
     }
 }
 
+pub fn relay_type_aliases(item_type: &str) -> &'static [&'static str] {
+    match crate::utils::canonical::relay_type_family(item_type).as_str() {
+        "goods" => &["goods", "goodsno", "gs", "gsid", "item", "itemno", "it", "itid", "product", "productno", "prd", "prdno", "pdt", "branduid"],
+        "order" => &["order", "orderno", "ordernum", "orderid", "od", "odid", "ord", "ordno", "ordnum"],
+        "tracking" => &["tracking", "delivery", "dlv", "invoice", "invoiceno", "waybill", "shipment", "parcel"],
+        "event" => &["event", "coupon", "cp", "cpn", "promotion", "promo", "ev"],
+        "review" => &["review", "rv"],
+        _ => &[],
+    }
+}
+
 /// 🌟 [TRADE RELAY] 무역 서식 간 연결고리 규칙입니다.
 /// Commerce의 relay()가 order↔tracking을 tracking_number로 연결하듯,
 /// 무역 서식은 reference_invoice / reference_lc / reference_booking / container_number로 연결합니다.

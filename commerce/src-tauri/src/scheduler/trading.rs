@@ -4126,6 +4126,51 @@ pub async fn process_trading_task(
     ));
 
     
+    let prev_json: Option<Value> = store
+        .get_item_by_id("items", &hashed_item_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|d| serde_json::from_str::<Value>(&d.json_data).ok());
+    let prev_prior = crate::utils::canonical::ledger_prior(prev_json.as_ref());
+    let mut carried: Vec<String> = Vec::new();
+    if prev_prior == crate::utils::canonical::LedgerPrior::Placeholder {
+        if let (Some(prev), Some(obj)) = (prev_json.as_ref().and_then(|v| v.as_object()), extracted_data.as_object_mut()) {
+            for (k, v) in prev.iter() {
+                if !(k.starts_with("rel_") || k.starts_with("reference_")) {
+                    continue;
+                }
+                if crate::utils::canonical::relay_value_is_placeholder(k, v) {
+                    continue;
+                }
+                let blank_here = obj
+                    .get(k)
+                    .map_or(true, |cur| crate::utils::canonical::relay_value_is_placeholder(k, cur));
+                if blank_here {
+                    obj.insert(k.clone(), v.clone());
+                    carried.push(k.clone());
+                }
+            }
+        }
+    }
+    let (item_digest, item_vector) = if carried.is_empty() {
+        (item_digest, item_vector)
+    } else {
+        crate::utils::score_dynamics::record_baseline("trading.relay_placeholder_carry", carried.len() as f32);
+        emit_term(&format!(
+            "  🧷 [PLACEHOLDER CARRY] '{}' 자리에 다른 서식이 먼저 만든 자리 초안이 있었습니다. 초안이 들고 있던 연결 축 {:?} 을 원본으로 옮긴 뒤 저장합니다. 옮기지 않으면 원본 저장이 초안을 덮어 역방향 연결이 사라집니다.",
+            hashed_item_id, carried
+        ));
+        let carried_text = parsing::json_to_natural_language(&extracted_data);
+        if let Some(obj) = extracted_data.as_object_mut() {
+            obj.insert("text".to_string(), json!(carried_text.clone()));
+            obj.insert("masked_text".to_string(), json!(carried_text.clone()));
+        }
+        let carried_digest = crate::utils::hash::digest(&carried_text);
+        let carried_vector = model.get_embedding(carried_text).await.unwrap_or(vec![0.0; 384]);
+        (carried_digest, carried_vector)
+    };
+
     save_item(&store, "items", &hashed_item_id, &doc_type, extracted_data.clone(), Some(item_vector.clone()),
         &from_addr, &team_id, &cc_val, &bcc, &ref_val, Some(&item_digest)).await;
 
@@ -4269,10 +4314,12 @@ pub async fn process_trading_task(
 
         match hit {
             Some((foreign_id, mut foreign_data)) => {
-                let was_draft = foreign_data.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) == 0;
+                let foreign_prior = crate::utils::canonical::ledger_prior(Some(&foreign_data));
+                let was_draft = foreign_prior == crate::utils::canonical::LedgerPrior::Draft;
+                let is_placeholder = foreign_prior == crate::utils::canonical::LedgerPrior::Placeholder;
                 emit_term(&format!(
-                    "[TRADING RELAY] Found existing {} document '{}' (draft: {}).",
-                    foreign_type, foreign_id, was_draft
+                    "[TRADING RELAY] Found existing {} document '{}' (state: {:?}).",
+                    foreign_type, foreign_id, foreign_prior
                 ));
 
                 {
@@ -4296,15 +4343,21 @@ pub async fn process_trading_task(
                 }
 
                 let merged_text = parsing::json_to_natural_language(&foreign_data);
-                let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
+                let merged_vector = if is_placeholder {
+                    None
+                } else {
+                    Some(model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]))
+                };
                 foreign_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text.clone()));
                 foreign_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text));
 
                 let foreign_bcc = entity_bcc(foreign_type, &cc_val);
-                save_item(&store, "items", &foreign_id, foreign_type, foreign_data, Some(merged_vector),
+                save_item(&store, "items", &foreign_id, foreign_type, foreign_data, merged_vector,
                     &from_addr, &team_id, &cc_val, &foreign_bcc, &ref_val, None).await;
                 relay_linked += 1;
-                relay_promoted_types.push(foreign_type);
+                if was_draft {
+                    relay_promoted_types.push(foreign_type);
+                }
                 emit_term(&format!(
                     "  ✅ [TRADING RELAY] {} '{}' 에 {}='{}' / {}={} 역주입 완료.",
                     foreign_type, foreign_id, foreign_field, doc_number, mine_col, index_val
@@ -4386,38 +4439,32 @@ pub async fn process_trading_task(
     let mut stats_diff: std::collections::HashMap<String, (i64, i64, i64)> = std::collections::HashMap::new();
 
     {
-        let prev = store.get_item_by_id("items", &hashed_item_id).await.ok().flatten();
-        match prev {
-            None => {
-                let e = stats_diff.entry(doc_type.clone()).or_insert((0, 0, 0));
-                e.1 += 1; 
-                e.2 += 1; 
-                emit_term(&format!("  📊 [STATS] doc_type='{}' 신규 문서로 집계합니다.", doc_type));
-            },
-            Some(existing) => {
-                let was_draft = existing.updated_at_ts == 0;
-                if was_draft {
-                    let e = stats_diff.entry(doc_type.clone()).or_insert((0, 0, 0));
-                    e.0 -= 1; 
-                    e.1 += 1; 
-                    e.2 += 1;
-                    emit_term(&format!("  📊 [STATS] doc_type='{}' draft → 완성 문서로 전환합니다.", doc_type));
-                } else {
-                    emit_term(&format!("  📊 [STATS] doc_type='{}' 기존 문서 갱신이므로 count 를 증가시키지 않습니다.", doc_type));
-                }
-            }
+        let own_delta = crate::utils::canonical::ledger_delta(prev_prior, true);
+        if own_delta != (0, 0, 0) {
+            let e = stats_diff.entry(doc_type.clone()).or_insert((0, 0, 0));
+            e.0 += own_delta.0;
+            e.1 += own_delta.1;
+            e.2 += own_delta.2;
         }
+        emit_term(&format!(
+            "  📊 [STATS] doc_type='{}' 저장 전 상태 {:?} → 원장 변화 {:?}",
+            doc_type, prev_prior, own_delta
+        ));
     }
 
     for t in relay_draft_types.iter() {
+        let d = crate::utils::canonical::LEDGER_PLACEHOLDER_DELTA;
         let e = stats_diff.entry(t.to_string()).or_insert((0, 0, 0));
-        e.0 += 1; 
+        e.0 += d.0;
+        e.1 += d.1;
+        e.2 += d.2;
     }
     for t in relay_promoted_types.iter() {
+        let d = crate::utils::canonical::ledger_delta(crate::utils::canonical::LedgerPrior::Draft, true);
         let e = stats_diff.entry(t.to_string()).or_insert((0, 0, 0));
-        e.0 -= 1; 
-        e.1 += 1; 
-        e.2 += 1; 
+        e.0 += d.0;
+        e.1 += d.1;
+        e.2 += d.2;
     }
     if !relay_draft_types.is_empty() || !relay_promoted_types.is_empty() {
         emit_term(&format!(

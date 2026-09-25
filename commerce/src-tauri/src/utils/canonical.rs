@@ -197,3 +197,70 @@ pub fn relay_write(
     }
     true
 }
+
+pub fn relay_key_for_type(t: &str) -> Option<&'static str> {
+    match relay_type_family(t).as_str() {
+        "goods" => Some("goods"),
+        "order" => Some("order"),
+        "tracking" => Some("tracking"),
+        "event" => Some("event"),
+        _ => None,
+    }
+}
+
+pub fn relay_ref_index(v: Option<&serde_json::Value>) -> Option<u32> {
+    let n = v?.as_u64()?;
+    if n == 0 || n > u64::from(u32::MAX) {
+        None
+    } else {
+        Some(n as u32)
+    }
+}
+
+pub fn relay_companion_base(key: &str) -> Option<&'static str> {
+    let k = key.trim().to_lowercase();
+    RELAY_LINK_KEYS
+        .iter()
+        .copied()
+        .find(|base| k.len() == base.len() + 6 && k.starts_with(*base) && k.ends_with("_title"))
+}
+
+pub fn is_relay_placeholder(doc: &serde_json::Value) -> bool {
+    let updated_zero = doc.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) == 0;
+    let digest_empty = doc
+        .get("digest")
+        .and_then(|v| v.as_str())
+        .map_or(true, |s| s.trim().is_empty());
+    updated_zero && digest_empty
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerPrior {
+    Absent,
+    Placeholder,
+    Draft,
+    Confirmed,
+}
+
+pub fn ledger_prior(doc: Option<&serde_json::Value>) -> LedgerPrior {
+    match doc {
+        None => LedgerPrior::Absent,
+        Some(d) if d.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) > 0 => LedgerPrior::Confirmed,
+        Some(d) if is_relay_placeholder(d) => LedgerPrior::Placeholder,
+        Some(_) => LedgerPrior::Draft,
+    }
+}
+
+pub fn ledger_delta(prior: LedgerPrior, confirm: bool) -> (i64, i64, i64) {
+    match (prior, confirm) {
+        (LedgerPrior::Absent, false) => (1, 0, 1),
+        (LedgerPrior::Absent, true) => (0, 1, 1),
+        (LedgerPrior::Placeholder, false) => (0, 0, 1),
+        (LedgerPrior::Placeholder, true) => (-1, 1, 1),
+        (LedgerPrior::Draft, false) => (0, 0, 0),
+        (LedgerPrior::Draft, true) => (-1, 1, 0),
+        (LedgerPrior::Confirmed, _) => (0, 0, 0),
+    }
+}
+
+pub const LEDGER_PLACEHOLDER_DELTA: (i64, i64, i64) = (1, 0, 0);

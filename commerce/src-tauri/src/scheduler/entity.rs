@@ -52,3 +52,12 @@ pub fn entity_id(team_id: &str, index: u32) -> String {
 pub fn entity_bcc(type_: &str, cc: &str) -> String {
     crate::utils::hash::hash_id(&format!("{}{}", type_, cc))
 }
+
+pub fn entity_seed(cc: &str, raw: &str) -> String {
+    let t = raw.trim();
+    let scope = cc.trim();
+    if t.is_empty() || scope.is_empty() || crate::utils::hash::is_valid_relay_key(t) {
+        return t.to_string();
+    }
+    format!("{}:{}", scope, t)
+}

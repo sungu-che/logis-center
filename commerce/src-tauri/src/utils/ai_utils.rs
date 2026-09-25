@@ -5802,6 +5802,160 @@ pub fn collect_id_link_candidates_from_url(page_url: &str) -> Vec<IdLinkCandidat
     out
 }
 
+const ID_KEY_WORDS: &[&str] = &["id", "no", "idx", "seq", "code", "num", "number", "uid", "key", "sn"];
+
+pub fn same_id_token(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase();
+    let (x, y) = (norm(a), norm(b));
+    !x.is_empty() && x == y
+}
+
+pub fn href_resource_stem(href: &str) -> String {
+    let (_, path, _) = split_href_parts(href);
+    path.split('/')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+        .last()
+        .map(|s| s.split('.').next().unwrap_or(s).to_lowercase())
+        .unwrap_or_default()
+}
+
+pub fn href_param_key(href: &str, token: &str) -> Option<String> {
+    let (_, _, query) = split_href_parts(href);
+    for pair in query.split('&') {
+        let p = match pair.find('=') {
+            Some(p) => p,
+            None => continue,
+        };
+        if pair[p + 1..].trim() == token {
+            let k = pair[..p].trim().trim_start_matches("amp;").to_lowercase();
+            if !k.is_empty() {
+                return Some(k);
+            }
+        }
+    }
+    None
+}
+
+pub fn candidate_type_evidence(cand: &IdLinkCandidate, aliases: &[&str]) -> u8 {
+    if cand.is_host_part || aliases.is_empty() {
+        return 0;
+    }
+    let alias_hit = |w: &str| aliases.iter().any(|a| w == *a || (a.len() >= 5 && w.starts_with(*a)));
+    let key = href_param_key(&cand.href, &cand.token).unwrap_or_default();
+    let key_words: Vec<String> = humanize_url_token(&key).split_whitespace().map(|s| s.to_string()).collect();
+    if key_words.iter().any(|w| alias_hit(w)) {
+        return 2;
+    }
+    let key_is_id = key.is_empty() || key_words.iter().any(|w| ID_KEY_WORDS.contains(&w.as_str()));
+    if !key_is_id {
+        return 0;
+    }
+    let mut words: Vec<String> = humanize_url_token(&href_resource_stem(&cand.href))
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect();
+    words.extend(cand.role_phrase.split_whitespace().map(|s| s.to_string()));
+    if words.iter().any(|w| alias_hit(w)) { 1 } else { 0 }
+}
+
+pub fn id_resource_affinity(page_url: &str, cand: &IdLinkCandidate, self_aliases: &[&str]) -> f32 {
+    let page_stem = href_resource_stem(page_url);
+    let same_stem = !page_stem.is_empty() && page_stem == href_resource_stem(&cand.href);
+    (if same_stem { 1.0 } else { 0.0 }) + 0.5 * candidate_type_evidence(cand, self_aliases) as f32
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct IdRoleCensus {
+    pub rows: usize,
+    pub roles: std::collections::HashMap<String, (usize, std::collections::HashSet<String>)>,
+}
+
+impl IdRoleCensus {
+    pub fn build(all_lines: &[Vec<String>]) -> Self {
+        let mut roles: std::collections::HashMap<String, (usize, std::collections::HashSet<String>)> =
+            std::collections::HashMap::new();
+        for lines in all_lines.iter() {
+            let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for c in collect_id_link_candidates(&refs) {
+                if c.is_host_part || !seen.insert(c.role_phrase.clone()) {
+                    continue;
+                }
+                let e = roles
+                    .entry(c.role_phrase.clone())
+                    .or_insert_with(|| (0, std::collections::HashSet::new()));
+                e.0 += 1;
+                e.1.insert(c.token.to_lowercase());
+            }
+        }
+        Self { rows: all_lines.len(), roles }
+    }
+
+    pub fn row_unique(&self, role: &str) -> bool {
+        if self.rows < 3 {
+            return false;
+        }
+        match self.roles.get(role) {
+            Some((present, distinct)) => *present * 10 >= self.rows * 8 && distinct.len() == *present,
+            None => false,
+        }
+    }
+
+    pub fn coverage(&self, role: &str) -> (usize, usize) {
+        self.roles.get(role).map(|(p, d)| (*p, d.len())).unwrap_or((0, 0))
+    }
+}
+
+pub fn collect_typed_relay_refs(
+    cands: &[IdLinkCandidate],
+    self_token: &str,
+    foreign_types: &[&str],
+) -> Vec<(String, String, String)> {
+    let mut claims: Vec<(String, String, String)> = Vec::new();
+    for t in foreign_types.iter() {
+        let aliases = crate::logic::relay_type_aliases(t);
+        if aliases.is_empty() {
+            continue;
+        }
+        let mut best: Option<(String, u8, String)> = None;
+        let mut conflict = false;
+        for c in cands.iter() {
+            if c.is_host_part || same_id_token(&c.token, self_token) {
+                continue;
+            }
+            let ev = candidate_type_evidence(c, aliases);
+            if ev == 0 {
+                continue;
+            }
+            match best.as_ref() {
+                None => best = Some((c.token.clone(), ev, c.role_phrase.clone())),
+                Some((tok, bev, _)) => {
+                    if ev > *bev {
+                        best = Some((c.token.clone(), ev, c.role_phrase.clone()));
+                        conflict = false;
+                    } else if ev == *bev && !same_id_token(tok, &c.token) {
+                        conflict = true;
+                    }
+                }
+            }
+        }
+        if conflict {
+            continue;
+        }
+        if let Some((tok, _, role)) = best {
+            claims.push((t.to_string(), tok, role));
+        }
+    }
+    let snapshot = claims.clone();
+    claims.retain(|(t, tok, _)| {
+        !snapshot
+            .iter()
+            .any(|(t2, tok2, _)| t2 != t && same_id_token(tok2, tok))
+    });
+    claims
+}
+
 #[derive(Debug, Clone)]
 pub struct LabeledTokenCandidate {
     pub token: String,

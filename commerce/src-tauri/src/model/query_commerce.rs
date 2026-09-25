@@ -3952,27 +3952,37 @@ impl crate::model::LogisModel {
                         
                         obj.insert("condition".to_string(), json!(structured_cond.clone()));
 
-                        // 🌟 [N:N ALTERNATE AXIS] 실제로 조건에 실린 속성에 대해서만 대안 목록을 남깁니다.
-                        //    STAGE-3 이 이 목록으로 '1순위가 틀렸을 때의 대안 쿼리'를 발행하고,
-                        //    프론트엔드 Dexie 도 동일 목록으로 재질의할 수 있습니다.
                         let mut alt_payload = serde_json::Map::new();
                         for (prop, alts) in &plinko_alternates {
                             if !structured_cond.contains_key(prop) { continue; }
                             if alts.is_empty() { continue; }
                             alt_payload.insert(prop.clone(), json!(alts.clone()));
                         }
+                        for prop in crate::utils::canonical::RELAY_LINK_KEYS.iter() {
+                            let text_valued = structured_cond
+                                .get(*prop)
+                                .and_then(|c| c.get("value"))
+                                .and_then(|v| v.as_str())
+                                .map_or(false, crate::utils::canonical::relay_text_is_content);
+                            if !text_valued { continue; }
+                            let companion = format!("{}_title", prop);
+                            let entry = alt_payload.entry(prop.to_string()).or_insert_with(|| json!([]));
+                            if let Some(arr) = entry.as_array_mut() {
+                                if !arr.iter().any(|x| x.as_str() == Some(companion.as_str())) {
+                                    arr.push(json!(companion));
+                                }
+                            }
+                        }
                         if !alt_payload.is_empty() {
                             emit_term(&format!("  🔀 [ALTERNATE AXIS]\n{}", serde_json::to_string_pretty(&alt_payload).unwrap_or_default()));
                         }
                         obj.insert("alternates".to_string(), Value::Object(alt_payload));
 
-                        // 🌟 [UNASSIGNED RESCUE] 조건이 되지 못한 청크를 STAGE-3 이 FTS 검색어에 병합할 수 있도록 전달합니다.
                         if !unassigned_chunks.is_empty() {
                             emit_term(&format!("  🧷 [UNASSIGNED RESCUE] 조건 미확정 청크 {:?} 를 FTS 검색어로 보존합니다.", unassigned_chunks));
                         }
                         obj.insert("unassigned".to_string(), json!(unassigned_chunks.clone()));
 
-                        // 🌟 완전일치로 확정된 계절/시간 키를 STAGE-3 및 결정론 시간 가이드에 넘깁니다.
                         if !exact_season_key.is_empty() {
                             obj.insert("exact_season".to_string(), json!(exact_season_key.clone()));
                         }

@@ -17,6 +17,7 @@ pub mod translit;
 pub mod indexing;
 mod worker;
 mod entity;
+mod relay_ledger;
 pub mod trading;
 
 use crate::scheduler::translit::{generate_transliteration_aliases, transliterate_cross_language};
@@ -29,7 +30,7 @@ use crate::utils::json_utils::merge_node;
 use crate::js_templates::*;
 
 pub use worker::start_background_worker;
-pub use entity::{normalize_entity_key, entity_index, entity_id, entity_bcc};
+pub use entity::{normalize_entity_key, entity_index, entity_id, entity_bcc, entity_seed};
 
 pub static PROGRESS_TX: OnceCell<tokio::sync::mpsc::UnboundedSender<serde_json::Value>> = OnceCell::new();
 
@@ -5525,6 +5526,20 @@ pub async fn process_task(
                 let total_extracted_items = all_extracted_items.len();
                 let mut retry_count = 0usize;
                 let mut reject_count = 0usize;
+                let id_census = IdRoleCensus::build(&all_item_raw_lines);
+                let self_aliases = crate::logic::relay_type_aliases(&page_type);
+                let mut unique_rescued = 0usize;
+                let normalize_list_link = |raw: &str| -> String {
+                    match url::Url::parse(&url).ok().and_then(|base| base.join(raw).ok()) {
+                        Some(abs) => format!(
+                            "{}{}",
+                            abs.path(),
+                            abs.query().map(|q| format!("?{}", q)).unwrap_or_default()
+                        )
+                        .to_lowercase(),
+                        None => raw.to_string(),
+                    }
+                };
 
                 for item_idx in 0..total_extracted_items {
                     let (has_id, has_link) = {
@@ -5575,6 +5590,45 @@ pub async fn process_task(
                     }
 
                     
+                    if recovered.is_none() {
+                        if let Some(raw_lines) = all_item_raw_lines.get(item_idx) {
+                            let raw_refs: Vec<&str> = raw_lines.iter().map(|s| s.as_str()).collect();
+                            let cands = collect_id_link_candidates(&raw_refs);
+                            let mut ranked: Vec<(usize, f32)> = cands
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, c)| !c.is_host_part && id_census.row_unique(&c.role_phrase))
+                                .map(|(ci, c)| (ci, id_resource_affinity(&url, c, self_aliases) + 0.01 * c.prior))
+                                .collect();
+                            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                            if let Some(&(bi, top)) = ranked.first() {
+                                let contested = ranked.iter().skip(1).any(|(ci, s)| {
+                                    (top - *s).abs() < 1e-6 && !same_id_token(&cands[*ci].token, &cands[bi].token)
+                                });
+                                if contested {
+                                    crate::utils::score_dynamics::record_baseline("commerce.idlink_unique_contested", 1.0);
+                                    emit_term(&format!(
+                                        "      ⚖️ [ID/LINK ROW-UNIQUE CONTESTED] Item {}/{}: 행마다 값이 다른 식별 후보가 둘 이상이고 자기 자원 근거가 같아 고르지 않습니다. 틀린 자기 식별자는 서로 다른 문서를 한 행으로 합칩니다.",
+                                        item_idx + 1, total_extracted_items
+                                    ));
+                                } else {
+                                    let c = &cands[bi];
+                                    let (present, distinct) = id_census.coverage(&c.role_phrase);
+                                    unique_rescued += 1;
+                                    crate::utils::score_dynamics::record_baseline("commerce.idlink_unique_rescue", 1.0);
+                                    recovered = Some((
+                                        c.token.clone(),
+                                        normalize_list_link(&c.href),
+                                        format!(
+                                            "행 고유 식별자 (역할 '{}' · {}행 중 {}행 보유 · 값 {}종 전부 상이 · 자기 자원 근거 {:.2})",
+                                            c.role_phrase, id_census.rows, present, distinct, top
+                                        ),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
                     if recovered.is_none() {
                         if let Some((ref pat_prefix, ref pat_suffix)) = discovered_url_pattern {
                             let labeled = all_item_labeled_lines.get(item_idx).cloned().unwrap_or_default();
@@ -5650,6 +5704,117 @@ pub async fn process_task(
                         emit_term(&format!("  🔄 [ID/LINK RETRY] Item {}/{}: {} → \"id\": \"{}\", \"link\": \"{}\"", item_idx + 1, total_extracted_items, reason, found_id, constructed_link));
                     } else {
                         emit_term(&format!("  ⚪ [ID/LINK RETRY SKIP] Item {}/{}: 코사인 게이트를 통과한 식별자 후보가 없어 id/link 를 비워 둡니다. (잘못된 링크보다 빈 값이 안전합니다)", item_idx + 1, total_extracted_items));
+                    }
+                }
+
+                {
+                    let own_family = crate::utils::canonical::relay_type_family(&page_type);
+                    let related_types = crate::logic::related(&page_type);
+                    let relay_foreign: Vec<&str> = ["goods", "order", "tracking"]
+                        .iter()
+                        .copied()
+                        .filter(|t| *t != own_family.as_str() && related_types.iter().any(|r| r == t))
+                        .collect();
+                    let mut verify_swapped = 0usize;
+                    let mut relay_bound = 0usize;
+                    for item_idx in 0..total_extracted_items {
+                        let raw_lines = match all_item_raw_lines.get(item_idx) {
+                            Some(l) => l,
+                            None => continue,
+                        };
+                        let raw_refs: Vec<&str> = raw_lines.iter().map(|s| s.as_str()).collect();
+                        let cands = collect_id_link_candidates(&raw_refs);
+                        if cands.is_empty() {
+                            continue;
+                        }
+                        let mut self_token = all_extracted_items[item_idx]
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+
+                        if !self_token.is_empty() && id_census.rows >= 3 {
+                            let chosen: Vec<&IdLinkCandidate> = cands
+                                .iter()
+                                .filter(|c| same_id_token(&c.token, &self_token))
+                                .collect();
+                            let chosen_unique = chosen.iter().any(|c| id_census.row_unique(&c.role_phrase));
+                            if !chosen.is_empty() && !chosen_unique {
+                                let chosen_aff = chosen
+                                    .iter()
+                                    .map(|c| id_resource_affinity(&url, c, self_aliases))
+                                    .fold(0.0f32, f32::max);
+                                let mut alt: Vec<(usize, f32)> = cands
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, c)| !c.is_host_part && id_census.row_unique(&c.role_phrase))
+                                    .map(|(ci, c)| (ci, id_resource_affinity(&url, c, self_aliases)))
+                                    .collect();
+                                alt.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                                if let Some(&(ai, a_aff)) = alt.first() {
+                                    let contested = alt.iter().skip(1).any(|(ci, s)| {
+                                        (a_aff - *s).abs() < 1e-6 && !same_id_token(&cands[*ci].token, &cands[ai].token)
+                                    });
+                                    if a_aff > chosen_aff && !contested {
+                                        let c = &cands[ai];
+                                        emit_term(&format!(
+                                            "  🔁 [ID/LINK UNIQUE VERIFY] Item {}/{}: 코사인이 고른 '{}' 는 여러 행이 같은 값을 공유하는 역할이라 이 행 자신의 식별자가 아니라 다른 문서를 가리키는 참조입니다. 행 고유 역할 '{}' 의 '{}' 로 교체합니다. (자기 자원 근거 {:.2} > {:.2})",
+                                            item_idx + 1, total_extracted_items, self_token, c.role_phrase, c.token, a_aff, chosen_aff
+                                        ));
+                                        if let Some(obj) = all_extracted_items[item_idx].as_object_mut() {
+                                            obj.insert("id".to_string(), json!(c.token.clone()));
+                                            obj.insert("link".to_string(), json!(normalize_list_link(&c.href)));
+                                        }
+                                        self_token = c.token.clone();
+                                        verify_swapped += 1;
+                                        crate::utils::score_dynamics::record_baseline("commerce.idlink_unique_swap", 1.0);
+                                    }
+                                }
+                            }
+                        }
+
+                        if relay_foreign.is_empty() {
+                            continue;
+                        }
+                        for (ftype, token, role) in collect_typed_relay_refs(&cands, &self_token, &relay_foreign) {
+                            let key = match crate::utils::canonical::relay_key_for_type(&ftype) {
+                                Some(k) => k,
+                                None => continue,
+                            };
+                            let f_index = entity_index(&ftype, &team_id, &entity_seed(&task.cc, &token));
+                            if let Some(obj) = all_extracted_items[item_idx].as_object_mut() {
+                                let companion = format!("{}_title", key);
+                                let text_val = obj
+                                    .get(key)
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| crate::utils::canonical::relay_text_is_content(s));
+                                let companion_empty = obj
+                                    .get(&companion)
+                                    .and_then(|v| v.as_str())
+                                    .map_or(true, |s| s.trim().is_empty());
+                                if let Some(t) = text_val {
+                                    if companion_empty {
+                                        obj.insert(companion.clone(), json!(t));
+                                    }
+                                }
+                                obj.insert(key.to_string(), json!(f_index));
+                            }
+                            relay_bound += 1;
+                            emit_term(&format!(
+                                "  🔗 [RELAY REF BIND] Item {}/{}: {} ← '{}' (역할 '{}') → {}.{} = {} | 행에 인쇄된 상대 문서의 식별자로 상대 index 를 결정론으로 재현했습니다. 글자 값은 {}_title 로 옮겨 검색 문장은 그대로 유지합니다.",
+                                item_idx + 1, total_extracted_items, ftype, token, role, page_type, key, f_index, key
+                            ));
+                        }
+                    }
+                    crate::utils::score_dynamics::record_baseline("commerce.relay_ref_bound", relay_bound as f32);
+                    if unique_rescued > 0 || verify_swapped > 0 || relay_bound > 0 {
+                        emit_term(&format!(
+                            "  🧬 [ID/RELAY CENSUS] {}행 | 행 고유 역할 {:?} | 자기 식별자 복구 {}건 · 교체 {}건 | 상대 참조 결속 {}건",
+                            id_census.rows,
+                            id_census.roles.keys().filter(|r| id_census.row_unique(r)).collect::<Vec<_>>(),
+                            unique_rescued, verify_swapped, relay_bound
+                        ));
                     }
                 }
 
@@ -7795,7 +7960,7 @@ pub async fn process_task(
     
     
     
-    let index_val = entity_index(&page_type, &team_id, &id_val_raw);
+    let index_val = entity_index(&page_type, &team_id, &entity_seed(&task.cc, &id_val_raw));
     let generated_id = entity_id(&team_id, index_val);
 
     if let Some(obj) = extracted_data.as_object_mut() {
@@ -7812,6 +7977,8 @@ pub async fn process_task(
         store_guard.as_ref().ok_or_else(|| anyhow::anyhow!("Store not initialized"))?.clone()
     };
 
+    let mut stats_diff: std::collections::HashMap<String, (i64, i64, i64)> = std::collections::HashMap::new();
+
     if page_type == "order" {
         if let Some(goods_arr) = extracted_data.get("goods").and_then(|v| v.as_array()) {
             let cc_val = if is_detail { task.cc.to_uppercase() } else { task.cc.clone() };
@@ -7821,20 +7988,19 @@ pub async fn process_task(
                 let g_no = good.get("id").or_else(|| good.get("no")).and_then(|v| v.as_str()).unwrap_or("");
                 if !g_no.is_empty() {
                     let tracking_number = extracted_data.get("tracking_number").and_then(|v| v.as_str()).unwrap_or("");
-                    
-                    //
-                    
-                    
-                    
-                    
-                    
-                    
                     let clean_tracking_no = normalize_entity_key(tracking_number);
-                    let tracking_index = entity_index("tracking", &team_id, tracking_number);
-                    let goods_index = entity_index("goods", &team_id, g_no);
+                    if clean_tracking_no.is_empty() {
+                        emit_term(&format!(
+                            "  ⚪ [ORDER-ITEM BRIDGE SKIP] 주문 '{}' 은 송장번호가 비어 tracking 문서를 만들지 않습니다. 빈 값으로 index 를 만들면 송장 없는 모든 주문이 tracking 한 행으로 합쳐집니다. 상품 연결은 goods 배열 릴레이가 처리합니다.",
+                            id_val_raw
+                        ));
+                        break;
+                    }
+                    let tracking_index = entity_index("tracking", &team_id, &entity_seed(&task.cc, tracking_number));
+                    let goods_index = entity_index("goods", &team_id, &entity_seed(&task.cc, g_no));
                     let tracking_id = entity_id(&team_id, tracking_index);
                     let mut tracking_data = extracted_data.clone();
-                    
+
                     if let Some(obj) = tracking_data.as_object_mut() {
                         obj.insert("type".to_string(), json!("tracking"));
                         obj.insert("no".to_string(), json!(clean_tracking_no));
@@ -7842,20 +8008,28 @@ pub async fn process_task(
                         obj.insert("goods".to_string(), json!(goods_index));
                         obj.insert("order".to_string(), json!(index_val));
                     }
-                    
-                    
+
                     let tracking_text = parsing::json_to_natural_language(&tracking_data);
                     let masked_tracking_text = tracking_text.clone();
                     let tracking_vector = model.get_embedding(tracking_text.clone()).await.unwrap_or(vec![0.0; 384]);
-                    
+
                     tracking_data.as_object_mut().unwrap().insert("text".to_string(), json!(tracking_text));
                     tracking_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_tracking_text));
-                    
-                    
-                    
+
                     let tracking_bcc = entity_bcc("tracking", &cc_val);
-                    
+
                     let tracking_ref = crate::utils::hash::hash_id(&format!("{}{}{}", team_id, task.cc, task.r#ref));
+
+                    let tracking_prior = crate::utils::canonical::ledger_prior(
+                        store
+                            .get_item_by_id("tracking", &tracking_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .and_then(|d| serde_json::from_str::<serde_json::Value>(&d.json_data).ok())
+                            .as_ref(),
+                    );
+                    relay_ledger::add_delta(&mut stats_diff, "tracking", crate::utils::canonical::ledger_delta(tracking_prior, true));
 
                     save_item(&store, "tracking", &tracking_id, "tracking", tracking_data, Some(tracking_vector),
                         &task.from, &team_id, &task.cc, &tracking_bcc, &tracking_ref, None).await;
@@ -7880,47 +8054,27 @@ pub async fn process_task(
     let bcc = entity_bcc(&page_type, &cc_val);
     let ref_val = task.r#ref.clone();
     let mut items_to_process = Vec::new();
-    let mut stats_diff: std::collections::HashMap<String, (i64, i64, i64)> = std::collections::HashMap::new();
 
     if is_detail {
         
 
-        let fresh_keys: std::collections::HashSet<String> = extracted_data
-            .as_object()
-            .map(|o| {
-                o.iter()
-                    .filter(|(k, v)| !crate::utils::canonical::relay_value_is_placeholder(k, v))
-                    .map(|(k, _)| k.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
         let text_to_embed = extracted_data.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| parsing::json_to_natural_language(&extracted_data));
-        let item_digest = crate::utils::hash::digest(&text_to_embed); 
-        let mut target_id = generated_id.clone(); 
-        
+        let item_digest = crate::utils::hash::digest(&text_to_embed);
+        let mut target_id = generated_id.clone();
+
         let mut existing_vector = None;
-        let mut is_new = true;
-        let mut was_draft = false;
+        let mut existing_json_found: Option<serde_json::Value> = None;
 
-        
         if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &target_id).await {
-            is_new = false;
-            
-            
-            
-            
-            was_draft = existing_item.updated_at_ts == 0;
-
-            
             if let Ok(existing_json) = serde_json::from_str::<serde_json::Value>(&existing_item.json_data) {
                 let old_digest = existing_json.get("digest").and_then(|d| d.as_str()).unwrap_or("");
                 if old_digest == item_digest {
                     existing_vector = Some(existing_item.vector);
                 }
                 extracted_data = merge_node(&existing_json, &extracted_data);
+                existing_json_found = Some(existing_json);
             }
-        } 
-        
+        }
         else if !url.is_empty() {
             let normalized_link = if let Ok(parsed_url) = url::Url::parse(&url) {
                 format!("{}{}", parsed_url.path(), parsed_url.query().map(|q| format!("?{}", q)).unwrap_or_default()).to_lowercase()
@@ -7929,12 +8083,8 @@ pub async fn process_task(
             };
             if let Ok(Some((found_id, json_val))) = store.find_item_by_property(&target_table, "link", &json!(normalized_link)).await {
                 target_id = found_id.clone();
-                is_new = false;
 
                 if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &target_id).await {
-                    
-                    was_draft = existing_item.updated_at_ts == 0;
-
                     if let Ok(ej) = serde_json::from_str::<serde_json::Value>(&existing_item.json_data) {
                         let old_digest = ej.get("digest").and_then(|d| d.as_str()).unwrap_or("");
                         if old_digest == item_digest {
@@ -7946,34 +8096,21 @@ pub async fn process_task(
                 extracted_data = merge_node(&json_val, &extracted_data);
                 if let Some(obj) = extracted_data.as_object_mut() {
                     obj.insert("id".to_string(), json!(target_id.clone()));
+                    if let Some(found_index) = crate::utils::canonical::relay_ref_index(json_val.get("index")) {
+                        obj.insert("index".to_string(), json!(found_index));
+                    }
                 }
+                existing_json_found = Some(json_val);
             }
         }
 
-        if is_new {
-            let e = stats_diff.entry(page_type.clone()).or_insert((0, 0, 0));
-            e.1 += 1;
-            e.2 += 1;
-        } else if was_draft {
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            let e = stats_diff.entry(page_type.clone()).or_insert((0, 0, 0));
-            e.0 -= 1;
-            e.1 += 1;
-            e.2 += 1;
-            if let Some(obj) = extracted_data.as_object_mut() {
-                obj.insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
-            }
-        }
+        let self_prior = crate::utils::canonical::ledger_prior(existing_json_found.as_ref());
+        let self_delta = crate::utils::canonical::ledger_delta(self_prior, true);
+        relay_ledger::add_delta(&mut stats_diff, &page_type, self_delta);
+        emit_term(&format!(
+            "  📒 [RELAY LEDGER / SELF] {} '{}' 상세 문서 | 이전 상태 {:?} → count 확정 | 원장 변화 {:?}",
+            page_type, target_id, self_prior, self_delta
+        ));
 
         let vector = if let Some(v) = existing_vector {
             Some(v)
@@ -7984,408 +8121,26 @@ pub async fn process_task(
         
         
         
-        if page_type == "order" {
-            if let Some(tn_raw) = extracted_data.get("tracking_number")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()) 
-            {
-                if !tn_raw.trim().is_empty() {
-                    
-                    let clean_tn_pre = normalize_entity_key(&tn_raw);
-                    if !clean_tn_pre.is_empty() {
-                        let tracking_index_pre = entity_index("tracking", &team_id, &tn_raw);
-                        
-                        if let Some(obj) = extracted_data.as_object_mut() {
-                            obj.insert("tracking".to_string(), json!(tracking_index_pre));
-                        }
-                        
-                        emit_term(&format!("  🔑 [TRACKING INDEX PRE-COMPUTE] tracking_number '{}' → 정규화 '{}' → tracking index {} 사전 설정 완료.", tn_raw, clean_tn_pre, tracking_index_pre));
-                    }
-                }
-            }
+        if let Some(t_idx) = relay_ledger::bind_tracking_ref(&mut extracted_data, &page_type, &team_id, &task.cc) {
+            emit_term(&format!(
+                "  🔑 [TRACKING INDEX PRE-COMPUTE] 주문의 tracking 연결 index {} 확정. 송장번호로 index 를 만들 때 사이트 범위 시드를 함께 씁니다.",
+                t_idx
+            ));
         }
-
-        let related_types = crate::logic::related(&page_type);
-        for foreign_type in related_types {
-            if let Some((queries, merge_rule)) = crate::logic::relay(foreign_type, &extracted_data) {
-                for q in queries {
-                    if crate::utils::canonical::relay_key_is_empty(&q.value) {
-                        crate::utils::score_dynamics::record_baseline("commerce.relay_key_empty", 1.0);
-                        emit_term(&format!(
-                            "  ⚪ [RELAY KEY EMPTY] {} → {} 릴레이 조회 값이 비어 있어(0·빈 값·false) 조회와 초안 생성을 건너뜁니다. 비어 있는 값으로 index 를 조회하면 index 가 0 인 다른 문서가 걸립니다.",
-                            page_type, foreign_type
-                        ));
-                        continue;
-                    }
-                    match store.find_item_by_property("items", "index", &q.value).await {
-                        Ok(Some((foreign_id, mut foreign_data))) => {
-                            let was_foreign_draft = foreign_data.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) == 0;
-                            let mut needs_update = false;
-                            if foreign_id == target_id {
-                                continue;
-                            }
-                            if !crate::utils::canonical::relay_type_matches(foreign_type, &foreign_data) {
-                                crate::utils::score_dynamics::record_baseline("commerce.relay_type_guard", 1.0);
-                                emit_term(&format!(
-                                    "  🔀 [RELAY TYPE GUARD] {} → {} 릴레이 조회(index={})가 '{}' 타입 문서를 찾았습니다. 조회가 index 만 보고 타입을 보지 않아 생긴 교차 적중이라 병합하지 않습니다.",
-                                    page_type, foreign_type, q.value,
-                                    foreign_data.get("type").and_then(|v| v.as_str()).unwrap_or("")
-                                ));
-                                continue;
-                            }
-                            let foreign_is_draft = crate::store::is_relay_draft(&foreign_data);
-                            let mut own_log = crate::utils::canonical::RelayWriteLog::default();
-                            let mut far_log = crate::utils::canonical::RelayWriteLog::default();
-                            if let Some(update) = &merge_rule.update {
-                                for field in &update.includes {
-                                    if update.from == page_type {
-                                        if let Some(val) = extracted_data.get(field).cloned() {
-                                            if crate::utils::canonical::relay_write(&mut foreign_data, field, val, foreign_is_draft, &mut far_log) {
-                                                needs_update = true;
-                                            }
-                                        }
-                                    } else if update.to == page_type {
-                                        if let Some(val) = foreign_data.get(field).cloned() {
-                                            crate::utils::canonical::relay_write(&mut extracted_data, field, val, !fresh_keys.contains(field), &mut own_log);
-                                        }
-                                    }
-                                }
-                                if let Some(foreign_info) = &update.foreign {
-                                    if update.from == page_type {
-                                        if let Some(val) = extracted_data.get(&foreign_info.to).cloned() {
-                                            if crate::utils::canonical::relay_write(&mut foreign_data, &foreign_info.from, val, foreign_is_draft, &mut far_log) {
-                                                needs_update = true;
-                                            }
-                                        }
-                                    } else if update.to == page_type {
-                                        if let Some(val) = foreign_data.get(&foreign_info.to).cloned() {
-                                            crate::utils::canonical::relay_write(&mut extracted_data, &foreign_info.from, val, !fresh_keys.contains(&foreign_info.from), &mut own_log);
-                                        }
-                                    }
-                                }
-                            }
-
-
-                            if let Some(upsert) = &merge_rule.upsert {
-                                for field in &upsert.includes {
-                                    if upsert.from == page_type {
-                                        if let Some(val) = extracted_data.get(field).cloned() {
-                                            if crate::utils::canonical::relay_write(&mut foreign_data, field, val, foreign_is_draft, &mut far_log) {
-                                                needs_update = true;
-                                            }
-                                        }
-                                    } else if upsert.to == page_type {
-                                        if let Some(val) = foreign_data.get(field).cloned() {
-                                            crate::utils::canonical::relay_write(&mut extracted_data, field, val, !fresh_keys.contains(field), &mut own_log);
-                                        }
-                                    }
-                                }
-                            }
-                            if !own_log.kept.is_empty() || !far_log.kept.is_empty() {
-                                crate::utils::score_dynamics::record_baseline("commerce.relay_write_guard", (own_log.kept.len() + far_log.kept.len()) as f32);
-                                emit_term(&format!(
-                                    "  🛡️ [RELAY WRITE GUARD] {} ↔ {} (조회 값 {}) | {} 문서: 지킨 칸 {:?} · 채운 칸 {:?} | {} 문서: 지킨 칸 {:?} · 기록한 칸 {:?} | 식별자(id·index)는 릴레이로 바꾸지 않고, 값이 있는 연결 키(goods·order·tracking)도 유지합니다. 지금 처리 중인 문서는 이번 추출에서 읽은 값을 지키고 나머지 칸만 채우거나 갱신하며, 상대 문서는 릴레이 초안(updated_at 0·digest 빈 값·embed 아님)일 때만 기존 값을 갱신합니다.",
-                                    page_type, foreign_type, q.value, page_type, own_log.kept, own_log.written, foreign_type, far_log.kept, far_log.written
-                                ));
-                            }
-
-
-                            if needs_update {
-                                if was_foreign_draft && merge_rule.update.as_ref().map_or(false, |u| u.to == foreign_type) {
-                                    let e = stats_diff.entry(foreign_type.to_string()).or_insert((0, 0, 0));
-                                    e.0 -= 1;
-                                    e.1 += 1;
-                                    
-                                    e.2 += 1;
-                                    foreign_data.as_object_mut().unwrap().insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
-                                }
-                                let merged_text = parsing::json_to_natural_language(&foreign_data);
-                                let masked_merged_text = merged_text.clone();
-                                let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
-                                
-                                foreign_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
-                                foreign_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_merged_text));
-
-                                
-                                save_item(&store, &q.table, &foreign_id, foreign_type, foreign_data, Some(merged_vector),
-                                    &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
-                            }
-                        },
-                        Ok(None) => {
-                            
-                            
-                            
-                            
-                            
-                            
-                            
-                            
-                            
-                            
-                            
-                            
-                            
-                            let mut found_existing = false;
-                            if let Ok(cross_results) = store.get_all_items("items", 1, 0,
-                                Some(format!("type = '{}' AND data LIKE '%\"index\":{}%'", foreign_type, q.value))
-                            ).await {
-                                if !cross_results.is_empty() {
-                                    found_existing = true;
-                                    emit_term(&format!("  🔄 [RELAY DEDUP] 기존 {} 문서 발견 (index={}). 새 draft 생성을 건너뜁니다.", foreign_type, q.value));
-                                }
-                            }
-
-                            
-                            
-                            
-                            
-                            if !found_existing && (foreign_type == "goods" || foreign_type == "tracking") {
-                                if let Some(order_idx) = extracted_data.get("index") {
-                                    
-                                    
-                                    
-                                    
-                                    
-                                    
-                                    
-                                    let needle = crate::store::json_property_needle("order", order_idx);
-                                    let fallback_filter = format!("type = '{}' AND data LIKE '%{}%'", foreign_type, needle);
-                                    if let Ok(fallback_results) = store.get_all_items("items", 1, 0, Some(fallback_filter)).await {
-                                        if !fallback_results.is_empty() {
-                                            found_existing = true;
-                                            
-                                            
-                                            emit_term(&format!("  🔄 [RELAY ORDER-INDEX FALLBACK] needle '{}' 로 기존 {} 문서 발견. 새 draft 생성을 건너뜁니다.", needle, foreign_type));
-                                        }
-                                    }
-                                }
-                            }
-
-                            if !found_existing {
-                                let e = stats_diff.entry(foreign_type.to_string()).or_insert((0, 0, 0));
-                                e.0 += 1;
-                                e.2 += 1;
-                                let mut draft_data = json!({});
-                                let val_str = match &q.value {
-                                    serde_json::Value::String(s) => s.clone(),
-                                    serde_json::Value::Number(n) => n.to_string(),
-                                    _ => q.value.to_string(),
-                                };
-                                
-                                //
-                                
-                                
-                                
-                                
-                                
-                                
-                                
-                                
-                                
-                                let draft_index = entity_index(foreign_type, &team_id, &val_str);
-                                let draft_id = entity_id(&team_id, draft_index);
-                                
-                                
-                                
-                                let foreign_bcc = entity_bcc(foreign_type, &cc_val);
-                                if let Some(obj) = draft_data.as_object_mut() {
-                                    obj.insert("id".to_string(), json!(draft_id.clone()));
-                                    obj.insert("type".to_string(), json!(foreign_type));
-                                    
-                                    obj.insert("index".to_string(), json!(draft_index));
-                                    obj.insert(q.column.clone(), q.value.clone());
-                                    obj.insert("updated_at".to_string(), json!(0));
-                                    
-                                    
-                                    obj.insert("mode".to_string(), json!(search_mode.clone()));
-                                    
-                                    obj.insert("text".to_string(), json!(format!("{} {}", foreign_type, val_str)));
-                                }
-                                save_item(&store, &q.table, &draft_id, foreign_type, draft_data, None,
-                                    &task.from, &team_id, &task.cc, &foreign_bcc, &ref_val, None).await;
-                            }
-                        },
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-
-        if page_type == "order" {
-            if let Some(tn_raw) = extracted_data.get("tracking_number").and_then(|v| v.as_str()) {
-                if !tn_raw.trim().is_empty() {
-                    let clean_tn = crate::utils::hash::normalize_identifier(tn_raw);
-                    if !clean_tn.is_empty() {
-                        emit_term(&format!("  📦 [TRACKING RELAY] order 전처리에서 tracking_number '{}' 감지. tracking 테이블 역방향 쿼리 시작...", clean_tn));
-                        match store.find_item_by_property("tracking", "tracking_number", &json!(clean_tn)).await {
-                            Ok(Some((tracking_id, mut tracking_data))) => {
-
-                                let was_foreign_draft = tracking_data.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) == 0;
-                                let mut needs_update = false;
-
-                                for field in ["width", "height", "length", "weight"] {
-                                    if let Some(val) = extracted_data.get(field).cloned() {
-                                        let existing = tracking_data.get(field).and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                        if existing == 0.0 {
-                                            tracking_data.as_object_mut().unwrap().insert(field.to_string(), val);
-                                            needs_update = true;
-                                        }
-                                    }
-                                }
-
-                                if let Some(order_index) = extracted_data.get("index") {
-                                    if tracking_data.get("order").is_none() || tracking_data.get("order") == Some(&json!(0)) {
-                                        tracking_data.as_object_mut().unwrap().insert("order".to_string(), order_index.clone());
-                                        needs_update = true;
-                                    }
-                                }
-
-                                if let Some(tracking_index) = tracking_data.get("index").cloned() {
-                                    if extracted_data.get("tracking").is_none() || extracted_data.get("tracking") == Some(&json!(0)) {
-                                        extracted_data.as_object_mut().unwrap().insert("tracking".to_string(), tracking_index);
-                                    }
-                                }
-                                if needs_update {
-                                    if was_foreign_draft {
-                                        let e = stats_diff.entry("tracking".to_string()).or_insert((0, 0, 0));
-                                        e.0 -= 1;
-                                        e.1 += 1;
-                                        e.2 += 1;
-                                        tracking_data.as_object_mut().unwrap().insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
-                                    }
-                                    let merged_text = parsing::json_to_natural_language(&tracking_data);
-                                    let masked_merged_text = merged_text.clone();
-                                    let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
-                                    tracking_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
-                                    tracking_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_merged_text));
-                                    if tracking_data.get("mode").is_none() {
-                                        tracking_data.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
-                                    }
-                                    
-                                    save_item(&store, "tracking", &tracking_id, "tracking", tracking_data, Some(merged_vector),
-                                        &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
-                                    emit_term(&format!("  ✅ [TRACKING RELAY] 기존 tracking 문서 '{}'에 order.index 매핑 완료.", tracking_id));
-                                }
-                            },
-                            Ok(None) => {
-                                
-                                let mut found_existing_tracking = false;
-                                let tn_needle = format!("\"tracking_number\":\"{}\"", clean_tn.replace('\'', "''"));
-                                let tracking_cross_filter = format!("type = 'tracking' AND data LIKE '%{}%'", tn_needle);
-                                if let Ok(tracking_cross) = store.get_all_items("items", 1, 0, Some(tracking_cross_filter)).await {
-                                    if !tracking_cross.is_empty() {
-                                        found_existing_tracking = true;
-                                        let existing_tracking_id = &tracking_cross[0].id;
-                                        
-                                        if let Ok(Some(existing_data)) = store.get_item_by_id("tracking", existing_tracking_id).await {
-                                            if let Ok(mut ej) = serde_json::from_str::<serde_json::Value>(&existing_data.json_data) {
-                                                if ej.get("order").is_none() || ej.get("order") == Some(&json!(0)) {
-                                                    if let Some(order_index) = extracted_data.get("index") {
-                                                        ej.as_object_mut().unwrap().insert("order".to_string(), order_index.clone());
-                                                    }
-                                                    if let Some(tn_val) = extracted_data.get("tracking") {
-                                                        ej.as_object_mut().unwrap().insert("tracking".to_string(), tn_val.clone());
-                                                    }
-                                                    ej.as_object_mut().unwrap().insert("tracking_number".to_string(), json!(clean_tn.clone()));
-                                                    ej.as_object_mut().unwrap().insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
-                                                    let merged_text = crate::parsing::json_to_natural_language(&ej);
-                                                    let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
-                                                    ej.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
-                                                    ej.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text.clone()));
-                                                    if ej.get("mode").is_none() {
-                                                        ej.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
-                                                    }
-                                                    
-                                                    save_item(&store, "tracking", existing_tracking_id, "tracking", ej.clone(), Some(merged_vector),
-                                                        &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
-                                                }
-                                                if let Some(tracking_index) = ej.get("index").cloned() {
-                                                    extracted_data.as_object_mut().unwrap().insert("tracking".to_string(), tracking_index);
-                                                }
-                                            }
-                                        }
-                                        emit_term(&format!("  🔄 [TRACKING RELAY DEDUP] 기존 tracking 문서 '{}' 재사용 (tracking_number: {}). 새 draft 생성 건너뜀.", existing_tracking_id, clean_tn));
-                                    }
-                                }
-
-                                
-                                
-                                
-                                
-                                if !found_existing_tracking {
-                                    if let Some(order_index_val) = extracted_data.get("index") {
-                                        match store.find_item_by_property("tracking", "order", order_index_val).await {
-                                            Ok(Some((fallback_tid, mut fallback_tdata))) => {
-                                                found_existing_tracking = true;
-                                                let was_fb_draft = fallback_tdata.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) == 0;
-                                                if let Some(obj) = fallback_tdata.as_object_mut() {
-                                                    obj.insert("tracking_number".to_string(), json!(clean_tn.clone()));
-                                                    if let Some(tn_idx) = extracted_data.get("tracking") {
-                                                        obj.insert("tracking".to_string(), tn_idx.clone());
-                                                    }
-                                                    obj.insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
-                                                }
-                                                if was_fb_draft {
-                                                    let e = stats_diff.entry("tracking".to_string()).or_insert((0, 0, 0));
-                                                    e.0 -= 1;
-                                                    e.1 += 1;
-                                                }
-                                                let merged_text = crate::parsing::json_to_natural_language(&fallback_tdata);
-                                                let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
-                                                fallback_tdata.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
-                                                fallback_tdata.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text.clone()));
-                                                if fallback_tdata.get("mode").is_none() {
-                                                    fallback_tdata.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
-                                                }
-                                                
-                                                save_item(&store, "tracking", &fallback_tid, "tracking", fallback_tdata.clone(), Some(merged_vector),
-                                                    &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
-                                                if let Some(fb_tracking_index) = fallback_tdata.get("index").cloned() {
-                                                    extracted_data.as_object_mut().unwrap().insert("tracking".to_string(), fb_tracking_index);
-                                                }
-                                                emit_term(&format!("  🔄 [TRACKING RELAY ORDER-INDEX FALLBACK] order index로 기존 tracking 문서 '{}' 발견. tracking_number '{}' 매핑 완료. 새 draft 생성 건너뜀.", fallback_tid, clean_tn));
-                                            },
-                                            _ => {}
-                                        }
-                                    }
-                                }
-
-                                if !found_existing_tracking {
-                                    let e = stats_diff.entry("tracking".to_string()).or_insert((0, 0, 0));
-                                    e.0 += 1;
-                                    e.2 += 1;
-                                    
-                                    
-                                    
-                                    let tracking_index = entity_index("tracking", &team_id, &clean_tn);
-                                    let draft_id = entity_id(&team_id, tracking_index);
-                                    let tracking_bcc = entity_bcc("tracking", &cc_val);
-                                    let mut draft_data = json!({});
-                                    if let Some(obj) = draft_data.as_object_mut() {
-                                        obj.insert("id".to_string(), json!(draft_id.clone()));
-                                        obj.insert("type".to_string(), json!("tracking"));
-                                        obj.insert("tracking_number".to_string(), json!(clean_tn.clone()));
-                                        obj.insert("index".to_string(), json!(tracking_index));
-                                        if let Some(order_index) = extracted_data.get("index") {
-                                            obj.insert("order".to_string(), order_index.clone());
-                                        }
-                                        obj.insert("updated_at".to_string(), json!(0));
-                                        
-                                        obj.insert("mode".to_string(), json!(search_mode.clone()));
-                                        obj.insert("text".to_string(), json!(format!("tracking {}", clean_tn)));
-                                    }
-                                    extracted_data.as_object_mut().unwrap().insert("tracking".to_string(), json!(tracking_index));
-                                    save_item(&store, "tracking", &draft_id, "tracking", draft_data, None,
-                                        &task.from, &team_id, &task.cc, &tracking_bcc, &ref_val, None).await;
-                                    emit_term(&format!("  📝 [TRACKING RELAY] tracking draft '{}' 생성 (tracking_number: {}, index: {}).", draft_id, clean_tn, tracking_index));
-                                }
-                            },
-                            _ => {}
-                        }
-                    }
-                }
-            }
+        let detail_extra = relay_ledger::goods_array_refs(&mut extracted_data, &team_id, &task.cc);
+        let self_index = crate::utils::canonical::relay_ref_index(extracted_data.get("index")).unwrap_or(index_val);
+        {
+            let relay_env = relay_ledger::RelayEnv {
+                store: &store,
+                app_handle,
+                task_id: &task.id,
+                team_id: &team_id,
+                from: &task.from,
+                cc: &task.cc,
+                ref_val: &ref_val,
+                search_mode: &search_mode,
+            };
+            let _ = relay_ledger::bridge_relays(&relay_env, &page_type, &target_id, self_index, &mut extracted_data, &detail_extra, &mut stats_diff).await;
         }
 
         
@@ -8622,6 +8377,16 @@ pub async fn process_task(
     } else {
         
         if let Some(items) = extracted_data.get("items").and_then(|v| v.as_array()) {
+            let relay_env = relay_ledger::RelayEnv {
+                store: &store,
+                app_handle,
+                task_id: &task.id,
+                team_id: &team_id,
+                from: &task.from,
+                cc: &task.cc,
+                ref_val: &ref_val,
+                search_mode: &search_mode,
+            };
             for item_val in items.iter() {
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
@@ -8650,7 +8415,7 @@ pub async fn process_task(
                 } else {
                     original_id.clone()
                 };
-                let index_val = entity_index(&page_type, &team_id, &identity_seed);
+                let index_val = entity_index(&page_type, &team_id, &entity_seed(&task.cc, &identity_seed));
                 let hashed_item_id = entity_id(&team_id, index_val);
 
                 if let Some(obj) = single_item.as_object_mut() {
@@ -8658,383 +8423,86 @@ pub async fn process_task(
                     obj.insert("detail".to_string(), json!(false));
                     obj.insert("id".to_string(), json!(hashed_item_id.clone()));
                     obj.insert("index".to_string(), json!(index_val));
-                    
                     obj.insert("updated_at".to_string(), json!(0));
                 }
+                relay_ledger::bind_tracking_ref(&mut single_item, &page_type, &team_id, &task.cc);
 
-
-                let text_to_embed = single_item.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| parsing::json_to_natural_language(&single_item));
-                let item_digest = crate::utils::hash::digest(&text_to_embed);
-                
-                let mut existing_vector = None;
-                let mut is_new = true;
-
-
-                if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &hashed_item_id).await {
-                    is_new = false;
-
-                    
-                    if let Ok(ej) = serde_json::from_str::<serde_json::Value>(&existing_item.json_data) {
-                        let old_digest = ej.get("digest").and_then(|d| d.as_str()).unwrap_or("");
-                        if old_digest == item_digest {
-                            existing_vector = Some(existing_item.vector);
+                let existing_item = store.get_item_by_id(&target_table, &hashed_item_id).await.ok().flatten();
+                let existing_json: Option<serde_json::Value> = existing_item
+                    .as_ref()
+                    .and_then(|d| serde_json::from_str::<serde_json::Value>(&d.json_data).ok());
+                let self_prior = crate::utils::canonical::ledger_prior(existing_json.as_ref());
+                if let Some(ej) = existing_json.as_ref() {
+                    single_item = merge_node(ej, &single_item);
+                    if let Some(obj) = single_item.as_object_mut() {
+                        obj.insert("id".to_string(), json!(hashed_item_id.clone()));
+                        obj.insert("index".to_string(), json!(index_val));
+                        if ej.get("detail").map_or(false, |v| v.as_i64() == Some(1) || v.as_bool() == Some(true)) {
+                            obj.insert("detail".to_string(), json!(true));
                         }
                     }
                 }
 
-                if is_new {
-                    let e = stats_diff.entry(page_type.clone()).or_insert((0, 0, 0));
-                    e.0 += 1;
-                    e.2 += 1;
+                let bridge = relay_ledger::bridge_relays(&relay_env, &page_type, &hashed_item_id, index_val, &mut single_item, &[], &mut stats_diff).await;
+                let confirm = bridge.referenced || self_prior == crate::utils::canonical::LedgerPrior::Placeholder;
+                let self_delta = crate::utils::canonical::ledger_delta(self_prior, confirm);
+                relay_ledger::add_delta(&mut stats_diff, &page_type, self_delta);
+                let kept_ts = existing_json
+                    .as_ref()
+                    .and_then(|e| e.get("updated_at").and_then(|v| v.as_i64()))
+                    .filter(|t| *t > 0);
+                let self_ts = match kept_ts {
+                    Some(t) => t,
+                    None if confirm => chrono::Utc::now().timestamp_millis(),
+                    None => 0,
+                };
+                if let Some(obj) = single_item.as_object_mut() {
+                    obj.insert("updated_at".to_string(), json!(self_ts));
                 }
-                
+                emit_term(&format!(
+                    "  📒 [RELAY LEDGER / SELF] {} '{}' | 이전 상태 {:?} | 역방향 참조 {}건 | {} | 원장 변화 {:?}",
+                    page_type,
+                    hashed_item_id,
+                    self_prior,
+                    bridge.referrers,
+                    if self_ts > 0 { "count 확정" } else { "draft 유지 (목록 전용)" },
+                    self_delta
+                ));
+
+                let text_to_embed = if existing_json.is_some() {
+                    let mut text_view = single_item.clone();
+                    if let Some(o) = text_view.as_object_mut() {
+                        match item_val.get("id").filter(|v| !v.is_null()) {
+                            Some(raw_id) => {
+                                o.insert("id".to_string(), raw_id.clone());
+                            }
+                            None => {
+                                o.remove("id");
+                            }
+                        }
+                    }
+                    let merged_text = parsing::json_to_natural_language(&text_view);
+                    if let Some(obj) = single_item.as_object_mut() {
+                        obj.insert("text".to_string(), json!(merged_text.clone()));
+                        obj.insert("masked_text".to_string(), json!(merged_text.clone()));
+                    }
+                    merged_text
+                } else {
+                    single_item.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| parsing::json_to_natural_language(&single_item))
+                };
+                let item_digest = crate::utils::hash::digest(&text_to_embed);
+                let existing_vector = existing_item.as_ref().and_then(|doc| {
+                    let old_digest = existing_json
+                        .as_ref()
+                        .and_then(|e| e.get("digest").and_then(|d| d.as_str()))
+                        .unwrap_or("");
+                    if old_digest == item_digest { Some(doc.vector.clone()) } else { None }
+                });
                 let vector = if let Some(v) = existing_vector {
                     Some(v)
                 } else {
                     Some(model.get_embedding(text_to_embed).await?)
                 };
-
-                
-                let related_types = crate::logic::related(&page_type);
-                for foreign_type in related_types {
-                    if let Some((queries, merge_rule)) = crate::logic::relay(foreign_type, &single_item) {
-                        for q in queries {
-                            if crate::utils::canonical::relay_key_is_empty(&q.value) {
-                                crate::utils::score_dynamics::record_baseline("commerce.relay_key_empty", 1.0);
-                                emit_term(&format!(
-                                    "  ⚪ [RELAY KEY EMPTY] {} → {} 릴레이 조회 값이 비어 있어(0·빈 값·false) 조회와 초안 생성을 건너뜁니다. 비어 있는 값으로 index 를 조회하면 index 가 0 인 다른 문서가 걸립니다.",
-                                    page_type, foreign_type
-                                ));
-                                continue;
-                            }
-                            match store.find_item_by_property("items", "index", &q.value).await {
-                                Ok(Some((foreign_id, mut foreign_data))) => {
-                                    let mut needs_update = false;
-                                    if foreign_id == hashed_item_id {
-                                        continue;
-                                    }
-                                    if !crate::utils::canonical::relay_type_matches(foreign_type, &foreign_data) {
-                                        crate::utils::score_dynamics::record_baseline("commerce.relay_type_guard", 1.0);
-                                        emit_term(&format!(
-                                            "  🔀 [RELAY TYPE GUARD] {} → {} 릴레이 조회(index={})가 '{}' 타입 문서를 찾았습니다. 조회가 index 만 보고 타입을 보지 않아 생긴 교차 적중이라 병합하지 않습니다.",
-                                            page_type, foreign_type, q.value,
-                                            foreign_data.get("type").and_then(|v| v.as_str()).unwrap_or("")
-                                        ));
-                                        continue;
-                                    }
-                                    let foreign_is_draft = crate::store::is_relay_draft(&foreign_data);
-                                    let mut own_log = crate::utils::canonical::RelayWriteLog::default();
-                                    let mut far_log = crate::utils::canonical::RelayWriteLog::default();
-                                    if let Some(update) = &merge_rule.update {
-                                        for field in &update.includes {
-                                            if update.from == page_type {
-                                                if let Some(val) = single_item.get(field).cloned() {
-                                                    if crate::utils::canonical::relay_write(&mut foreign_data, field, val, foreign_is_draft, &mut far_log) {
-                                                        needs_update = true;
-                                                    }
-                                                }
-                                            } else if update.to == page_type {
-                                                if let Some(val) = foreign_data.get(field).cloned() {
-                                                    crate::utils::canonical::relay_write(&mut single_item, field, val, false, &mut own_log);
-                                                }
-                                            }
-                                        }
-                                        if let Some(foreign_info) = &update.foreign {
-                                            if update.from == page_type {
-                                                if let Some(val) = single_item.get(&foreign_info.to).cloned() {
-                                                    if crate::utils::canonical::relay_write(&mut foreign_data, &foreign_info.from, val, foreign_is_draft, &mut far_log) {
-                                                        needs_update = true;
-                                                    }
-                                                }
-                                            } else if update.to == page_type {
-                                                if let Some(val) = foreign_data.get(&foreign_info.to).cloned() {
-                                                    crate::utils::canonical::relay_write(&mut single_item, &foreign_info.from, val, false, &mut own_log);
-                                                }
-                                            }
-                                        }
-                                    }
-
-
-                                    if let Some(upsert) = &merge_rule.upsert {
-                                        for field in &upsert.includes {
-                                            if upsert.from == page_type {
-                                                if let Some(val) = single_item.get(field).cloned() {
-                                                    if crate::utils::canonical::relay_write(&mut foreign_data, field, val, foreign_is_draft, &mut far_log) {
-                                                        needs_update = true;
-                                                    }
-                                                }
-                                            } else if upsert.to == page_type {
-                                                if let Some(val) = foreign_data.get(field).cloned() {
-                                                    crate::utils::canonical::relay_write(&mut single_item, field, val, false, &mut own_log);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if !own_log.kept.is_empty() || !far_log.kept.is_empty() {
-                                        crate::utils::score_dynamics::record_baseline("commerce.relay_write_guard", (own_log.kept.len() + far_log.kept.len()) as f32);
-                                        emit_term(&format!(
-                                            "  🛡️ [RELAY WRITE GUARD] {} ↔ {} (조회 값 {}) | {} 문서: 지킨 칸 {:?} · 채운 칸 {:?} | {} 문서: 지킨 칸 {:?} · 기록한 칸 {:?} | 식별자(id·index)는 릴레이로 바꾸지 않고, 값이 있는 연결 키(goods·order·tracking)도 유지합니다. 지금 처리 중인 문서는 이번 추출에서 읽은 값을 지키고 나머지 칸만 채우거나 갱신하며, 상대 문서는 릴레이 초안(updated_at 0·digest 빈 값·embed 아님)일 때만 기존 값을 갱신합니다.",
-                                            page_type, foreign_type, q.value, page_type, own_log.kept, own_log.written, foreign_type, far_log.kept, far_log.written
-                                        ));
-                                    }
-
-                                    if needs_update {
-                                        let merged_text = parsing::json_to_natural_language(&foreign_data);
-                                        let masked_merged_text = merged_text.clone();
-                                        let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
-
-                                        foreign_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
-                                        foreign_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_merged_text));
-                                        if foreign_data.get("mode").is_none() {
-                                            foreign_data.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
-                                        }
-
-                                        
-                                        save_item(&store, &q.table, &foreign_id, foreign_type, foreign_data, Some(merged_vector),
-                                            &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
-                                    }
-                                },
-                                Ok(None) => {
-                                    
-                                    
-                                    let mut found_existing = false;
-                                    let val_str_for_search = match &q.value {
-                                        serde_json::Value::String(s) => s.clone(),
-                                        serde_json::Value::Number(n) => n.to_string(),
-                                        _ => q.value.to_string(),
-                                    };
-                                    if !val_str_for_search.is_empty() {
-                                        
-                                        
-                                        
-                                        let needle = crate::store::json_property_needle(&q.column, &q.value);
-                                        let cross_filter = format!("type = '{}' AND data LIKE '%{}%'", foreign_type, needle);
-                                        if let Ok(cross_results) = store.get_all_items("items", 1, 0, Some(cross_filter)).await {
-                                            if !cross_results.is_empty() {
-                                                found_existing = true;
-                                                emit_term(&format!("  🔄 [RELAY DEDUP] 기존 {} 문서 발견 ({}='{}'). 새 draft 생성을 건너뜁니다.", foreign_type, q.column, val_str_for_search));
-                                            }
-                                        }
-                                    }
-
-                                    
-                                    if !found_existing && (foreign_type == "goods" || foreign_type == "tracking") {
-                                        if let Some(order_idx) = single_item.get("index") {
-                                            
-                                            
-                                            let needle = crate::store::json_property_needle("order", order_idx);
-                                            let fallback_filter = format!("type = '{}' AND data LIKE '%{}%'", foreign_type, needle);
-                                            if let Ok(fallback_results) = store.get_all_items("items", 1, 0, Some(fallback_filter)).await {
-                                                if !fallback_results.is_empty() {
-                                                    found_existing = true;
-                                                    emit_term(&format!("  🔄 [RELAY ORDER-INDEX FALLBACK] needle '{}' 로 기존 {} 문서 발견. 새 draft 생성을 건너뜁니다.", needle, foreign_type));
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    if !found_existing {
-                                        let e = stats_diff.entry(foreign_type.to_string()).or_insert((0, 0, 0));
-                                        e.0 += 1;
-                                        e.2 += 1;
-                                        let mut draft_data = json!({});
-                                        let val_str = match &q.value {
-                                            serde_json::Value::String(s) => s.clone(),
-                                            serde_json::Value::Number(n) => n.to_string(),
-                                            _ => q.value.to_string(),
-                                        };
-                                        
-                                        
-                                        let draft_index = entity_index(foreign_type, &team_id, &val_str);
-                                        let draft_id = entity_id(&team_id, draft_index);
-                                        let foreign_bcc = entity_bcc(foreign_type, &cc_val);
-                                        if let Some(obj) = draft_data.as_object_mut() {
-                                            obj.insert("id".to_string(), json!(draft_id.clone()));
-                                            obj.insert("type".to_string(), json!(foreign_type));
-                                            obj.insert("index".to_string(), json!(draft_index));
-                                            obj.insert(q.column.clone(), q.value.clone());
-                                            obj.insert("updated_at".to_string(), json!(0));
-                                            obj.insert("mode".to_string(), json!(search_mode.clone()));
-                                            obj.insert("text".to_string(), json!(format!("{} {}", foreign_type, val_str)));
-                                        }
-                                        save_item(&store, &q.table, &draft_id, foreign_type, draft_data, None,
-                                            &task.from, &team_id, &task.cc, &foreign_bcc, &ref_val, None).await;
-                                    }
-                                },
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-
-                if page_type == "order" {
-                    if let Some(tn_raw) = single_item.get("tracking_number").and_then(|v| v.as_str()) {
-                        if !tn_raw.trim().is_empty() {
-                            let clean_tn = crate::utils::hash::normalize_identifier(tn_raw);
-                            if !clean_tn.is_empty() {
-                                emit_term(&format!("  📦 [TRACKING RELAY] order 리스트 아이템에서 tracking_number '{}' 감지. tracking 테이블 역방향 쿼리 시작...", clean_tn));
-                                match store.find_item_by_property("tracking", "tracking_number", &json!(clean_tn)).await {
-                                    Ok(Some((tracking_id, mut tracking_data))) => {
-
-                                        let was_foreign_draft = tracking_data.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) == 0;
-                                        let mut needs_update = false;
-
-                                        for field in ["width", "height", "length", "weight"] {
-                                            if let Some(val) = single_item.get(field).cloned() {
-                                                let existing = tracking_data.get(field).and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                                if existing == 0.0 {
-                                                    tracking_data.as_object_mut().unwrap().insert(field.to_string(), val);
-                                                    needs_update = true;
-                                                }
-                                            }
-                                        }
-
-                                        if let Some(order_index) = single_item.get("index") {
-                                            if tracking_data.get("order").is_none() || tracking_data.get("order") == Some(&json!(0)) {
-                                                tracking_data.as_object_mut().unwrap().insert("order".to_string(), order_index.clone());
-                                                needs_update = true;
-                                            }
-                                        }
-
-                                        if let Some(tracking_index) = tracking_data.get("index").cloned() {
-                                            if single_item.get("tracking").is_none() || single_item.get("tracking") == Some(&json!(0)) {
-                                                single_item.as_object_mut().unwrap().insert("tracking".to_string(), tracking_index);
-                                            }
-                                        }
-                                        if needs_update {
-                                            if was_foreign_draft {
-                                                let e = stats_diff.entry("tracking".to_string()).or_insert((0, 0, 0));
-                                                e.0 -= 1;
-                                                e.1 += 1;
-                                                e.2 += 1;
-                                                tracking_data.as_object_mut().unwrap().insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
-                                            }
-                                            let merged_text = parsing::json_to_natural_language(&tracking_data);
-                                            let masked_merged_text = merged_text.clone();
-                                            let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
-                                            tracking_data.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
-                                            tracking_data.as_object_mut().unwrap().insert("masked_text".to_string(), json!(masked_merged_text));
-                                            
-                                            if tracking_data.get("mode").is_none() {
-                                                tracking_data.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
-                                            }
-                                            save_item(&store, "tracking", &tracking_id, "tracking", tracking_data, Some(merged_vector),
-                                                &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
-                                            emit_term(&format!("  ✅ [TRACKING RELAY] 기존 tracking 문서 '{}'에 order.index 매핑 완료.", tracking_id));
-                                        }
-                                    },
-                                    Ok(None) => {
-                                        
-                                        let mut found_existing_tracking = false;
-                                        let tn_needle = format!("\"tracking_number\":\"{}\"", clean_tn.replace('\'', "''"));
-                                        let tracking_cross_filter = format!("type = 'tracking' AND data LIKE '%{}%'", tn_needle);
-                                        if let Ok(tracking_cross) = store.get_all_items("items", 1, 0, Some(tracking_cross_filter)).await {
-                                            if !tracking_cross.is_empty() {
-                                                found_existing_tracking = true;
-                                                let existing_tracking_id = &tracking_cross[0].id;
-                                                if let Ok(Some(existing_data)) = store.get_item_by_id("tracking", existing_tracking_id).await {
-                                                    if let Ok(mut ej) = serde_json::from_str::<serde_json::Value>(&existing_data.json_data) {
-                                                        if ej.get("order").is_none() || ej.get("order") == Some(&json!(0)) {
-                                                            if let Some(order_index) = single_item.get("index") {
-                                                                ej.as_object_mut().unwrap().insert("order".to_string(), order_index.clone());
-                                                            }
-                                                            if let Some(tn_val) = single_item.get("tracking") {
-                                                                ej.as_object_mut().unwrap().insert("tracking".to_string(), tn_val.clone());
-                                                            }
-                                                            ej.as_object_mut().unwrap().insert("tracking_number".to_string(), json!(clean_tn.clone()));
-                                                            ej.as_object_mut().unwrap().insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
-                                                            let merged_text = crate::parsing::json_to_natural_language(&ej);
-                                                            let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
-                                                            ej.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
-                                                            ej.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text.clone()));
-                                                            if ej.get("mode").is_none() {
-                                                                ej.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
-                                                            }
-                                                            
-                                                            save_item(&store, "tracking", existing_tracking_id, "tracking", ej.clone(), Some(merged_vector),
-                                                                &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
-                                                        }
-                                                        if let Some(tracking_index) = ej.get("index").cloned() {
-                                                            single_item.as_object_mut().unwrap().insert("tracking".to_string(), tracking_index);
-                                                        }
-                                                    }
-                                                }
-                                                emit_term(&format!("  🔄 [TRACKING RELAY DEDUP] 기존 tracking 문서 '{}' 재사용 (tracking_number: {}). 새 draft 생성 건너뜀.", existing_tracking_id, clean_tn));
-                                            }
-                                        }
-
-                                        
-                                        if !found_existing_tracking {
-                                            if let Some(order_index_val) = single_item.get("index") {
-                                                match store.find_item_by_property("tracking", "order", order_index_val).await {
-                                                    Ok(Some((fallback_tid, mut fallback_tdata))) => {
-                                                        found_existing_tracking = true;
-                                                        let was_fb_draft = fallback_tdata.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0) == 0;
-                                                        if let Some(obj) = fallback_tdata.as_object_mut() {
-                                                            obj.insert("tracking_number".to_string(), json!(clean_tn.clone()));
-                                                            if let Some(tn_idx) = single_item.get("tracking") {
-                                                                obj.insert("tracking".to_string(), tn_idx.clone());
-                                                            }
-                                                            obj.insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
-                                                        }
-                                                        if was_fb_draft {
-                                                            let e = stats_diff.entry("tracking".to_string()).or_insert((0, 0, 0));
-                                                            e.0 -= 1;
-                                                            e.1 += 1;
-                                                        }
-                                                        let merged_text = crate::parsing::json_to_natural_language(&fallback_tdata);
-                                                        let merged_vector = model.get_embedding(merged_text.clone()).await.unwrap_or(vec![0.0; 384]);
-                                                        fallback_tdata.as_object_mut().unwrap().insert("text".to_string(), json!(merged_text));
-                                                        fallback_tdata.as_object_mut().unwrap().insert("masked_text".to_string(), json!(merged_text.clone()));
-                                                        if fallback_tdata.get("mode").is_none() {
-                                                            fallback_tdata.as_object_mut().unwrap().insert("mode".to_string(), json!(search_mode.clone()));
-                                                        }
-                                                        
-                                                        save_item(&store, "tracking", &fallback_tid, "tracking", fallback_tdata.clone(), Some(merged_vector),
-                                                            &task.from, &team_id, &task.cc, &bcc, &ref_val, None).await;
-                                                        if let Some(fb_tracking_index) = fallback_tdata.get("index").cloned() {
-                                                            single_item.as_object_mut().unwrap().insert("tracking".to_string(), fb_tracking_index);
-                                                        }
-                                                        emit_term(&format!("  🔄 [TRACKING RELAY ORDER-INDEX FALLBACK] order index로 기존 tracking 문서 '{}' 발견. tracking_number '{}' 매핑 완료. 새 draft 생성 건너뜀.", fallback_tid, clean_tn));
-                                                    },
-                                                    _ => {}
-                                                }
-                                            }
-                                        }
-
-                                        if !found_existing_tracking {
-                                            let e = stats_diff.entry("tracking".to_string()).or_insert((0, 0, 0));
-                                            e.0 += 1;
-                                            e.2 += 1;
-                                            
-                                            let tracking_index = entity_index("tracking", &team_id, &clean_tn);
-                                            let draft_id = entity_id(&team_id, tracking_index);
-                                            let tracking_bcc = entity_bcc("tracking", &cc_val);
-                                            let mut draft_data = json!({});
-                                            if let Some(obj) = draft_data.as_object_mut() {
-                                                obj.insert("id".to_string(), json!(draft_id.clone()));
-                                                obj.insert("type".to_string(), json!("tracking"));
-                                                obj.insert("tracking_number".to_string(), json!(clean_tn.clone()));
-                                                obj.insert("index".to_string(), json!(tracking_index));
-                                                if let Some(order_index) = single_item.get("index") {
-                                                    obj.insert("order".to_string(), order_index.clone());
-                                                }
-                                                obj.insert("updated_at".to_string(), json!(0));
-                                                obj.insert("mode".to_string(), json!(search_mode.clone()));
-                                                obj.insert("text".to_string(), json!(format!("tracking {}", clean_tn)));
-                                            }
-                                            single_item.as_object_mut().unwrap().insert("tracking".to_string(), json!(tracking_index));
-                                            save_item(&store, "tracking", &draft_id, "tracking", draft_data, None,
-                                                &task.from, &team_id, &task.cc, &tracking_bcc, &ref_val, None).await;
-                                            emit_term(&format!("  📝 [TRACKING RELAY] tracking draft '{}' 생성 (tracking_number: {}, index: {}).", draft_id, clean_tn, tracking_index));
-                                        }
-                                    },
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                }
 
                 
                 save_item(&store, &target_table, &hashed_item_id, &page_type, single_item.clone(), vector,

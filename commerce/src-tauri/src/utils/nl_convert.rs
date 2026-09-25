@@ -54,7 +54,10 @@ pub fn json_to_natural_language(json_val: &serde_json::Value) -> String {
                         continue;
                     }
 
-                    let clean_key = key.replace("_", " ");
+                    let clean_key = match crate::utils::canonical::relay_companion_base(key) {
+                        Some(base) => base.to_string(),
+                        None => key.replace("_", " "),
+                    };
 
                     if v.is_object() || v.is_array() {
                         parse_node(v, &clean_key, sentences);

@@ -52,7 +52,7 @@ scripts/workers-diff/       차분 시험대 (아래)
 | linkedom 대조 (`workers/proxy/tests/dom_vectors.rs`) | Pug 452/452 바이트 동일, 선택자 31,027/31,027 (SyntheticData 화면 96 · 경계 56 · 무작위 300). 따로 무작위 6,000 문서도 100 % |
 | pako 대조 (`workers/common/tests/pako_array.rs`) | 430 경우 (93 던짐) 모두 같음 |
 | `cargo test`(common · proxy), `cargo check --target wasm32-unknown-unknown` | 통과, 경고 없음 |
-| 차분 시험 commerce (`node commerce.mjs`) | 고치기 전 원본과 28/28 (370d67a3), 고친 원본과 57/57 (fix-member-per-page 를 빼면 perpage_* 넷만 DIFF — 그때는 위에 덧댄 다섯도 함께 뺌, fix-member-sync-scope 를 빼면 scope_member_a · scope_site_member 와 멤버 동기화가 바뀐 invite_login · perpage_invited · perpage_revoke 만, fix-member-app-link 를 빼면 applink_member_a 만, fix-member-id-override 를 빼면 idoverride_member_a 만, fix-member-task-team-leak 을 빼면 taskleak_member_a 만, fix-member-page-list 를 빼면 팀장이 아닌 사람의 JSON GET 이 있는 perpage_invited · perpage_app_old_member · perpage_revoke · scope_member_a · idoverride_member_a · taskleak_member_a 만 DIFF) — 응답(상태 · 머리글 · Set-Cookie · 본문) · S3 요청(서명은 aws4fetch 로 다시 계산해 확인) · D1 · S3 끝 상태 |
+| 차분 시험 commerce (`node commerce.mjs`) | 고치기 전 원본과 28/28 (370d67a3), 고친 원본과 59/59 (fix-member-per-page 를 빼면 perpage_* 넷만 DIFF — 그때는 위에 덧댄 여섯도 함께 뺌, fix-member-search-answers 를 빼면 searchans_member_home 만, fix-member-sync-scope 를 빼면 scope_member_a · scope_site_member 와 멤버 동기화가 바뀐 invite_login · perpage_invited · perpage_revoke 만, fix-member-app-link 를 빼면 applink_member_a 만, fix-member-id-override 를 빼면 idoverride_member_a 만, fix-member-task-team-leak 을 빼면 taskleak_member_a 만, fix-member-page-list 를 빼면 팀장이 아닌 사람의 JSON GET 이 있는 perpage_invited · perpage_app_old_member · perpage_revoke · scope_member_a · idoverride_member_a · taskleak_member_a 만 DIFF) — 응답(상태 · 머리글 · Set-Cookie · 본문) · S3 요청(서명은 aws4fetch 로 다시 계산해 확인) · D1 · S3 끝 상태 |
 | 차분 시험 trading (`node trading.mjs`) | 고치기 전 원본과 41/41 (370d67a3), 고친 원본과 58/58 |
 | `wrangler deploy --dry-run` (두 워커) | 빌드 · 바인딩 확인 통과. proxy 2,547 KiB (gzip 889 KiB), apac 419 KiB (gzip 166 KiB) |
 
@@ -116,9 +116,8 @@ Vectorize 필터는 키끼리 AND 라 "cc ∈ … 또는 bcc ∈ …" 를 한 �
 (조건 SQL 은 범위를 먼저 걸고 LIMIT 300 이라 이 문제가 없음). search_scope_member 시나리오가 그 경우를 보입니다(팀 공통 행 SH1 이 상위 5 밖이라 벡터 결과에 없고 SQL 결과에는 있음).
 cc · bcc 메타데이터 색인을 만든 뒤에는 Vectorize 필터(`bcc: {$in}` 과 `cc: {$in}` 두 번)로 옮길 수 있습니다.
 
-남은 것: 팀장이 팀 공통 페이지(홈)에서 한 검색의 답은 팀 전체에서 찾은 것이고, 그 대화 행(`from` = 팀 · `to` = 작업 bcc('') · `cc` = homeCc)에 검색한 사람이 남지 않아
-commerce 동기화는 팀 공통으로 멤버에게도 줍니다(`search` 칸은 지우지만 `markdown` · `results` 는 남음). 팀장의 쓰기를 그대로 두라는 조건 때문에 이번에 바꾸지 않았습니다 —
-답 대화에 검색한 사람을 남기거나(proxy), commerce 가 답 대화의 id(= 작업 id)로 작업의 `from` 을 찾아 팀장이 아닌 사람에게는 자기 검색의 답만 주는 방법이 있습니다.
+팀장이 팀 공통 페이지(홈)에서 한 검색의 답은 팀 전체에서 찾은 것이고 그 대화 행에 검색한 사람이 남지 않습니다 — 이것은 commerce 쪽
+fix-member-search-answers 가 막습니다(proxy 의 쓰기는 그대로, 아래 "페이지별 멤버").
 
 ## trading (trading-logis-center 65684e6) 고친 버그
 
@@ -189,6 +188,7 @@ BUG-TR-2(`it.fails`)는 커서 꼴(시각 + id)을 바꿔야 해 그대로 둡�
 | fix-member-app-link | 1561 · 1998~ | 앱 추출은 요청 href 가 proxy_fetch 의 기본값(console — 팀 공통)이라 봉투 link 의 가게 페이지에 팀원 누구나 작업을 넣었고, 팀 공통이 homeCc 의 아무 호스트(`*.logis.center`)였음 → link 가 http(s) 면 그 페이지로 판정, 팀 공통은 logis.center · commerce · console 호스트만 |
 | fix-member-id-override | 1020 · 1561 | `?id=` 가 판정할 페이지를 골라, 그 주소에 아이템이 없으면 A 의 멤버가 `?id=A` 로 B 의 주소에 작업 · 대화를 넣었음 → 팀장이 아니면 href 의 페이지도 멤버여야 |
 | fix-member-task-team-leak | 2564 | proxy 가 처리한 작업의 data 에 팀 행 통째(base.pages 포함)를 써, 동기화의 내 작업으로 팀장이 아닌 멤버가 그것을 받았음 → 팀장이 아니면 작업 data 에서 `team` 을 뺌 |
+| fix-member-search-answers | 2584 | proxy 검색의 답 대화(`from` = 팀, 검색한 사람이 없음)가 팀 공통 홈에 쌓여 팀장의 답(팀 전체에서 찾음)까지 팀원에게 실렸음 → 팀장이 아니면 원래 작업(ref · updated_at 으로 이음)이 그 사람의 것인 답만 |
 | fix-member-page-list | 1145 · 1256 · 2857 | 응답의 페이지 목록이 팀장이 아니어도 팀 · cc 의 모든 페이지 행(셀렉터 · 주소)이었음 → 팀장이 아니면 동기화 범위 안의 페이지만 |
 
 멤버 초대(사용자 결정: 대기 초대 → 첫 로그인 때 확정):
@@ -272,13 +272,19 @@ BUG-TR-2(`it.fails`)는 커서 꼴(시각 + id)을 바꿔야 해 그대로 둡�
   `member` 와 무관하게 거릅니다.
 - 그 밖에 동기화가 팀장이 아닌 사람에게 주는 팀 단위 값(살펴보고 그대로 둔 것): 팀 사용자 목록(1088 — 팀 행 · 팀원 행, data 는 지우고 name 만, 팀원 관리 화면용),
   `cookies` 의 개수(goods · order · tracking · event · coupon — 팀 합계, fix-member-per-page 에서 그대로 두기로 함). 힌트 · 상세 · 1132 의 아이템은 범위 안입니다.
-  **proxy 의 클라우드 검색 답**은 고치지 못했습니다: proxy search 는 Vectorize 를 `{type, to: 팀}` 으로만 걸러 팀의 모든 페이지에서 찾고, 그 답(`markdown` · `results`,
-  행의 from · to · cc · bcc 는 지움)을 대화 행(`cc` = 작업의 cc — 앱 검색이면 homeCc, `ref` = 작업 ref)으로 씁니다. 동기화는 그 대화의 `search` 만 지우므로,
-  팀 공통 홈에서 검색한 답은 범위(cc = homeCc)에 들어 A 의 멤버에게도 B 의 아이템을 담아 보입니다. 답 안의 행에 페이지 열이 남지 않아 commerce 쪽에서는 거를 수 없고,
-  proxy 가 검색 필터에 그 사람의 범위(bcc · cc)를 넣어야 합니다.
-- 원본 쪽 패치는 서로 위에 덧댑니다: `COMMERCE_SKIP=fix-member-per-page` 는 그 위의 다섯(`fix-member-sync-scope` · `fix-member-app-link` · `fix-member-id-override` ·
-  `fix-member-task-team-leak` · `fix-member-page-list`)과 함께, `fix-member-app-link` 는 `fix-member-id-override` 와 함께, `fix-member-sync-scope` 는
-  `fix-member-task-team-leak` · `fix-member-page-list` 와 함께 줘야 합니다(그 둘이 `memberScope` · `memberSyncScope` 를 씀).
+  proxy 의 클라우드 검색은 팀장이 아니면 그 사람의 범위에서만 찾습니다(proxy 의 fix-search-member-scope).
+- 검색의 답(fix-member-search-answers): proxy 는 검색의 답을 대화 행(`id` = 문맥 id(무작위) · `from` = 팀 · `to` = 작업 bcc('') · `cc` = 작업 cc · `ref` = task.ref ·
+  data = `{id, markdown, results, search}` · `created_at` = now)으로 쓰고, 검색한 사람은 남기지 않습니다(작업 id 의 대화 행은 epilogue 가 `from` = 검색한 사람의
+  글 대화로 덮음). 팀 공통 홈의 답은 범위(cc = homeCc)에 들고 이 주소의 대화(2584, ref = itemId = 홈의 task.ref)로 실려, 팀장의 답(팀 전체에서 찾은 것)이 팀원에게도 갔습니다.
+  팀장의 쓰기는 그대로 두고 commerce 에서 거릅니다: 팀장이 아니면 그 질의의 행 가운데 `from` = 팀이고 data 를 풀어 `search` 가 있는 것(검색의 답 — PUT 대화 ·
+  epilogue 대화에는 없음)을 원래 작업으로 잇습니다. 작업 id 는 답에 없어서, proxy 가 같은 now 로 쓰는 두 값 — 답의 `ref` = 작업의 `ref`, 답의 `created_at` =
+  작업의 `updated_at`(epilogue 의 `UPDATE tasks SET data, updated_at = now`) — 으로 지역 DB 의 tasks 를 한 번(`"to"` = 팀 · `"ref"` IN json_each) 읽어 맞춥니다.
+  맞는 작업이 없거나 하나라도 그 사람의 것이 아니면 뺍니다(`fixes.rs::foreign_search_answers`). 행을 읽은 뒤 거르므로 `LIMIT 10` 이 남의 답으로 차면 그만큼 덜 실립니다
+  (답 행만으로는 검색한 사람을 SQL 에서 가릴 수 없음 — tasks 는 다른 DB). `cookies.talks`(같은 주소의 대화 수, 2609 의 COUNT)는 남의 답까지 셉니다.
+  작업 행을 지우면(DELETE `?type=crons`) 그 답은 팀원에게서 빠집니다.
+- 원본 쪽 패치는 서로 위에 덧댑니다: `COMMERCE_SKIP=fix-member-per-page` 는 그 위의 여섯(`fix-member-sync-scope` · `fix-member-app-link` · `fix-member-id-override` ·
+  `fix-member-task-team-leak` · `fix-member-page-list` · `fix-member-search-answers`)과 함께, `fix-member-app-link` 는 `fix-member-id-override` 와 함께,
+  `fix-member-sync-scope` 는 `fix-member-task-team-leak` · `fix-member-page-list` · `fix-member-search-answers` 와 함께 줘야 합니다(`memberScope` · `memberSyncScope` 를 씀).
 
 고치지 않고 적어 둔 것: `cookies.hash` 를 S3 경로에 검증 없이 씀, 홈 id 를 대문자 cc 로 만들어 `pageId` 와 같아지지 않음(클라우드 검색만 보정),
 `?created_at=%20` 의 NaN 이 SQL 로(418), 1474~1558 의 페이지 트리는 결과를 버리는 죽은 코드, POST 가 sender · 잔액 없으면 빈 418,

@@ -441,9 +441,20 @@ async fn member_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
     all_into(ctx, stmt).await?;
 
     if ctx.results.length()?.truthy() {
+        // 고침 (fix-member-search-answers): 팀장이 아니면 남의 검색 답(팀 공통 페이지에 쌓인 proxy 검색의 답 — 검색한 사람이 행에 없음)은 싣지 않는다
+        let foreign = if scope.is_some() {
+            crate::fixes::foreign_search_answers(env, &ctx.logisRegion.to_key(), &ctx.results, &cookies.g("team")?, &cookies.g("address")?).await?
+        } else {
+            Vec::new()
+        };
+
         ctx.i = V::Num(0.0);
         while below_len(&ctx.i, &ctx.results)? {
             ctx.talk = ctx.results.gk(&ctx.i)?;
+            if ctx.talk.get("id").as_str().is_some_and(|id| foreign.iter().any(|f| f == id)) {
+                ctx.i = inc(&ctx.i);
+                continue;
+            }
             ctx.talk.s_("table", V::from("talks"))?;
 
             // 2596 — 원본은 pako.ungzip(숫자 배열) (session.rs 와 같이 공용 ungzip 으로 푼다)

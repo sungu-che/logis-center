@@ -1597,3 +1597,83 @@ console.log(`[API-DEBUG] 클라이언트(Client)로 반환하는 데이터 통�
 
 					console.log(`[API-DEBUG] 클라이언트(Client)로 반환하는 데이터 통계`);
 >>>
+
+=====================================================================================================================
+fix-member-search-answers: proxy 검색의 답은 대화 행(from = 팀 · to = 작업 bcc('') · cc = 작업 cc · ref = task.ref · data 에 search)으로 쌓이고 검색한 사람이
+남지 않아, 팀 공통 페이지(홈)의 답은 누가 검색했든 팀원 모두에게 실렸다(팀장의 검색은 팀 전체에서 찾은 것) → 팀장이 아니면 이 주소의 대화(2584)에서 남의 검색 답을 뺀다.
+답과 작업은 ref = task.ref · 답의 created_at = 작업의 updated_at(proxy 가 같은 now 로 씀)으로 잇는다. workers/commerce/src/fixes.rs(foreign_search_answers) · get.rs 와 1:1.
+fix-member-sync-scope 위에 덧댄다(memberScope).
+@@ fix-member-search-answers
+<<< find
+async function teamOwner(
+=== replace
+// fix-member-search-answers: 이 주소의 대화 가운데 남의 검색 답(from = 팀 · data 에 search)의 id 들. 원래 작업(ref = 답의 ref · updated_at = 답의 created_at ·
+// to = 팀)이 없거나 하나라도 그 사람의 것이 아니면 뺀다
+async function foreignSearchAnswers(env, logisRegion, rows, team, address){
+	var cands = []
+	for(var i = 0; i < rows.length; i++){
+		var row = rows[i]
+		if(row.from != team){
+			continue
+		}
+		var data
+		try{
+			data = JSON.parse(new TextDecoder('utf-8').decode(ungzip(row.data)))
+		}catch(err){
+			continue
+		}
+		if(!(data && typeof data == "object" && !Array.isArray(data) && data.search)){
+			continue
+		}
+		if(typeof row.id == "string"){
+			cands.push(row)
+		}
+	}
+	if(!cands.length){
+		return []
+	}
+	var refs = []
+	cands.forEach(row => {
+		if(typeof row.ref == "string" && refs.indexOf(row.ref) < 0){
+			refs.push(row.ref)
+		}
+	})
+	var { results } = await env[logisRegion].prepare(`SELECT "from", "ref", "updated_at" FROM tasks WHERE "to" = ?1 AND "ref" IN (SELECT value FROM json_each(?2)) LIMIT 1000`).bind(team, JSON.stringify(refs)).all()
+	var drop = []
+	cands.forEach(row => {
+		var matched = results.filter(k => k.ref == row.ref && k.updated_at == row.created_at)
+		var mine = matched.length > 0 && matched.every(k => k.from == address)
+		if(!mine){
+			drop.push(row.id)
+		}
+	})
+	return drop
+}
+
+async function teamOwner(
+>>>
+
+@@ fix-member-search-answers
+<<< find
+).bind(cookies.cc, itemId, ...scopeParams(memberScope)).all()
+
+
+						if(results.length){
+							for(var i = 0; i < results.length; i++){
+								var talk = results[i]
+								talk.table = 'talks'
+=== replace
+).bind(cookies.cc, itemId, ...scopeParams(memberScope)).all()
+
+
+						if(results.length){
+							// fix-member-search-answers: 팀장이 아니면 남의 검색 답은 싣지 않는다
+							var foreignAnswers = memberScope ? await foreignSearchAnswers(env, logisRegion, results, cookies.team, cookies.address) : []
+
+							for(var i = 0; i < results.length; i++){
+								var talk = results[i]
+								if(typeof talk.id == "string" && foreignAnswers.indexOf(talk.id) > -1){
+									continue
+								}
+								talk.table = 'talks'
+>>>

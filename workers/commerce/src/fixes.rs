@@ -263,6 +263,50 @@ pub fn strip_task_team(task: &V) -> R<()> {
     Ok(())
 }
 
+const SQL_ANSWER_TASKS: &str = r#"SELECT "from", "ref", "updated_at" FROM tasks WHERE "to" = ?1 AND "ref" IN (SELECT value FROM json_each(?2)) LIMIT 1000"#;
+
+/// `await foreignSearchAnswers(env, logisRegion, results, team, address)` — fix-member-search-answers: 이 주소의 대화(2584) 가운데 proxy 검색의 답
+/// (`from` = 팀, data 에 `search`)이 그 사람의 검색이 아니면 그 대화 id 들. 답 행에는 검색한 사람이 없어 원래 작업으로 잇는다: proxy 는 답을
+/// `ref` = task.ref · `created_at` = now 로 쓰고 같은 now 로 작업 행의 `updated_at` 을 고친다(epilogue). 그런 작업이 없거나 하나라도 남의 것이면 뺀다
+pub async fn foreign_search_answers(env: &Env, logis_region: &str, rows: &V, team: &V, address: &V) -> R<Vec<String>> {
+    let mut cands: Vec<(String, V, V)> = Vec::new();
+    for row in rows.items() {
+        if !logis_worker_common::loose_eq(&row.get("from"), team) {
+            continue;
+        }
+        let Ok(d) = ungzip_json(&row.get("data")) else { continue };
+        if !(matches!(d, V::Obj(_)) && d.get("search").truthy()) {
+            continue;
+        }
+        if let Some(id) = row.get("id").as_str() {
+            cands.push((id.to_string(), row.get("ref"), row.get("created_at")));
+        }
+    }
+    if cands.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut refs: Vec<String> = Vec::new();
+    for (_, r, _) in &cands {
+        if let Some(r) = r.as_str() {
+            push_unique(&mut refs, r.to_string());
+        }
+    }
+    let refs = V::from(stringify_str(&V::from(refs.iter().map(|s| V::from(s.as_str())).collect::<Vec<_>>())));
+    let tasks = js::query_bound(env, logis_region, SQL_ANSWER_TASKS, &[team.clone(), refs]).await?.items();
+    let mut drop = Vec::new();
+    for (id, r, t) in cands {
+        let matched: Vec<&V> = tasks
+            .iter()
+            .filter(|k| logis_worker_common::loose_eq(&k.get("ref"), &r) && logis_worker_common::loose_eq(&k.get("updated_at"), &t))
+            .collect();
+        let mine = !matched.is_empty() && matched.iter().all(|k| logis_worker_common::loose_eq(&k.get("from"), address));
+        if !mine {
+            drop.push(id);
+        }
+    }
+    Ok(drop)
+}
+
 /// `pageInScope(scope, page)` — fix-member-page-list: 페이지 행이 멤버 범위 안인지 (cc ∈ ccs · bcc ∈ bccs · id ∈ refs)
 pub fn page_in_scope(scope: &SyncScope, page: &V) -> bool {
     let has = |list: &[String], v: V| v.as_str().is_some_and(|s| list.iter().any(|x| x == s));

@@ -452,3 +452,26 @@ SCENARIOS.push(
   { name: "taskleak_member_a", rows: SCOPE_ROWS([MEMBER_A, PROCESSED_TASK("0x" + "94".repeat(20), REF_A, OTHER), PROCESSED_TASK("0x" + "95".repeat(20), REF_B, USER)]),
     s3: S3_PERPAGE, requests: [JGET(OTHER_COOKIES), JSON_GET()] },
 );
+
+// ---------------------------------------------------------------------------------------------------------------------
+// fix-member-search-answers: 팀 공통 페이지(홈 /tracking)에 쌓인 proxy 검색의 답(from = 팀 · to = '' · data 에 search)은 검색한 사람이 행에 없다 —
+// 원래 작업(ref = 답의 ref · updated_at = 답의 created_at)의 from 으로 가려, 팀장이 아니면 자기 검색의 답만. 작업을 찾을 수 없는 답도 뺀다
+const HOME_REF = hashId(TEAM + HOME_CC + "/tracking"); // 홈의 itemId = 검색 작업의 ref
+const ANSWER = (id, created_at, markdown) => TALK({ id, from: TEAM, to: "", cc: HOME_CC, bcc: "", ref: HOME_REF, created_at,
+  data: { id, markdown, results: [{ id: "x" }], search: { query: {}, sql: { results: [] }, vector: { results: [] } } } });
+const ANSWER_ROWS = () => SCOPE_ROWS([MEMBER_A,
+  ANSWER("0x" + "5c".repeat(20), T0 - 50000, "OTHER 의 검색 답"),
+  ANSWER("0x" + "5d".repeat(20), T0 - 40000, "팀장의 검색 답 (팀 전체)"),
+  ANSWER("0x" + "5e".repeat(20), T0 - 30000, "작업을 찾을 수 없는 답"),
+  TALK({ id: "0x" + "5f".repeat(20), from: OTHER, to: TEAM, cc: HOME_CC, bcc: "", ref: HOME_REF, data: { text: "OTHER 가 홈에 쓴 글" }, created_at: T0 - 20000 }),
+  LOGIS_TASK("0x" + "96".repeat(20), HOME_REF, OTHER, { type: "prompt", cc: HOME_CC, updated_at: T0 - 50000 }),
+  LOGIS_TASK("0x" + "97".repeat(20), HOME_REF, USER, { type: "prompt", cc: HOME_CC, updated_at: T0 - 40000 }),
+]);
+const HOME_GET = { origin: HOME_ORIGIN, href: HOME_HREF };
+
+SCENARIOS.push(
+  // 팀원(OTHER): 홈의 대화에는 자기 검색의 답과 일반 글만 — 팀장의 답 · 작업을 찾을 수 없는 답은 빠진다
+  { name: "searchans_member_home", rows: ANSWER_ROWS(), s3: S3_PERPAGE, requests: [JGET(OTHER_COOKIES, HOME_GET)] },
+  // 팀장: 지금과 같이 모든 답
+  { name: "searchans_owner_home", rows: ANSWER_ROWS(), s3: S3_PERPAGE, requests: [JSON_GET(HOME_GET)] },
+);

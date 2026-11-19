@@ -414,6 +414,19 @@ pub async fn run(ctx: &mut Ctx, env: &Env, req: &Req) -> R<Step> {
         }
     }
 
+    // 고침 (fix-member-id-override): `?id=`(1020)는 pageId 를 바꿔 판정할 페이지를 고른다 — 그 주소에 아이템이 없으면 href 가 다른 페이지여도
+    // `?id=` 의 페이지로 판정했다(POST 작업 · PUT 대화는 href 의 주소로 들어감). 팀장이 아니면 href 의 페이지(resolve 와 같은 방법 — link_member)도 멤버여야 한다
+    if ctx.member.truthy()
+        && !member_owner
+        && ctx.cookies.g("address")?.truthy()
+        && ctx.cookies.g("team")?.truthy()
+        && eth::is_address(&ctx.req.g("query")?.g("id")?)
+    {
+        let href = ctx.url.g("href")?.to_str();
+        let on_href = crate::fixes::link_member(env, &ctx.zoneRegion, &ctx.cookies.g("address")?, &ctx.cookies.g("team")?, &href).await?;
+        ctx.member = V::Bool(on_href);
+    }
+
     // 고침 (fix-member-per-page): 팀장이 아니면 팀 base.pages({ [사이트 cc]: { [페이지 type]: { draft, count } } })를 멤버인 것만 남긴다
     let pages = ctx.cookies.g("pages")?;
     if ctx.cookies.g("address")?.truthy() && ctx.cookies.g("team")?.truthy() && !member_owner && matches!(pages, V::Obj(_)) && !pages.keys().is_empty() {

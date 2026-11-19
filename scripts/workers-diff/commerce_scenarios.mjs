@@ -422,3 +422,32 @@ SCENARIOS.push(
       path: q({ origin: "https://trading.logis.center", href: "https://trading.logis.center/x", created_at: T0 + 1000, from: OTHER, to: TEAM }) },
   ] },
 );
+
+// ---------------------------------------------------------------------------------------------------------------------
+// fix-member-id-override: ?id= 로 판정할 페이지를 고를 수 있었다 — B 의 주소(아이템이 없는 no=4)에 ?id=A 를 붙이면 A 의 멤버가 B 에 작업 · 대화를 넣었다.
+// fix-member-task-team-leak: 처리된 작업의 data.team(팀 행 통째 — base.pages 포함)은 팀장에게만. fix-member-page-list: 페이지 목록도 멤버 범위만
+const HREF_B4 = "https://shop.example.com/order/view?no=4"; // 페이지 B 의 주소 — 아이템이 없어 ?id= 가 판정 페이지를 고른다
+const PROCESSED_TEAM = { id: TEAM, type: "team", from: USER, to: TEAM, cc: "", bcc: "", ref: "",
+  data: { name: "Kim Shop", base: PERPAGE_BASE(), address: ["서울특별시 강남구 1"] }, created_at: T0 - 900000, updated_at: T0 - 900000 };
+const PROCESSED_TASK = (id, ref, from) => LOGIS_TASK(id, ref, from, { type: "prompt", cc: CC, updated_at: T0 - 30000,
+  data: { id, flag: "kr", team: PROCESSED_TEAM, created_at: T0 - 60000 } });
+
+SCENARIOS.push(
+  // A 의 멤버: ?id=A 를 붙여 B 의 주소로 POST · PUT 대화 · JSON GET → 막힘. ?id=A 로 A 의 주소에 POST → 받아짐
+  { name: "idoverride_member_a", rows: SCOPE_ROWS([MEMBER_A]), s3: S3_PERPAGE, requests: [
+    POST_TEXT(OTHER_COOKIES, OTHER, HREF_B4, "주문 B", { id: PAGE_A }),
+    PUT({ href: HREF_B4, id: PAGE_A, from: OTHER, to: TEAM, text: "B 의 대화" }, OTHER_COOKIES),
+    JGET(OTHER_COOKIES, { href: HREF_B4, id: PAGE_A }),
+    POST_TEXT(OTHER_COOKIES, OTHER, HREF, "상품 A", { id: PAGE_A }),
+  ] },
+  // 팀장은 그대로: ?id=A 로 B 의 주소에 POST · PUT 대화 · JSON GET
+  // (PUT 대화의 id 는 무작위라 D1 끝 상태의 id 순서가 실행마다 바뀐다 — talks 행은 빼서 그 대화만 남긴다)
+  { name: "idoverride_owner", rows: SCOPE_ROWS([MEMBER_A]).filter((r) => r.table !== "talks"), s3: S3_PERPAGE, requests: [
+    POST_TEXT(COOKIES, USER, HREF_B4, "주문 B", { id: PAGE_A }),
+    PUT({ href: HREF_B4, id: PAGE_A, from: USER, to: TEAM, text: "B 의 대화" }),
+    JSON_GET({ href: HREF_B4, id: PAGE_A }),
+  ] },
+  // 처리된 작업: A 의 멤버가 받는 자기 작업에는 data.team 이 없고 페이지 목록도 A · 팀 공통만, 팀장은 data.team 과 모든 페이지
+  { name: "taskleak_member_a", rows: SCOPE_ROWS([MEMBER_A, PROCESSED_TASK("0x" + "94".repeat(20), REF_A, OTHER), PROCESSED_TASK("0x" + "95".repeat(20), REF_B, USER)]),
+    s3: S3_PERPAGE, requests: [JGET(OTHER_COOKIES), JSON_GET()] },
+);

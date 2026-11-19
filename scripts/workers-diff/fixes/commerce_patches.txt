@@ -1510,3 +1510,89 @@ member = memberOwner || ccOfHost(url.host) == homeCc
 				// fix-member-per-page: 이 페이지의 멤버(팀장 · 페이지 멤버 행 · 팀 공통 페이지)만 작업을 넣는다
 				if(cookies.sender && created_at && !member){
 >>>
+
+=====================================================================================================================
+fix-member-id-override: `?id=`(1020)는 pageId 를 바꿔 판정할 페이지를 고른다 — 그 주소에 아이템이 없으면 href 가 다른 페이지여도 `?id=` 의 페이지로
+판정해, 페이지 A 의 멤버가 ?id=A 로 페이지 B 의 주소에 작업 · 대화를 넣을 수 있었다 → 팀장이 아니면 href 의 페이지(linkMember — resolve 와 같은 방법)도
+멤버여야 한다. 앱 · 확장은 ?id= 로 페이지를 고르지 않는다(권한 주기 · 거두기 PUT 의 id = 팀뿐). workers/commerce/src/resolve.rs 와 1:1.
+fix-member-sync-scope · fix-member-app-link 위에 덧댄다.
+@@ fix-member-id-override
+<<< find
+// fix-member-per-page: 팀장이 아니면 팀 base.pages 를 멤버인 것만
+=== replace
+// fix-member-id-override: 팀장이 아니면 ?id= 로 고른 페이지뿐 아니라 href 의 페이지도 멤버여야 한다
+			if(member && !memberOwner && cookies.address && cookies.team && ethers.isAddress(req.query.id)){
+				member = await linkMember(env, zoneRegion, cookies.address, cookies.team, url.href)
+			}
+
+			// fix-member-per-page: 팀장이 아니면 팀 base.pages 를 멤버인 것만
+>>>
+
+=====================================================================================================================
+fix-member-task-team-leak: proxy 는 처리한 작업 행의 data 를 { id, flag, team, created_at } 으로 덮고(team = 팀 행 통째 — base.pages · 주소 목록),
+동기화는 내 작업(from = 나)을 처리 여부와 상관없이 돌려줘 팀장이 아닌 멤버가 팀 base.pages 를 보았다 → 팀장이 아니면 돌려주는 작업의 data 에서 team 을 뺀다.
+workers/commerce/src/fixes.rs(strip_task_team) · get.rs 와 1:1.
+@@ fix-member-task-team-leak
+<<< find
+async function teamOwner(
+=== replace
+// fix-member-task-team-leak: 처리된 작업의 data.team(팀 행 통째)을 뺀다 (data 를 풀 수 없거나 team 이 없으면 그대로)
+function stripTaskTeam(task){
+	try{
+		var data = JSON.parse(new TextDecoder('utf-8').decode(ungzip(task.data)))
+		if(data && typeof data == "object" && !Array.isArray(data) && Object.prototype.hasOwnProperty.call(data, 'team')){
+			delete data.team
+			task.data = gzip(new TextEncoder('utf-8').encode(JSON.stringify(data)), { to: 'arraybuffer' })
+		}
+	}catch(err){
+	}
+}
+
+async function teamOwner(
+>>>
+
+@@ fix-member-task-team-leak
+<<< find
+task.ref = ''
+
+								tasks.push(task)
+=== replace
+task.ref = ''
+
+								// fix-member-task-team-leak: 처리된 작업의 data.team 은 팀장에게만
+								if(memberScope){
+									stripTaskTeam(task)
+								}
+
+								tasks.push(task)
+>>>
+
+=====================================================================================================================
+fix-member-page-list: 응답의 페이지 목록(1145 · 1256 의 팀 · cc 페이지 행 — 셀렉터 · 주소가 든 data 포함)이 팀장이 아니어도 팀의 모든 페이지였다 →
+팀장이 아니면 멤버 범위(memberSyncScope) 안의 페이지만 (cc ∈ ccs · bcc ∈ bccs · id ∈ refs). member 와 무관하게. workers/commerce/src/fixes.rs(page_in_scope) · get.rs 와 1:1.
+@@ fix-member-page-list
+<<< find
+async function teamOwner(
+=== replace
+// fix-member-page-list: 페이지 행이 멤버 범위 안인지
+function pageInScope(scope, page){
+	return (typeof page.cc == "string" && scope.ccs.indexOf(page.cc) > -1)
+		|| (typeof page.bcc == "string" && scope.bccs.indexOf(page.bcc) > -1)
+		|| (typeof page.id == "string" && scope.refs.indexOf(page.id) > -1)
+}
+
+async function teamOwner(
+>>>
+
+@@ fix-member-page-list
+<<< find
+console.log(`[API-DEBUG] 클라이언트(Client)로 반환하는 데이터 통계`);
+=== replace
+// fix-member-page-list: 팀장이 아니면 페이지 목록은 멤버 범위 안의 것만
+					if(cookies.address && cookies.team && !memberOwner){
+						var pageScope = await memberSyncScope(env, zoneRegion, cookies.address, cookies.team, homeCc)
+						pages = pages.filter(p => pageInScope(pageScope, p))
+					}
+
+					console.log(`[API-DEBUG] 클라이언트(Client)로 반환하는 데이터 통계`);
+>>>

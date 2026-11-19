@@ -258,6 +258,15 @@ pub async fn run(ctx: &mut Ctx, env: &Env, _req: &Req) -> R<Step> {
             member_rows(ctx, env).await?;
         }
 
+        // 고침 (fix-member-page-list): 응답의 페이지 목록(1145 · 1256 의 팀 · cc 페이지 행 — 셀렉터 · 주소가 든 data 포함)은 팀장이 아니면 멤버 범위 안의 것만
+        // (멤버가 아닌 페이지의 요청이어도 실리는 목록이라 member 와 무관하게 거른다)
+        if ctx.cookies.g("address")?.truthy() && ctx.cookies.g("team")?.truthy() {
+            if let Some(scope) = sync_scope(ctx, env).await? {
+                let kept: Vec<V> = ctx.pages.items().into_iter().filter(|p| crate::fixes::page_in_scope(&scope, p)).collect();
+                ctx.pages = V::from(kept);
+            }
+        }
+
         // 2853
         let cookies = ctx.cookies.clone();
         console_log!(T2853[0]);
@@ -406,6 +415,10 @@ async fn member_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
             ctx.task = ctx.results.gk(&ctx.i)?;
             ctx.task.s_("table", V::from("tasks"))?;
             ctx.task.s_("ref", V::from(""))?;
+            // 고침 (fix-member-task-team-leak): 처리된 작업의 data.team(팀 행 통째)은 팀장에게만
+            if scope.is_some() {
+                crate::fixes::strip_task_team(&ctx.task)?;
+            }
             ctx.tasks.push(ctx.task.clone())?;
             ctx.i = inc(&ctx.i);
         }

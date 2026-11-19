@@ -52,7 +52,7 @@ scripts/workers-diff/       차분 시험대 (아래)
 | linkedom 대조 (`workers/proxy/tests/dom_vectors.rs`) | Pug 452/452 바이트 동일, 선택자 31,027/31,027 (SyntheticData 화면 96 · 경계 56 · 무작위 300). 따로 무작위 6,000 문서도 100 % |
 | pako 대조 (`workers/common/tests/pako_array.rs`) | 430 경우 (93 던짐) 모두 같음 |
 | `cargo test`(common · proxy), `cargo check --target wasm32-unknown-unknown` | 통과, 경고 없음 |
-| 차분 시험 commerce (`node commerce.mjs`) | 고치기 전 원본과 28/28 (370d67a3), 고친 원본과 54/54 (fix-member-per-page 를 빼면 perpage_* 넷만 DIFF — 그때는 위에 덧댄 둘도 함께 뺌, fix-member-sync-scope 를 빼면 scope_member_a · scope_site_member 와 멤버 동기화가 바뀐 invite_login · perpage_invited · perpage_revoke 만, fix-member-app-link 를 빼면 applink_member_a 만 DIFF) — 응답(상태 · 머리글 · Set-Cookie · 본문) · S3 요청(서명은 aws4fetch 로 다시 계산해 확인) · D1 · S3 끝 상태 |
+| 차분 시험 commerce (`node commerce.mjs`) | 고치기 전 원본과 28/28 (370d67a3), 고친 원본과 57/57 (fix-member-per-page 를 빼면 perpage_* 넷만 DIFF — 그때는 위에 덧댄 다섯도 함께 뺌, fix-member-sync-scope 를 빼면 scope_member_a · scope_site_member 와 멤버 동기화가 바뀐 invite_login · perpage_invited · perpage_revoke 만, fix-member-app-link 를 빼면 applink_member_a 만, fix-member-id-override 를 빼면 idoverride_member_a 만, fix-member-task-team-leak 을 빼면 taskleak_member_a 만, fix-member-page-list 를 빼면 팀장이 아닌 사람의 JSON GET 이 있는 perpage_invited · perpage_app_old_member · perpage_revoke · scope_member_a · idoverride_member_a · taskleak_member_a 만 DIFF) — 응답(상태 · 머리글 · Set-Cookie · 본문) · S3 요청(서명은 aws4fetch 로 다시 계산해 확인) · D1 · S3 끝 상태 |
 | 차분 시험 trading (`node trading.mjs`) | 고치기 전 원본과 41/41 (370d67a3), 고친 원본과 58/58 |
 | `wrangler deploy --dry-run` (두 워커) | 빌드 · 바인딩 확인 통과. proxy 2,547 KiB (gzip 889 KiB), apac 419 KiB (gzip 166 KiB) |
 
@@ -168,6 +168,9 @@ BUG-TR-2(`it.fails`)는 커서 꼴(시각 + id)을 바꿔야 해 그대로 둡�
 | fix-member-per-page | 1108 · 1561~1577 · 2000 · 1894 · 2494 | 팀 행(늘 읽힘)이 `member = true` 라 팀원 모두가 모든 페이지의 멤버였고, member 는 GET 동기화만 막았음(POST · PUT 대화는 보지 않음) → 팀장 · 페이지 멤버 · 팀 공통 페이지만 멤버, `cookies.pages` 거름, POST · PUT 대화도 멤버만 (아래 "페이지별 멤버") |
 | fix-member-sync-scope | 2494~2849 | member 이면 동기화가 팀 · 사이트 단위 질의(같은 cc 의 아이템, 다른 cc 의 최근 아이템, 팀 초안, 내 작업, 대화, 힌트, sales · tracking)라 한 페이지의 멤버가 팀의 다른 페이지 행까지 받았음 → 팀장이 아니면 모든 질의에 멤버 범위(`cc` ∈ 사이트 · `bcc` ∈ 페이지 · `ref` ∈ 페이지의 작업/대화 ref)를 바인딩으로 붙임, 팀장은 그대로 (아래 "페이지별 멤버") |
 | fix-member-app-link | 1561 · 1998~ | 앱 추출은 요청 href 가 proxy_fetch 의 기본값(console — 팀 공통)이라 봉투 link 의 가게 페이지에 팀원 누구나 작업을 넣었고, 팀 공통이 homeCc 의 아무 호스트(`*.logis.center`)였음 → link 가 http(s) 면 그 페이지로 판정, 팀 공통은 logis.center · commerce · console 호스트만 |
+| fix-member-id-override | 1020 · 1561 | `?id=` 가 판정할 페이지를 골라, 그 주소에 아이템이 없으면 A 의 멤버가 `?id=A` 로 B 의 주소에 작업 · 대화를 넣었음 → 팀장이 아니면 href 의 페이지도 멤버여야 |
+| fix-member-task-team-leak | 2564 | proxy 가 처리한 작업의 data 에 팀 행 통째(base.pages 포함)를 써, 동기화의 내 작업으로 팀장이 아닌 멤버가 그것을 받았음 → 팀장이 아니면 작업 data 에서 `team` 을 뺌 |
+| fix-member-page-list | 1145 · 1256 · 2857 | 응답의 페이지 목록이 팀장이 아니어도 팀 · cc 의 모든 페이지 행(셀렉터 · 주소)이었음 → 팀장이 아니면 동기화 범위 안의 페이지만 |
 
 멤버 초대(사용자 결정: 대기 초대 → 첫 로그인 때 확정):
 
@@ -219,7 +222,7 @@ BUG-TR-2(`it.fails`)는 커서 꼴(시각 + id)을 바꿔야 해 그대로 둡�
     `hashId('tracking' + 대문자 cc)`(이미지), `ref` = `hashId(팀 + cc + pathname)` — prompt 작업은 `ref` 로만 페이지가 정해짐).
   - 고친 질의: 같은 cc 의 아이템 · 다른 cc 의 최근 아이템 · 초안(그래서 `cookies.draft` 도 범위 안 초안만 셈) · 내 작업 · 이 주소의 대화와 그 개수 · 팀이 나에게 보낸 대화 ·
     힌트 두 질의(두 번째는 OR 조각을 괄호로 묶고 범위를 붙임 — 조각마다 condition 이 있어 결과는 같음) · 상세 행 · 상품의 sales · 주문의 tracking 두 갈래 · 목록.
-  - 그대로 둔 것: 응답의 페이지 목록(1145 · 1256 의 팀 · cc 페이지 행)과 팀 사용자 목록 — 원래 멤버가 아니어도 실리는 목록이고, `cookies.pages` 는 이미 거릅니다.
+  - 응답의 페이지 목록은 fix-member-page-list, 처리된 작업의 팀 행은 fix-member-task-team-leak 이 거릅니다(아래).
 - 앱 추출의 페이지(fix-member-app-link): 앱(main.ts 3001~)은 추출 봉투를 `proxy_fetch` 로 보내 요청 href 가 기본값 `https://console.logis.center/` 이고
   (팀 공통), 봉투의 `link` 는 `currentDetectedUrl`(가게 주소) 또는 `"local"` 입니다. fix-app-extraction 은 link 가 http(s) 면 그 주소로 작업(`task.cc` = 그 호스트의 cc)을
   넣으므로, 이제 그 주소로 판정합니다(`fixes.rs::app_extraction_link` · `link_member`, POST 의 멤버 검사 바로 앞):
@@ -231,10 +234,30 @@ BUG-TR-2(`it.fails`)는 커서 꼴(시각 + id)을 바꿔야 해 그대로 둡�
   `currentDetectedUrl`(가게 — 팀 공통 아님)뿐이고, 확장(`web/commerce/static/js`)은 요청을 `logis.center` 로 보내며 href 는 보고 있는 가게 주소입니다.
   commerce.logis.center 의 다른 경로(워커가 그리는 셸 화면)도 쓰이므로 경로까지는 묶지 않았습니다. 그 밖의 `*.logis.center`(trading 등)는 homeCc 라도 팀 공통이 아니고,
   그런 href 의 페이지는 없으므로 팀장만 씁니다.
-- 원본 쪽 패치는 fix-member-per-page 위에 덧대므로 `COMMERCE_SKIP=fix-member-per-page` 는 `fix-member-sync-scope,fix-member-app-link` 와 함께 줘야 합니다.
-- 남은 것: `?id=` 질의(1020)는 `pageId` 를 바꿔 판정할 페이지를 고를 수 있습니다 — 그 주소에 아이템이 없으면 href 가 다른 페이지여도 `?id=` 의 페이지로 판정합니다
-  (동기화의 행은 범위로 묶여 새지 않지만, POST 작업 · PUT 대화는 href 의 주소로 들어감). proxy 는 처리한 작업 행의 data 를 `{id, flag, team, created_at}` 으로 덮어
-  (`team` 은 팀 행 통째 — base.pages 포함), 그 작업을 만든 멤버는 동기화의 작업 행으로 팀 base.pages 를 봅니다. 둘 다 이번에 고치지 않았습니다.
+- `?id=` 로 고른 페이지(fix-member-id-override): `?id=`(1020)는 `pageId` 를 바꿔 판정할 페이지를 고릅니다 — 그 주소에 아이템이 없으면 href 가 다른
+  페이지여도 `?id=` 의 페이지로 판정해, A 의 멤버가 `?id=A` 를 붙여 B 의 주소에 POST 작업 · PUT 대화를 넣을 수 있었습니다(작업의 cc · ref, 대화의 ref 는 href 로 정해짐).
+  이제 팀장이 아니고 `?id=` 가 주소 꼴이면, 위의 판정으로 멤버여도 href 의 페이지(`link_member` — 앱 추출과 같은 resolve 의 방법, 서비스 호스트면 팀 공통)도
+  멤버여야 합니다. 앱(web/desktop · apps/core)과 확장(web/commerce/static/js)은 `?id=` 로 페이지를 고르지 않고(권한 주기 · 거두기 PUT 의 `id` = 팀뿐 — 이때 `?id=`
+  는 페이지가 아니라 판정이 원래 거짓이고, 거두기는 멤버 판정을 보지 않음), 팀장은 그대로라 정상 흐름은 바뀌지 않습니다. `?id=` 를 무시하는 대신 두 페이지를 다 보게 한 까닭:
+  pageId 를 바꾸면 페이지 · type · 상세 판정과 응답(현재 페이지 · 동기화)까지 바뀌지만, 이 규칙은 멤버 판정 한 곳만 좁힙니다. 두 페이지의 멤버라면 대화의 bcc 가 `?id=`
+  페이지의 것이 될 수 있지만 둘 다 그 사람이 볼 수 있는 페이지입니다.
+- 처리된 작업의 팀 행(fix-member-task-team-leak): proxy 는 처리한 작업 행의 data 를 `{id, flag, team, created_at}` 으로 덮고(`team` = 팀 행 통째 — base.pages ·
+  주소 목록, proxy handler 의 epilogue), 동기화는 내 작업(`from` = 나)을 처리 여부와 상관없이 돌려줘 팀장이 아닌 멤버가 팀 base.pages 를 보았습니다.
+  팀장이 아니면 돌려주는 작업 행의 data 를 풀어 `team` 을 빼고 다시 gzip 합니다(`fixes.rs::strip_task_team` — 풀 수 없거나 team 이 없으면 그대로).
+  앱은 동기화의 작업 행을 id 로만 보고(modes/commerce.ts 의 클라우드 작업 완료 판정), 확장은 crons 로 담기만 해 data.team 을 읽는 곳이 없습니다.
+  proxy 가 팀 행 통째를 작업에 쓰는 것 자체도 필요해 보이지 않습니다(처리 기록이면 id · flag · created_at 이면 충분) — proxy 는 이번에 바꾸지 않았습니다.
+- 페이지 목록(fix-member-page-list): 응답의 페이지 목록(1145 · 1256 의 팀 · cc 페이지 행 — 셀렉터 · 주소 · origin 이 든 data)은 멤버가 아닌 페이지의 요청에도 실리는
+  팀 전체 목록이었습니다. 팀장이 아니면 위의 동기화 범위(`member_sync_scope`) 안의 페이지만 남깁니다(`cc` ∈ ccs · `bcc` ∈ bccs · `id` ∈ refs — 홈은 homeCc 라 남음).
+  `member` 와 무관하게 거릅니다.
+- 그 밖에 동기화가 팀장이 아닌 사람에게 주는 팀 단위 값(살펴보고 그대로 둔 것): 팀 사용자 목록(1088 — 팀 행 · 팀원 행, data 는 지우고 name 만, 팀원 관리 화면용),
+  `cookies` 의 개수(goods · order · tracking · event · coupon — 팀 합계, fix-member-per-page 에서 그대로 두기로 함). 힌트 · 상세 · 1132 의 아이템은 범위 안입니다.
+  **proxy 의 클라우드 검색 답**은 고치지 못했습니다: proxy search 는 Vectorize 를 `{type, to: 팀}` 으로만 걸러 팀의 모든 페이지에서 찾고, 그 답(`markdown` · `results`,
+  행의 from · to · cc · bcc 는 지움)을 대화 행(`cc` = 작업의 cc — 앱 검색이면 homeCc, `ref` = 작업 ref)으로 씁니다. 동기화는 그 대화의 `search` 만 지우므로,
+  팀 공통 홈에서 검색한 답은 범위(cc = homeCc)에 들어 A 의 멤버에게도 B 의 아이템을 담아 보입니다. 답 안의 행에 페이지 열이 남지 않아 commerce 쪽에서는 거를 수 없고,
+  proxy 가 검색 필터에 그 사람의 범위(bcc · cc)를 넣어야 합니다.
+- 원본 쪽 패치는 서로 위에 덧댑니다: `COMMERCE_SKIP=fix-member-per-page` 는 그 위의 다섯(`fix-member-sync-scope` · `fix-member-app-link` · `fix-member-id-override` ·
+  `fix-member-task-team-leak` · `fix-member-page-list`)과 함께, `fix-member-app-link` 는 `fix-member-id-override` 와 함께, `fix-member-sync-scope` 는
+  `fix-member-task-team-leak` · `fix-member-page-list` 와 함께 줘야 합니다(그 둘이 `memberScope` · `memberSyncScope` 를 씀).
 
 고치지 않고 적어 둔 것: `cookies.hash` 를 S3 경로에 검증 없이 씀, 홈 id 를 대문자 cc 로 만들어 `pageId` 와 같아지지 않음(클라우드 검색만 보정),
 `?created_at=%20` 의 NaN 이 SQL 로(418), 1474~1558 의 페이지 트리는 결과를 버리는 죽은 코드, POST 가 sender · 잔액 없으면 빈 418,

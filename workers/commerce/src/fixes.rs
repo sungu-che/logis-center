@@ -249,6 +249,24 @@ pub fn scope_params(scope: Option<&SyncScope>) -> Vec<V> {
     }
 }
 
+/// `stripTaskTeam(task)` — fix-member-task-team-leak: proxy 는 처리한 작업 행의 data 를 `{id, flag, team, created_at}` 으로 덮는다
+/// (`team` = 팀 행 통째 — base.pages · 주소 목록). 팀장이 아닌 사람에게 돌려줄 작업이면 `team` 을 뺀다 (data 를 풀 수 없거나 team 이 없으면 그대로)
+pub fn strip_task_team(task: &V) -> R<()> {
+    let Ok(d) = ungzip_json(&task.get("data")) else { return Ok(()) };
+    if matches!(d, V::Obj(_)) && d.has("team") {
+        d.del("team")?;
+        let text = stringify_str(&d);
+        task.s_("data", V::bytes(logis_worker_common::gzip::gzip(text.as_bytes())))?;
+    }
+    Ok(())
+}
+
+/// `pageInScope(scope, page)` — fix-member-page-list: 페이지 행이 멤버 범위 안인지 (cc ∈ ccs · bcc ∈ bccs · id ∈ refs)
+pub fn page_in_scope(scope: &SyncScope, page: &V) -> bool {
+    let has = |list: &[String], v: V| v.as_str().is_some_and(|s| list.iter().any(|x| x == s));
+    has(&scope.ccs, page.get("cc")) || has(&scope.bccs, page.get("bcc")) || has(&scope.refs, page.get("id"))
+}
+
 /// fix-member-app-link: 팀 공통 페이지 = 서비스 자신의 호스트(데스크톱 앱이 href 로 보내는 commerce · console, 그리고 logis.center).
 /// 다른 `*.logis.center` 는 homeCc 라도 팀 공통이 아니다
 pub fn team_common_host(hostname: &str) -> bool {

@@ -447,7 +447,8 @@ SCENARIOS.push(
     PUT({ href: HREF_B4, id: PAGE_A, from: USER, to: TEAM, text: "B 의 대화" }),
     JSON_GET({ href: HREF_B4, id: PAGE_A }),
   ] },
-  // 처리된 작업: A 의 멤버가 받는 자기 작업에는 data.team 이 없고 페이지 목록도 A · 팀 공통만, 팀장은 data.team 과 모든 페이지
+  // 처리된 작업: A 의 멤버가 받는 자기 작업에는 data.team 이 없고 페이지 목록도 A · 팀 공통만, 팀장은 data.team 과 모든 페이지.
+  // 다시 만든 data 도 D1 행처럼 바이트 수의 배열이라(Uint8Array 의 {"0":…} 꼴이 아님) 하네스 출력에 shape 표시가 없고 팀장의 작업과 모양이 같다
   { name: "taskleak_member_a", rows: SCOPE_ROWS([MEMBER_A, PROCESSED_TASK("0x" + "94".repeat(20), REF_A, OTHER), PROCESSED_TASK("0x" + "95".repeat(20), REF_B, USER)]),
     s3: S3_PERPAGE, requests: [JGET(OTHER_COOKIES), JSON_GET()] },
 );

@@ -47,7 +47,7 @@ scripts/workers-diff/       차분 시험대 (아래)
 | 무엇 | 결과 |
 | --- | --- |
 | 차분 시험 apac (`scripts/workers-diff`: `node apac.mjs`) | 고친 원본과 5/5 동일 — 바깥 요청(gzip 을 푼 본문) · D1 끝 상태 · 예외 |
-| 차분 시험 proxy (`node proxy.mjs`) | 고친 원본과 44/44 동일 — 응답 · LLM 요청 본문 전부 · Workers AI · Vectorize 호출 · D1 11개 표 끝 상태(`console` 오류 기록 포함) |
+| 차분 시험 proxy (`node proxy.mjs`) | 고친 원본과 47/47 동일(fix-search-member-scope 를 빼면 search_scope_member · search_scope_site 만 DIFF — `PROXY_SKIP`) — 응답 · LLM 요청 본문 전부 · Workers AI · Vectorize 호출 · D1 11개 표 끝 상태(`console` 오류 기록 포함) |
 | 고치기 전 (2e82ecbb) | 고치지 않은 원본과 apac 5/5 · proxy 23/23 동일 (`ORIGINAL=raw node proxy.mjs` 로 다시 볼 수 있음) |
 | linkedom 대조 (`workers/proxy/tests/dom_vectors.rs`) | Pug 452/452 바이트 동일, 선택자 31,027/31,027 (SyntheticData 화면 96 · 경계 56 · 무작위 300). 따로 무작위 6,000 문서도 100 % |
 | pako 대조 (`workers/common/tests/pako_array.rs`) | 430 경우 (93 던짐) 모두 같음 |
@@ -70,7 +70,7 @@ D1 의 undefined 바인딩 수정은 진입 모듈의 env 래퍼가 원본 쪽�
 ```
 cd scripts/workers-diff && npm install
 (cd ../../workers/apac && worker-build --release) && (cd ../../workers/proxy && worker-build --release)
-node apac.mjs && node proxy.mjs          # ONLY=scan_goods_list node proxy.mjs 로 하나만
+node apac.mjs && node proxy.mjs          # ONLY=scan_goods_list node proxy.mjs 로 하나만, PROXY_SKIP=<id> 면 그 수정만 빼고
 ```
 
 ## 고친 버그
@@ -95,11 +95,30 @@ node apac.mjs && node proxy.mjs          # ONLY=scan_goods_list node proxy.mjs �
 | fix-undefined-binds | 5062 · 5102 | 다른 행의 id(`row.id` · `item.id`)를 묶음 → 확인한 행(`edge.id`) |
 | fix-parse-body | 1984 | 인자를 가리는 `var body = ''` 와 정의되지 않은 `selectors` (부르는 곳 없음) |
 | fix-sql-params | 전체 | SQL 에 값을 이어 붙였다(작은따옴표가 든 값이면 깨짐) → 모두 `?n` 바인딩. 표 이름은 알려진 표만, 조건 조각(parseCondition)은 유한한 수만, ORDER BY 열은 그 표의 열만 |
+| fix-search-member-scope | 5876 · 6108 · 6167 | 자연어 검색이 Vectorize 를 `{type, to: 팀}` 으로만 거르고 행도 `"to"` = 팀 으로만 읽어, 팀장이 아닌 사람의 검색 답(팀 공통 homeCc 의 대화)에 그 사람이 볼 수 없는 페이지의 아이템이 담겼다 → 검색한 사람(`task.from`)이 팀장(`team.from`)이 아니면 벡터로 찾은 행 · 조건 SQL 의 행을 멤버 범위로 거름, 팀장은 그대로 (아래) |
 
 판단이 들어간 것: fix-edge-draft 의 초안 유형은 관계 키(`query[0].type`)입니다(`relate.type` 이 아님 — 찾지 못한 질의와 같은 유형으로 다시 찾게).
 fix-schema-* 는 마이그레이션 대신 코드를 스키마에 맞췄습니다 — `predeploy` 는 `DB`(logis_center)에만 마이그레이션을 적용하고, 이 문장들이 쓰는
 지역 DB(`commerce_logis_apac1_*`)에는 적용하지 않기 때문입니다. 운영 지역 DB 에 그 열이 따로 만들어져 있다면 되돌릴 자리입니다.
 닿는 시나리오가 없는 수정(같은 요청 안에서 작업은 `LIMIT 1` 이라 "앞 작업" 누수는 재현되지 않음, `CLIENT_EMBEDDING` 이 참이라 죽은 갈래)은 코드 검토로만 확인했습니다.
+
+검색의 멤버 범위(fix-search-member-scope, commerce 의 페이지별 멤버와 짝). 검색한 사람은 작업의 `from`(commerce POST 가 늘 `cookies.address` 로 씀)이고,
+팀장은 proxy 가 이미 읽는 팀 행의 `from` 입니다. 둘이 다르면 `search.rs::search_scope`(원본 쪽 `searchMemberScope`)가 그 사람의 범위를 만듭니다 —
+commerce `member_sync_scope` 와 같은 규칙에서 행 쪽만: `ccs` = homeCc + 멤버 행(`type 'member'` · `from` = 그 사람 · `to` = 팀) bcc(사이트 행은 bcc = cc),
+`bccs` = 멤버 행 bcc + 그 bcc 를 가진 팀 페이지 행 type 의 `hashId(type + cc)` · `hashId(type + 대문자 cc)`. 작업 · 대화의 `ref` 목록은 검색 표(sales · event ·
+tracking — proxy 가 아이템의 cc · bcc 를 그대로 씀)에 쓸 데가 없어 뺐습니다. 벡터로 찾은 id 의 행(6108)과 조건 SQL(6167)에
+`("cc" IN json_each(?) OR "bcc" IN json_each(?))` 를 붙입니다.
+
+거르는 자리를 행 읽기로 둔 까닭: 색인 메타데이터에는 `cc` · `bcc` 가 있지만(proxy item1 · item4 의 upsert, commerce PUT 벡터 모두 `type` · `from` · `to` · `cc` · `bcc` · `ref` 를 가짐),
+Vectorize 필터는 키끼리 AND 라 "cc ∈ … 또는 bcc ∈ …" 를 한 질의로 쓸 수 없고(사이트 멤버와 페이지 멤버가 섞임 — 두 번 묻고 합쳐야 함),
+필터에 쓰는 키는 메타데이터 색인이 있어야 하는데 저장소에 cc · bcc 색인을 만든 기록이 없습니다(색인 없이 거르면 결과가 비거나, 색인을 만든 뒤 넣은 벡터만 걸림).
+대가: Vectorize 의 topK(작업의 topK — 무료 50 · 유료 100)는 팀으로만 거른 상위 K 개라, 범위 밖 행이 상위를 차지하면 범위 안 행이 벡터 결과에서 빠질 수 있습니다
+(조건 SQL 은 범위를 먼저 걸고 LIMIT 300 이라 이 문제가 없음). search_scope_member 시나리오가 그 경우를 보입니다(팀 공통 행 SH1 이 상위 5 밖이라 벡터 결과에 없고 SQL 결과에는 있음).
+cc · bcc 메타데이터 색인을 만든 뒤에는 Vectorize 필터(`bcc: {$in}` 과 `cc: {$in}` 두 번)로 옮길 수 있습니다.
+
+남은 것: 팀장이 팀 공통 페이지(홈)에서 한 검색의 답은 팀 전체에서 찾은 것이고, 그 대화 행(`from` = 팀 · `to` = 작업 bcc('') · `cc` = homeCc)에 검색한 사람이 남지 않아
+commerce 동기화는 팀 공통으로 멤버에게도 줍니다(`search` 칸은 지우지만 `markdown` · `results` 는 남음). 팀장의 쓰기를 그대로 두라는 조건 때문에 이번에 바꾸지 않았습니다 —
+답 대화에 검색한 사람을 남기거나(proxy), commerce 가 답 대화의 id(= 작업 id)로 작업의 `from` 을 찾아 팀장이 아닌 사람에게는 자기 검색의 답만 주는 방법이 있습니다.
 
 ## trading (trading-logis-center 65684e6) 고친 버그
 
@@ -244,6 +263,8 @@ BUG-TR-2(`it.fails`)는 커서 꼴(시각 + id)을 바꿔야 해 그대로 둡�
 - 처리된 작업의 팀 행(fix-member-task-team-leak): proxy 는 처리한 작업 행의 data 를 `{id, flag, team, created_at}` 으로 덮고(`team` = 팀 행 통째 — base.pages ·
   주소 목록, proxy handler 의 epilogue), 동기화는 내 작업(`from` = 나)을 처리 여부와 상관없이 돌려줘 팀장이 아닌 멤버가 팀 base.pages 를 보았습니다.
   팀장이 아니면 돌려주는 작업 행의 data 를 풀어 `team` 을 빼고 다시 gzip 합니다(`fixes.rs::strip_task_team` — 풀 수 없거나 team 이 없으면 그대로).
+  다시 만든 data 는 D1 행의 BLOB 과 같은 꼴(바이트 수의 JSON 배열 `[31,139,…]`)로 돌려줘 팀장이 받는 작업 행과 모양이 같습니다
+  (Uint8Array 의 `{"0":31,…}` 꼴이면 `new Uint8Array(task.data)` 가 빈 배열이 됨 — 데스크톱의 `bytesOf` 는 두 꼴을 다 읽고, 확장의 crons 는 data 를 풀지 않지만).
   앱은 동기화의 작업 행을 id 로만 보고(modes/commerce.ts 의 클라우드 작업 완료 판정), 확장은 crons 로 담기만 해 data.team 을 읽는 곳이 없습니다.
   proxy 가 팀 행 통째를 작업에 쓰는 것 자체도 필요해 보이지 않습니다(처리 기록이면 id · flag · created_at 이면 충분) — proxy 는 이번에 바꾸지 않았습니다.
 - 페이지 목록(fix-member-page-list): 응답의 페이지 목록(1145 · 1256 의 팀 · cc 페이지 행 — 셀렉터 · 주소 · origin 이 든 data)은 멤버가 아닌 페이지의 요청에도 실리는

@@ -256,7 +256,9 @@ pub fn strip_task_team(task: &V) -> R<()> {
     if matches!(d, V::Obj(_)) && d.has("team") {
         d.del("team")?;
         let text = stringify_str(&d);
-        task.s_("data", V::bytes(logis_worker_common::gzip::gzip(text.as_bytes())))?;
+        // D1 행의 BLOB 과 같은 꼴(바이트 수의 JSON 배열)로 — 팀장이 받는 작업 행과 같은 모양
+        let bytes = logis_worker_common::gzip::gzip(text.as_bytes());
+        task.s_("data", V::from(bytes.into_iter().map(|b| V::Num(b as f64)).collect::<Vec<_>>()))?;
     }
     Ok(())
 }

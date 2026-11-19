@@ -1,6 +1,6 @@
 // proxy 차분 시험: 원본 TS 와 Rust(wasm) 를 같은 D1 · 같은 가짜 LLM/AI/Vectorize · 같은 가상 시계 · 같은 난수로 돌려
 // 응답 · 바깥 요청(LLM) · AI/Vectorize 호출 · D1 끝 상태를 견준다.
-// usage: node proxy.mjs <logis-center/workers 경로> [시나리오 이름]
+// usage: node proxy.mjs <logis-center/workers 경로> [시나리오 이름[,이름…]]   (PROXY_SKIP=fix-id,… 면 그 수정을 빼고 원본을 고친다)
 import { Miniflare } from "miniflare";
 import * as esbuild from "esbuild";
 import { gzipSync, gunzipSync } from "node:zlib";
@@ -19,7 +19,9 @@ async function original(name) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const raw = execFileSync("git", ["-C", REPO, "show", `${ORIGINAL_COMMIT}:workers/${name}/src/index.ts`]).toString("utf8");
   // ORIGINAL=raw 면 버그를 고치기 전의 원본 그대로, 아니면 fixes.mjs 의 수정을 덧댄 "고친 원본"
-  const { source, applied } = process.env.ORIGINAL === "raw" ? { source: raw, applied: [] } : await patchOriginal(name, raw);
+  // PROXY_SKIP=fix-a,fix-b 면 그 수정만 빼고 덧댄다 — 수정 하나가 어느 시나리오를 바꾸는지 보려고 (commerce 의 COMMERCE_SKIP 과 같음)
+  const omit = (process.env.PROXY_SKIP || "").split(",").filter(Boolean);
+  const { source, applied } = process.env.ORIGINAL === "raw" ? { source: raw, applied: [] } : await patchOriginal(name, raw, { omit });
   if (applied.length) console.log(`[${name}] fixes applied to the original: ${applied.join(", ")}`);
   fs.writeFileSync(file, source);
   return file;
@@ -108,6 +110,8 @@ async function run(variant, scenario) {
         modulesRules: [{ type: "CompiledWasm", include: ["**/*.wasm"], fallthrough: true }, { type: "ESModule", include: ["**/*.js", "**/*.mjs"] }],
         compatibilityDate: "2025-12-01",
         d1Databases: Object.fromEntries(D1.map((n) => [n, `${n}-${variant}-${scenario.name}`])),
+        // scenario.vectors: 가짜 Vectorize 에 미리 넣을 벡터 (mocks 의 seedVectors)
+        ...(scenario.vectors ? { bindings: { __VEC_SEED: JSON.stringify(scenario.vectors) } } : {}),
         outboundService: outbound,
       },
     ],
@@ -143,7 +147,7 @@ async function run(variant, scenario) {
 }
 
 let fail = 0;
-for (const scenario of SCENARIOS.filter((s) => !ONLY || s.name === ONLY)) {
+for (const scenario of SCENARIOS.filter((s) => !ONLY || ONLY.split(",").includes(s.name))) {
   const ts = await run("ts", scenario);
   const rs = await run("rs", scenario);
   // hashId() 의 무작위 id(원본: ethers.Wallet.createRandom)는 실행마다 다르다: 한쪽에만 있는 0x 주소는 나온 순서대로 자리표로

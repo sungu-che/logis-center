@@ -1,6 +1,6 @@
 //! 자연어 검색 (원본 5682~6320): 글을 문맥으로 나누고 벡터 · SQL 로 찾은 행으로 LLM 이 답을 만들어 talks 에 쌓는다.
 
-use logis_worker_common::gzip::{decode_utf8, gzip_json, ungzip};
+use logis_worker_common::gzip::{decode_utf8, gzip_json, ungzip, ungzip_json};
 use logis_worker_common::js::{self, Env};
 use logis_worker_common::jsv::{index_of, less_than, parse_str, tpl};
 use logis_worker_common::tables::TABLES;
@@ -173,11 +173,19 @@ pub async fn run(ctx: &mut Ctx, env: &Env) -> R<Flow> {
 
     // 유료 회원 이전 컨텍스트 합치기는 원본에서 주석 처리됨
 
+    // 고침 (fix-search-member-scope): 팀장이 아닌 사람의 검색은 그 사람의 멤버 범위(사이트 cc · 페이지 bcc — commerce 의 동기화 범위와 같은 규칙)의
+    // 행만 찾는다. 원본은 팀 전체에서 찾아, 팀 공통(homeCc) 대화로 쓰이는 답에 다른 페이지의 아이템이 담겼다. 팀장은 그대로(None)
+    let scope = if loose_eq(&task.g("from")?, &ctx.team.g("from")?) {
+        None
+    } else {
+        Some(search_scope(env, &ctx.zoneRegion, &task.g("from")?, &ctx.team.g("id")?).await?)
+    };
+
     if ctx.contexts.truthy() && ctx.contexts.g("length")?.truthy() {
         ctx.q = V::Num(0.0);
         while less_than(&ctx.q, &ctx.contexts.g("length")?) == Some(true) {
             // 몸통의 continue 는 q 반복으로 (Ok 로 돌아와 q 를 올린다)
-            context_step(ctx, env).await?;
+            context_step(ctx, env, scope.as_ref()).await?;
             ctx.q = inc(&ctx.q);
         }
     }
@@ -204,7 +212,7 @@ fn paragraphs_step(ctx: &mut Ctx) -> R<bool> {
 }
 
 /// 문맥 하나 (5879~6317). 일찍 Ok 로 돌아가는 곳이 원본의 q 반복 continue
-async fn context_step(ctx: &mut Ctx, env: &Env) -> R<()> {
+async fn context_step(ctx: &mut Ctx, env: &Env, scope: Option<&SearchScope>) -> R<()> {
     let task = ctx.task.clone();
     let team = ctx.team.clone();
     let models = ctx.models.clone();
@@ -413,7 +421,7 @@ async fn context_step(ctx: &mut Ctx, env: &Env) -> R<()> {
 
         console_log!("type", ctx.type_.clone());
 
-        if let Err(err) = vector_rows(ctx, env, &match_params).await {
+        if let Err(err) = vector_rows(ctx, env, &match_params, scope).await {
             console_log!("matches_condition", err);
         }
     }
@@ -429,7 +437,7 @@ async fn context_step(ctx: &mut Ctx, env: &Env) -> R<()> {
     console_log!("after condition", ctx.condition.clone());
 
     if ctx.condition.truthy() {
-        if let Err(err) = sql_rows(ctx, env, params).await {
+        if let Err(err) = sql_rows(ctx, env, params, scope).await {
             console_log!("text2sql err", err);
         }
     }
@@ -512,11 +520,16 @@ async fn context_step(ctx: &mut Ctx, env: &Env) -> R<()> {
 }
 
 /// 6107~6145 의 try 안: 벡터로 찾은 id 들의 행
-async fn vector_rows(ctx: &mut Ctx, env: &Env, params: &[V]) -> R<()> {
+async fn vector_rows(ctx: &mut Ctx, env: &Env, params: &[V], scope: Option<&SearchScope>) -> R<()> {
     let table = search_table(&ctx.type_)?;
     let db = tpl(T6108, &[ctx.zoneRegion.clone(), ctx.type_.clone()]);
-    let sql = format!("SELECT * FROM {table} WHERE {} LIMIT 100", ctx.matches_condition.to_str());
-    ctx.results = select_bound(env, &db, &sql, params).await?;
+    // 고침 (fix-search-member-scope): 범위가 있으면 OR 로 이은 조각을 괄호로 묶고 범위를 붙인다 (Vectorize 는 팀으로만 거르고, 행을 읽을 때 거른다)
+    let sql = match scope {
+        Some(_) => format!("SELECT * FROM {table} WHERE ({}){} LIMIT 100", ctx.matches_condition.to_str(), scope_sql(scope, params.len() + 1)),
+        None => format!("SELECT * FROM {table} WHERE {} LIMIT 100", ctx.matches_condition.to_str()),
+    };
+    let params = [params.to_vec(), scope_params(scope)].concat();
+    ctx.results = select_bound(env, &db, &sql, &params).await?;
 
     if ctx.results.length()?.truthy() {
         ctx.r = V::Num(0.0);
@@ -551,7 +564,7 @@ async fn vector_rows(ctx: &mut Ctx, env: &Env, params: &[V]) -> R<()> {
 }
 
 /// 6160~6212 의 try 안: 조건 SQL 로 찾은 행
-async fn sql_rows(ctx: &mut Ctx, env: &Env, mut params: Vec<V>) -> R<()> {
+async fn sql_rows(ctx: &mut Ctx, env: &Env, mut params: Vec<V>, scope: Option<&SearchScope>) -> R<()> {
     let now = ctx.now.clone();
     let team = ctx.team.clone();
 
@@ -573,7 +586,10 @@ async fn sql_rows(ctx: &mut Ctx, env: &Env, mut params: Vec<V>) -> R<()> {
     }
 
     let to = ph(&mut params, text(&team.g("id")?));
-    let sql = format!("SELECT * FROM {table} WHERE {} AND \"to\" = {to} {} LIMIT 300", ctx.condition.to_str(), ctx.orderBy.to_str());
+    // 고침 (fix-search-member-scope): 팀장이 아니면 멤버 범위의 행만
+    let s = scope_sql(scope, params.len() + 1);
+    params.extend(scope_params(scope));
+    let sql = format!("SELECT * FROM {table} WHERE {} AND \"to\" = {to}{s} {} LIMIT 300", ctx.condition.to_str(), ctx.orderBy.to_str());
     console_log!(sql.clone());
 
     let db = tpl(T6167, &[ctx.zoneRegion.clone(), ctx.type_.clone()]);
@@ -620,4 +636,68 @@ async fn sql_rows(ctx: &mut Ctx, env: &Env, mut params: Vec<V>) -> R<()> {
         ctx.rag.g("search")?.s_("sql", obj! { "results" => ctx.results.clone() })?;
     }
     Ok(())
+}
+
+/// fix-search-member-scope: 팀장이 아닌 사람의 검색 범위 — commerce 의 `member_sync_scope` 와 같은 규칙에서 행 쪽(cc · bcc)만.
+/// `ccs` = homeCc(팀 공통) + 멤버 행 bcc(사이트 행은 bcc = cc), `bccs` = 멤버 행 bcc + 그 bcc 를 가진 팀 페이지 행 type 의 목록 · 상세 두 꼴.
+/// sales · event · tracking 행은 proxy 가 아이템의 cc · bcc 를 그대로 쓴다
+pub(crate) struct SearchScope {
+    ccs: Vec<String>,
+    bccs: Vec<String>,
+}
+
+fn push_unique(list: &mut Vec<String>, s: String) {
+    if !list.contains(&s) {
+        list.push(s);
+    }
+}
+
+const SQL_MEMBER_BCCS: &str = r#"SELECT "bcc" FROM items WHERE "type" = 'member' AND "from" = ?1 AND "to" = ?2 LIMIT 1000"#;
+const SQL_TEAM_PAGES: &str = r#"SELECT "id", "cc", "bcc", "data" FROM items WHERE "type" = 'pages' AND "to" = ?1 LIMIT 1000"#;
+
+/// `await searchMemberScope(env, zoneRegion, task.from, team.id)`
+async fn search_scope(env: &Env, zone: &V, address: &V, team_id: &V) -> R<SearchScope> {
+    let db = format!("commerce_logis_{}_items", zone.to_str());
+    let rows = js::query_bound(env, &db, SQL_MEMBER_BCCS, &[address.clone(), team_id.clone()]).await?;
+    let mut member: Vec<String> = Vec::new();
+    for row in rows.items() {
+        if let Some(b) = row.get("bcc").as_str() {
+            if !b.is_empty() {
+                push_unique(&mut member, b.to_string());
+            }
+        }
+    }
+    let mut ccs = vec![hash_id(&V::from("logis.center"))?];
+    for b in &member {
+        push_unique(&mut ccs, b.clone());
+    }
+    let mut bccs = member.clone();
+    for p in js::query_bound(env, &db, SQL_TEAM_PAGES, &[team_id.clone()]).await?.items() {
+        let data = ungzip_json(&p.get("data")).unwrap_or(V::Undef);
+        let type_ = data.get("type").as_str().unwrap_or("").to_string();
+        if let (Some(cc), Some(bcc)) = (p.get("cc").as_str(), p.get("bcc").as_str()) {
+            if member.iter().any(|m| m == bcc) && !type_.is_empty() {
+                push_unique(&mut bccs, hash_id(&V::from(type_.clone() + cc))?);
+                push_unique(&mut bccs, hash_id(&V::from(type_.clone() + &logis_worker_common::jsv::to_upper(cc)))?);
+            }
+        }
+    }
+    Ok(SearchScope { ccs, bccs })
+}
+
+/// `searchScopeSql(scope, n)` — 팀장(None)이면 빈 글. ?n · ?n+1 은 JSON 배열(json_each 로 풂)
+fn scope_sql(scope: Option<&SearchScope>, n: usize) -> String {
+    match scope {
+        Some(_) => format!(r#" AND ("cc" IN (SELECT value FROM json_each(?{n})) OR "bcc" IN (SELECT value FROM json_each(?{})))"#, n + 1),
+        None => String::new(),
+    }
+}
+
+/// `searchScopeParams(scope)`
+fn scope_params(scope: Option<&SearchScope>) -> Vec<V> {
+    let list = |l: &[String]| V::from(stringify_str(&V::from(l.iter().map(|s| V::from(s.as_str())).collect::<Vec<_>>())));
+    match scope {
+        Some(s) => vec![list(&s.ccs), list(&s.bccs)],
+        None => Vec::new(),
+    }
 }

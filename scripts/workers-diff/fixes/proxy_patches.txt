@@ -1,0 +1,92 @@
+proxy 원본(801b0ce0)에 덧대는 수정 — fixes/proxy_scope.mjs 가 읽는다. Rust 판(workers/proxy)의 같은 id 의 수정과 1:1.
+꼴은 commerce_patches.txt 와 같다: "@@ <id>" 줄, 고를 수 있는 "@@ count <n>", 그다음 "<<< find" … "=== replace" … ">>>". find 는 공백을 무시하고 맞춘다.
+
+=====================================================================================================================
+fix-search-member-scope: 자연어 검색(5682~6320)은 Vectorize 를 { type, to: 팀 } 으로만 거르고 행도 "to" = 팀 으로만 읽어, 팀장이 아닌 사람의 검색 답
+(팀 공통 homeCc 의 대화로 쓰임)에 그 사람이 볼 수 없는 페이지의 아이템이 담겼다 → 검색한 사람(task.from)이 팀장(team.from)이 아니면, 벡터로 찾은 행과
+조건 SQL 의 행을 그 사람의 멤버 범위(commerce 의 동기화 범위와 같은 규칙 — cc ∈ homeCc + 멤버 행 bcc, bcc ∈ 멤버 행 bcc + 그 페이지 type 의 두 꼴)로 거른다.
+팀장은 질의 그대로. workers/proxy/src/search.rs 와 1:1.
+@@ fix-search-member-scope
+<<< find
+function hashId(text){
+=== replace
+// fix-search-member-scope: 팀장이 아닌 사람의 검색 범위 — commerce 의 memberSyncScope 와 같은 규칙에서 행 쪽(cc · bcc)만
+async function searchMemberScope(env, zone, address, teamId){
+	var db = env[`commerce_logis_${zone}_items`]
+	var add = (list, value) => {
+		if(list.indexOf(value) < 0){
+			list.push(value)
+		}
+	}
+	var { results } = await db.prepare(`SELECT "bcc" FROM items WHERE "type" = 'member' AND "from" = ?1 AND "to" = ?2 LIMIT 1000`).bind(address, teamId).all()
+	var member = []
+	results.forEach(row => {
+		if(typeof row.bcc == "string" && row.bcc){
+			add(member, row.bcc)
+		}
+	})
+	var ccs = [hashId('logis.center')]
+	member.forEach(bcc => add(ccs, bcc))
+	var bccs = member.slice()
+	var pages = (await db.prepare(`SELECT "id", "cc", "bcc", "data" FROM items WHERE "type" = 'pages' AND "to" = ?1 LIMIT 1000`).bind(teamId).all()).results
+	pages.forEach(p => {
+		var data
+		try{
+			data = JSON.parse(new TextDecoder('utf-8').decode(ungzip(p.data)))
+		}catch(err){
+			data = undefined
+		}
+		var type = data && typeof data == "object" && typeof data.type == "string" ? data.type : ''
+		if(typeof p.cc == "string" && typeof p.bcc == "string" && member.indexOf(p.bcc) > -1 && type){
+			add(bccs, hashId(type + p.cc))
+			add(bccs, hashId(type + p.cc.toUpperCase()))
+		}
+	})
+	return { ccs : ccs, bccs : bccs }
+}
+
+// fix-search-member-scope: 팀장(null)이면 빈 글. ?n · ?n+1 은 JSON 배열(json_each 로 풂)
+function searchScopeSql(scope, n){
+	return scope ? ` AND ("cc" IN (SELECT value FROM json_each(?${n})) OR "bcc" IN (SELECT value FROM json_each(?${n + 1})))` : ''
+}
+
+function searchScopeParams(scope){
+	return scope ? [JSON.stringify(scope.ccs), JSON.stringify(scope.bccs)] : []
+}
+
+// fix-search-member-scope: 범위가 있을 때만 바인딩 (팀장의 문장은 그대로)
+function searchScopeBind(stmt, scope){
+	return scope ? stmt.bind(...searchScopeParams(scope)) : stmt
+}
+
+function hashId(text){
+>>>
+
+@@ fix-search-member-scope
+<<< find
+if(contexts){
+									if(contexts.length){
+										for(var q = 0; q < contexts.length; q++){
+=== replace
+// fix-search-member-scope: 팀장이 아니면 그 사람의 멤버 범위의 행만 찾는다 (팀장은 null — 질의 그대로)
+								var searchScope = task.from == team.from ? null : await searchMemberScope(env, zoneRegion, task.from, team.id)
+
+								if(contexts){
+									if(contexts.length){
+										for(var q = 0; q < contexts.length; q++){
+>>>
+
+범위가 있으면 OR 로 이은 조각을 괄호로 묶고 범위를 붙인다 (원본의 이 문장은 값을 글에 넣어 자리표가 없으므로 범위는 ?1 · ?2)
+@@ fix-search-member-scope
+<<< find
+var { results } = await env[`commerce_logis_${zoneRegion}_${type}`].prepare(`SELECT * FROM ${type} WHERE ${matches_condition} LIMIT 100`).all()
+=== replace
+var { results } = await searchScopeBind(env[`commerce_logis_${zoneRegion}_${type}`].prepare(`SELECT * FROM ${type} WHERE ${searchScope ? '(' + matches_condition + ')' : matches_condition}${searchScopeSql(searchScope, 1)} LIMIT 100`), searchScope).all()
+>>>
+
+@@ fix-search-member-scope
+<<< find
+var { results } = await env[`commerce_logis_${zoneRegion}_${type}`].prepare(`SELECT * FROM ${type} WHERE ${condition} AND "to" = '${team.id}' ${orderBy} LIMIT 300`).all()
+=== replace
+var { results } = await searchScopeBind(env[`commerce_logis_${zoneRegion}_${type}`].prepare(`SELECT * FROM ${type} WHERE ${condition} AND "to" = '${team.id}'${searchScopeSql(searchScope, 1)} ${orderBy} LIMIT 300`), searchScope).all()
+>>>

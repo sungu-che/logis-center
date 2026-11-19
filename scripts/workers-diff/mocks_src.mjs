@@ -58,6 +58,16 @@ function wrapD1(db) {
     if (prop === "batch") return (list) => t.batch(list.map((s) => real.get(s) || s));
     const v = Reflect.get(t, prop); return typeof v === "function" ? v.bind(t) : v; } });
 }
+// 시나리오가 미리 넣어 둔 벡터(바인딩 __VEC_SEED = { [색인 이름]: [{ id, values, metadata }] } JSON) — 첫 요청 때 한 번, 기록 없이
+let seeded = false;
+function seedVectors(env) {
+  if (seeded) return;
+  seeded = true;
+  const seed = Reflect.get(env, "__VEC_SEED");
+  if (!seed) return;
+  for (const [name, list] of Object.entries(JSON.parse(seed))) { if (!store.has(name)) store.set(name, new Map()); for (const v of list) store.get(name).set(v.id, v); }
+}
 export function wrapEnv(env) {
+  seedVectors(env);
   return new Proxy(env, { get(target, prop) { if (prop === "AI") return ai; if (prop in vecs) return vecs[prop]; return wrapD1(Reflect.get(target, prop)); } });
 }`;

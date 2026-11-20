@@ -7,7 +7,7 @@
 use logis_worker_common::gzip::{gzip_json, ungzip_json};
 use logis_worker_common::js::{self, Env};
 use logis_worker_common::jsv::{add, index_of, num_to_string, Throw};
-use logis_worker_common::tables::{lookup, CENTER_REGION, LANGUAGE_CODE, LOGIS_REGION, TABLES};
+use logis_worker_tables::tables::{lookup, CENTER_REGION, LANGUAGE_CODE, LOGIS_REGION, TABLES};
 use logis_worker_common::util::is_diff;
 use logis_worker_common::{console_log, date, obj, stringify_str, R, V};
 

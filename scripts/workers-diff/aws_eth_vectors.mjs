@@ -1,5 +1,6 @@
 // aws4fetch 1.0.20 의 sign() 결과(주소 · 방법 · 머리글 반복 순서 · 본문)와 ethers 6 의 isAddress · computeAddress 기준값.
-// node aws_eth_vectors.mjs ../../workers/common/tests/aws_eth_vectors.json
+// node aws_eth_vectors.mjs ../../../premium-discount/workers/common/tests/aws_eth_vectors.json
+// (공용 층과 그 시험 벡터는 premium-discount 의 workers/common 으로 옮겨 갔다. 벡터를 다시 뽑으면 그쪽에 커밋한다)
 // 값 표기: 없는 칸 = undefined, null = null. 본문은 { str } (문자열) · { b64 } (Uint8Array).
 import { AwsClient } from "aws4fetch";
 import { ethers } from "ethers";

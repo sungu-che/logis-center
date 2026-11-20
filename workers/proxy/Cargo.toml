@@ -11,6 +11,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 logis-worker-common.workspace = true
+logis-worker-tables.workspace = true
 scraper.workspace = true
 url = "2"
 regex.workspace = true

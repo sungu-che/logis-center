@@ -5,7 +5,7 @@
 use logis_worker_common::gzip::{decode_utf8, gzip_json, ungzip};
 use logis_worker_common::js::{self, Env};
 use logis_worker_common::jsv::{js_trim_start, less_than, to_lower, to_upper, tpl, Throw};
-use logis_worker_common::tables::CENTER_REGION;
+use logis_worker_tables::tables::CENTER_REGION;
 use logis_worker_common::util::hash_id;
 use logis_worker_common::web::{headers_set, Req};
 use logis_worker_common::{add, console_log, eth, loose_eq, obj, parse_str, stringify_str, R, V};

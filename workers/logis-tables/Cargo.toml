@@ -1,0 +1,15 @@
+[package]
+name = "logis-worker-tables"
+description = "logis-center Workers 에만 쓰는 것: 원본 index.ts 의 지역 · 언어 표(tables, 생성)와 LLM 이 낸 망가진 JSON 고치기(dirty_json). 공용 층은 premium-discount-worker-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+logis-worker-common.workspace = true
+regex.workspace = true
+fancy-regex.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

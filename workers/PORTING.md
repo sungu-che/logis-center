@@ -67,7 +67,7 @@ JS 의 `var` 는 함수 범위라 반복을 넘어 값이 남고 안쪽 반복�
 - Workers AI: `env.ai_run(model, &input).await?` · Vectorize: `env.vectorize_upsert(name, &vectors).await?` · `env.vectorize_query(name, &vector, &options).await?`.
 - LLM: `crate::llm::deepinfra(&key, &model, &system, &user, &config, &inline_data).await?` · `crate::llm::gemini(…)` (빠진 인자는 `V::Undef`, `null` 은 `V::Null`).
 - gzip: `gzip::ungzip_json(&row.g("data")?)?` · `gzip::gzip_json(&x)?`(D1 에 넣는 ArrayBuffer).
-- 표: `tables::lookup(LOGIS_REGION, &flag)` · `LANGUAGE_CODE` · `CENTER_REGION`.
+- 표: `logis_worker_tables::tables::lookup(LOGIS_REGION, &flag)` · `LANGUAGE_CODE` · `CENTER_REGION` (공용 층 `logis_worker_common` 은 premium-discount-worker-common).
 - 규칙 · 프롬프트: `crate::rules::{image2json, list2json, item2json, related, relay, parse_status, paragraph2propertys, parse_condition, …}`,
   `logis_worker_common::util::{hash_id, digest, crc32, merge_node, is_diff, clean_number, normalize_numeric_homoglyphs, rows_trim, …}`.
 - DOM: `crate::dom::Document::parse(&html)` → `query_selector_all(sel)?` · `query_selector(sel)?` · `text_content(id)` · `get_attribute(id, name)`.

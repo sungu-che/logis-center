@@ -3,7 +3,7 @@
 
 use logis_worker_common::js::{self, Env};
 use logis_worker_common::jsv::{index_of, strict_eq, tpl, Throw};
-use logis_worker_common::tables::CENTER_REGION;
+use logis_worker_tables::tables::CENTER_REGION;
 use logis_worker_common::util::{hash_id, merge_node};
 use logis_worker_common::{console_log, loose_eq, obj, R, V};
 

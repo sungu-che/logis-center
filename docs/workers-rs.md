@@ -13,11 +13,11 @@ workers/                    자기 Cargo 작업 공간 (wasm32, 루트 작업 �
 ├─ Cargo.toml  .cargo/      target-dir · wasm 의 getrandom 백엔드 (루트의 target-cpu=native 를 덮음)
 ├─ PORTING.md               옮기는 규칙 (JS → Rust 대응표)
 ├─ migrations/              D1 스키마 한 벌 (두 워커가 같이 씀, 파일 이름은 원본 그대로 — wrangler 가 이름으로 적용 이력을 본다)
-├─ common/                  logis-worker-common
-│  ├─ jsv.rs                JS 값 모형 V: 참조 공유 · undefined/null · 던지는 속성 읽기(엄격 모드) · JS 키 순서 · ryu-js 수 표기 · JSON
-│  ├─ js.rs                 D1 · Workers AI · Vectorize · fetch 를 JS 그대로 부름 (wasm 전용)
-│  ├─ gzip.rs               pako ungzip/gzip — D1 숫자 배열 입력에서 pako 가 던지는 자리까지 재현
-│  ├─ date.rs · util.rs · dirty_json.rs · tables.rs · platform.rs
+├─ (공용 층)                premium-discount-worker-common @ 60c3614 (git, 이름은 logis-worker-common — 아래 "공용 층")
+│                           jsv(JS 값 모형 V) · js(D1 · Workers AI · Vectorize · fetch, wasm 전용) · gzip(pako) · date · util · platform · web · aws · eth
+├─ logis-tables/            logis-worker-tables: logis 에만 쓰는 것
+│  ├─ tables.rs             원본 index.ts 의 지역 · 언어 표 (scripts/workers-gen/gen_tables.py 로 생성)
+│  └─ dirty_json.rs         normalizeToJsonString · parseDirtyJson (LLM 이 낸 망가진 JSON 고치기)
 ├─ commerce/                commerce-logis-center: 세션(S3) · 페이지 · 멤버 · 작업 대기열 API (원본 별도 저장소 fd1e991, 아래 "commerce")
 ├─ trading/                 trading-logis-center: 무역 문서 동기화 API (원본 65684e6, 새 D1 · migrations/ 는 이 워커 것)
 ├─ apac/                    cron 워커 (lib.rs 하나)
@@ -42,6 +42,32 @@ scripts/workers-diff/       차분 시험대 (아래)
   그 함수가 없어 모든 처리기가 예외로 끝났습니다. 0.8.7 로 고정했습니다(`worker-build@0.8.7` 도 같이).
 - Vectorize 는 workers-rs 에 감싼 형이 없어 바인딩 객체의 `upsert` · `query` 를 JS 그대로 부릅니다(D1 · AI 도 같은 방식).
 
+### 공용 층 (premium-discount-worker-common)
+
+예전 `workers/common`(logis-worker-common)은 premium-discount 로 옮겨 갔고(PD 의 `workers/common`, 370d67a3 에서 복사), 이제 PD 가 주인입니다.
+`workers/Cargo.toml` 이 루트 Cargo.toml 의 다른 premium-discount-* 와 같은 꼴로 가져옵니다:
+
+```toml
+logis-worker-common = { package = "premium-discount-worker-common", git = "https://github.com/Qntology/premium-discount", rev = "60c3614667f1229a1de834a223a8e4842a663600" }
+```
+
+- 이름을 `logis-worker-common` 으로 붙여 워커 소스의 `use logis_worker_common::…` 은 그대로입니다. PD crate 의 작업 공간 상속과
+  `../../crates/premium-discount-identity` 경로 의존은 git 으로도 그대로 풀립니다(같은 저장소 안).
+- 올리기: `rev` 를 새 전체 SHA 로 바꾸고 `cargo update -p premium-discount-worker-common` → 아래 "검증" 을 다시 돌립니다.
+  리비전은 fork(sungu-che)에만 있어도 Qntology 주소로 받아집니다(같은 fork 네트워크, 루트의 premium-discount-* 도 같음).
+- 같이 고칠 때: `workers/Cargo.toml` 끝의 `[patch."https://github.com/Qntology/premium-discount"]` 주석을 풀면 `../premium-discount` 를 씁니다.
+- 공용 층의 시험(`tests/aws_eth.rs` · `tests/pako_array.rs` 와 그 JSON)은 PD 에 있습니다. 벡터 생성기(`scripts/workers-diff/aws_eth_vectors.mjs` ·
+  `pako_vectors.mjs`)는 여기 남았고 출력은 옆 checkout `../premium-discount/workers/common/tests/` 로 갑니다. logis 의 `cargo test` 는 PD crate 시험을 돌리지 않습니다.
+- PD 쪽에서 달라진 것(60c3614 기준, logis 출력은 그대로 — 아래 "검증"):
+  - `util::hash_str`: logis-schema `hash::hash_id` 를 부르던 것을 같은 코드(premium-discount-identity + `logis-rehash:` 다시 해시 + crc32)로 옮겨 넣음.
+    60,005 개 입력에서 두 구현의 값이 모두 같았습니다. 그래서 워커 작업 공간에 logis-schema(chrono · dirs …)가 더는 들어오지 않습니다.
+  - `js::to_throw`: Error 가 아닌 던진 값(`throw "x"`)을 이름 없는 `Throw::value` 로 둡니다(예전에는 `Error: x`). JS 의 `String(err)` 와 같아져 더 맞습니다.
+    logis 의 시험한 경로에서는 그런 값이 던져지지 않아 `console` 표 · 로그가 그대로였습니다.
+  - `js::req_from`: `request.method` 를 그대로 둡니다(예전에는 worker::Method 를 거쳐 모르는 메서드가 GET 으로, `patch` 가 `PATCH` 로 바뀜).
+    원본 TS 와 같아지고, trading 이 따로 하던 덮어쓰기는 지웠습니다.
+  - `js::bind_exact` · `js::first` 가 더해짐 (logis 는 쓰지 않음).
+  - `tables` · `dirty_json` 은 가져가지 않아 `workers/logis-tables`(logis-worker-tables)로 옮겼습니다(바이트 그대로, `crate::jsv` · `crate::platform` 은 lib.rs 가 다시 내보냄).
+
 ## 검증
 
 | 무엇 | 결과 |
@@ -50,11 +76,12 @@ scripts/workers-diff/       차분 시험대 (아래)
 | 차분 시험 proxy (`node proxy.mjs`) | 고친 원본과 47/47 동일(fix-search-member-scope 를 빼면 search_scope_member · search_scope_site 만 DIFF — `PROXY_SKIP`) — 응답 · LLM 요청 본문 전부 · Workers AI · Vectorize 호출 · D1 11개 표 끝 상태(`console` 오류 기록 포함) |
 | 고치기 전 (2e82ecbb) | 고치지 않은 원본과 apac 5/5 · proxy 23/23 동일 (`ORIGINAL=raw node proxy.mjs` 로 다시 볼 수 있음) |
 | linkedom 대조 (`workers/proxy/tests/dom_vectors.rs`) | Pug 452/452 바이트 동일, 선택자 31,027/31,027 (SyntheticData 화면 96 · 경계 56 · 무작위 300). 따로 무작위 6,000 문서도 100 % |
-| pako 대조 (`workers/common/tests/pako_array.rs`) | 430 경우 (93 던짐) 모두 같음 |
-| `cargo test`(common · proxy), `cargo check --target wasm32-unknown-unknown` | 통과, 경고 없음 |
+| pako 대조 (PD `workers/common/tests/pako_array.rs`) | 430 경우 (93 던짐) 모두 같음 — 공용 층과 함께 PD 로 옮겨 감. 60c3614 에서 PD 의 `cargo test -p premium-discount-worker-common` 단위 12 · aws_eth 5 · pako 1 통과 |
+| `cargo test -j 2`(logis-tables · proxy · commerce · trading), `cargo check --target wasm32-unknown-unknown --workspace -j 2` | 통과, 경고 없음 |
+| 공용 층을 PD 60c3614 로 바꾼 뒤 (2026-11-20) | apac 5/5 · proxy 47/47 · commerce 59/59 · trading 58/58 그대로 동일. `hashId` 는 logis-schema 구현과 60,005 입력에서 같음. wasm(`build/index_bg.wasm`, 바이트) apac 390,378 → 391,494 · proxy 2,588,390 → 2,597,192 · commerce 2,154,412 → 2,153,624 · trading 1,913,387 → 1,913,206 |
 | 차분 시험 commerce (`node commerce.mjs`) | 고치기 전 원본과 28/28 (370d67a3), 고친 원본과 59/59 (fix-member-per-page 를 빼면 perpage_* 넷만 DIFF — 그때는 위에 덧댄 여섯도 함께 뺌, fix-member-search-answers 를 빼면 searchans_member_home 만, fix-member-sync-scope 를 빼면 scope_member_a · scope_site_member 와 멤버 동기화가 바뀐 invite_login · perpage_invited · perpage_revoke 만, fix-member-app-link 를 빼면 applink_member_a 만, fix-member-id-override 를 빼면 idoverride_member_a 만, fix-member-task-team-leak 을 빼면 taskleak_member_a 만, fix-member-page-list 를 빼면 팀장이 아닌 사람의 JSON GET 이 있는 perpage_invited · perpage_app_old_member · perpage_revoke · scope_member_a · idoverride_member_a · taskleak_member_a 만 DIFF) — 응답(상태 · 머리글 · Set-Cookie · 본문) · S3 요청(서명은 aws4fetch 로 다시 계산해 확인) · D1 · S3 끝 상태 |
 | 차분 시험 trading (`node trading.mjs`) | 고치기 전 원본과 41/41 (370d67a3), 고친 원본과 58/58 |
-| `wrangler deploy --dry-run` (두 워커) | 빌드 · 바인딩 확인 통과. proxy 2,547 KiB (gzip 889 KiB), apac 419 KiB (gzip 166 KiB) |
+| `wrangler deploy --dry-run` (두 워커) | 빌드 · 바인딩 확인 통과. proxy 2,547 KiB (gzip 889 KiB), apac 419 KiB (gzip 166 KiB). PD 공용 층으로 바꾼 뒤 apac 416 KiB (gzip 165 KiB) |
 
 차분 시험대는 원본(git 이력에서 꺼낸 TS 를 esbuild 로 묶음)과 Rust 빌드를 Miniflare 에서 같은 조건으로 돌립니다:
 같은 D1 행, 같은 가상 시계(setTimeout 이 시계를 밀고 바로 실행), 같은 씨앗의 `Math.random`, 같은 가짜 LLM 응답(프롬프트로 어느 호출인지 가림),
@@ -69,7 +96,7 @@ D1 의 undefined 바인딩 수정은 진입 모듈의 env 래퍼가 원본 쪽�
 
 ```
 cd scripts/workers-diff && npm install
-(cd ../../workers/apac && worker-build --release) && (cd ../../workers/proxy && worker-build --release)
+(cd ../../workers/apac && worker-build --release) && (cd ../../workers/proxy && worker-build --release)   # 처음 빌드는 공용 층을 git 으로 받는다 (github.com 접근 필요)
 node apac.mjs && node proxy.mjs          # ONLY=scan_goods_list node proxy.mjs 로 하나만, PROXY_SKIP=<id> 면 그 수정만 빼고
 ```
 
@@ -307,6 +334,7 @@ DELETE 응답의 Content-Type 없음, POST 성공 응답의 `ref` 에 href.
 
 `wrangler.json` 의 바인딩 · 이름 · 크론은 그대로이고, `main` 이 `build/index.js`, `build.command` 가
 `cargo install -q worker-build@0.8.7 --locked && worker-build --release` 입니다. 배포 PC 에는 Rust 와 `wasm32-unknown-unknown` 표적이 있어야 합니다.
+공용 층(premium-discount-worker-common)을 git 으로 받으므로 github.com 의 Qntology/premium-discount 에 닿아야 합니다(한 번 받으면 cargo 가 보관).
 `npm run deploy`(predeploy 가 `migrations/` 를 DB 에 적용).
 
 - commerce: 정적 자산(셸 HTML 이 읽는 `static/js/content.js` 등)은 `web/commerce/` 에서 올라갑니다(`assets.directory`). 비밀 값

@@ -11,6 +11,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 logis-worker-common.workspace = true
+logis-worker-tables.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 worker.workspace = true

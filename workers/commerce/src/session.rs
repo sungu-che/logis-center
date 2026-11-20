@@ -7,7 +7,7 @@
 use logis_worker_common::gzip::{decode_utf8, gzip_json, ungzip};
 use logis_worker_common::js::{self, Env};
 use logis_worker_common::jsv::{index_of, less_than, quote, to_lower, tpl, Throw};
-use logis_worker_common::tables::{lookup, CENTER_REGION, HELLO, LANGUAGE_CODE, LOGIS_REGION, TWO_PART_DOMAINS};
+use logis_worker_tables::tables::{lookup, CENTER_REGION, HELLO, LANGUAGE_CODE, LOGIS_REGION, TWO_PART_DOMAINS};
 use logis_worker_common::util::hash_id;
 use logis_worker_common::web::{headers_append, headers_new, headers_set, Req};
 use logis_worker_common::{add, aws, console_log, date, eth, loose_eq, obj, parse_str, platform, stringify_str, R, V};

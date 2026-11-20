@@ -41,10 +41,8 @@ mod worker_main {
     #[wasm_bindgen(js_name = fetch)]
     pub async fn fetch(req: web_sys::Request, env: worker::Env, _ctx: worker::worker_sys::Context) -> Result<JsValue, JsValue> {
         logis_worker_common::platform::install_panic_hook();
-        // request.method 그대로 (worker::Method 는 모르는 메서드를 바꾼다)
-        let method = req.method();
-        let mut r = req_from(worker::Request::from(req)).await;
-        r.method = method;
+        // req_from 이 request.method 를 그대로 둔다 (worker::Method 를 거치지 않음 — premium-discount-worker-common 60c3614)
+        let r = req_from(worker::Request::from(req)).await;
         match crate::handler::fetch(r, Env(env)).await {
             Ok(resp) => {
                 let resp = resp_into(resp).map_err(|e| JsValue::from(js_sys::Error::new(&e.to_string())))?;

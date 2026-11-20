@@ -9,7 +9,7 @@ mod worker_main {
     use logis_worker_common::js::{self, Body, Env};
     use logis_worker_common::jsv::Throw;
     use logis_worker_common::platform::{now, sleep};
-    use logis_worker_common::tables::{lookup, LOGIS_REGION};
+    use logis_worker_tables::tables::{lookup, LOGIS_REGION};
     use logis_worker_common::util::{is_diff, random_below};
     use logis_worker_common::{console_log, gzip, loose_eq, obj, stringify_str, R, V};
     use worker::{event, ScheduleContext, ScheduledEvent};

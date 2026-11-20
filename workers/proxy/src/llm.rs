@@ -1,6 +1,6 @@
 //! `Deepinfra(key, model, system, user, config, inlineData)` · `Gemini(...)` — 원본 그대로 (같은 요청 본문, 같은 응답 해석).
 
-use logis_worker_common::dirty_json::parse_dirty_json;
+use logis_worker_tables::dirty_json::parse_dirty_json;
 use logis_worker_common::js::{self, Body};
 use logis_worker_common::jsv::{add, index_of, js_trim, parse_str, stringify_checked, V};
 use logis_worker_common::{console_log, obj, R};

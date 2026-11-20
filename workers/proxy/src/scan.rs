@@ -7,7 +7,7 @@
 use logis_worker_common::gzip::{decode_utf8, gzip_json, ungzip};
 use logis_worker_common::js::{self, Env};
 use logis_worker_common::jsv::{add, js_trim, less_than, loose_eq, parse_str, tpl, Throw};
-use logis_worker_common::tables::CENTER_REGION;
+use logis_worker_tables::tables::CENTER_REGION;
 use logis_worker_common::util::{hash_id, merge_node};
 use logis_worker_common::{arr, console_log, obj, stringify_str, R, V};
 

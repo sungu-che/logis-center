@@ -6,7 +6,7 @@
   "scripts": {
     "apac": "node apac.mjs",
     "proxy": "node proxy.mjs",
-    "vectors:pako": "node pako_vectors.mjs ../../workers/common/tests/pako_array.json",
+    "vectors:pako": "node pako_vectors.mjs ../../../premium-discount/workers/common/tests/pako_array.json",
     "vectors:dom": "node dom_vectors.mjs ../../SyntheticData/commerce/output_html ../../workers/proxy/tests/dom_vectors.json"
   },
   "dependencies": {

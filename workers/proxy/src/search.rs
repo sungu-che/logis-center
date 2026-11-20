@@ -3,7 +3,7 @@
 use logis_worker_common::gzip::{decode_utf8, gzip_json, ungzip, ungzip_json};
 use logis_worker_common::js::{self, Env};
 use logis_worker_common::jsv::{index_of, less_than, parse_str, tpl};
-use logis_worker_common::tables::TABLES;
+use logis_worker_tables::tables::TABLES;
 use logis_worker_common::util::{hash_id, rows_trim};
 use logis_worker_common::{add, arr, console_log, loose_eq, obj, stringify_str, Throw, R, V};
 

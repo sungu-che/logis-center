@@ -58,7 +58,7 @@ pub fn domain_cc_text(current_host: &str) -> String {
         }
     };
     // 원본 그대로: endsWith 라 "xco.kr" 같은 이름도 두 부분 도메인으로 친다
-    if logis_worker_common::tables::TWO_PART_DOMAINS.iter().any(|d| current_host.ends_with(d)) {
+    if logis_worker_tables::tables::TWO_PART_DOMAINS.iter().any(|d| current_host.ends_with(d)) {
         part(3) + "." + &part(2) + "." + &part(1)
     } else {
         part(2) + "." + &part(1)

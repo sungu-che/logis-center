@@ -441,7 +441,8 @@ async fn member_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
     all_into(ctx, stmt).await?;
 
     if ctx.results.length()?.truthy() {
-        // 고침 (fix-member-search-answers): 팀장이 아니면 남의 검색 답(팀 공통 페이지에 쌓인 proxy 검색의 답 — 검색한 사람이 행에 없음)은 싣지 않는다
+        // 고침 (fix-member-search-answers): 팀장이 아니면 남의 검색 답(팀 공통 페이지에 쌓인 proxy 검색의 답)은 싣지 않는다.
+        // 검색한 사람은 data.by(fix-search-answer-owner), 그것이 없는 옛 답은 원래 작업으로 이어 가린다
         let foreign = if scope.is_some() {
             crate::fixes::foreign_search_answers(env, &ctx.logisRegion.to_key(), &ctx.results, &cookies.g("team")?, &cookies.g("address")?).await?
         } else {

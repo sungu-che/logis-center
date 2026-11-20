@@ -106,7 +106,7 @@ export const SCENARIOS = [
       : gemini({}),
   },
   {
-    name: "search_deepinfra",
+    name: "search_deepinfra", fixes: ["fix-search-answer-owner"],
     rows: ROWS(TASK({ type: "prompt", body: "올해 여름 이벤트로 판매된 제품중에서 무거운 제품으로 5000원 이하로 많이 팔린 제품 중에서 리뷰를 남긴 고객의 메세지도 보여줘" }), SALES(6)),
     request: REQUEST(), llm: SEARCH_LLM(),
   },
@@ -116,13 +116,13 @@ export const SCENARIOS = [
     request: REQUEST({ models: { deepinfra: 0, "G1-gemini-flash-lite-latest": 4000 } }), llm: SEARCH_LLM(),
   },
   {
-    name: "search_dirty_json",
+    name: "search_dirty_json", fixes: ["fix-search-answer-owner"],
     rows: ROWS(TASK({ type: "prompt", body: "쿠폰 이벤트 현황" })),
     request: REQUEST(),
     llm: ({ url, body }) => { const p = promptOf(body); return p.includes("Segment the natural language content") ? chat("```json\n{context: [{language: 'Korean', type: 'coupon', text: '쿠폰 이벤트',},],}\n```") : SEARCH_LLM()({ url, body }); },
   },
   {
-    name: "search_single_context",
+    name: "search_single_context", fixes: ["fix-search-answer-owner"],
     rows: ROWS(TASK({ type: "prompt", body: "재고 적은 상품" }), SALES(2)),
     request: REQUEST(),
     llm: SEARCH_LLM({ contexts: { type: "goods", condition: { quantity: { lte: 3 } } }, context: { context: [{ language: "Korean", type: "goods", text: "재고 적은 상품" }] } }),

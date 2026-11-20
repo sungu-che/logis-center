@@ -65,7 +65,7 @@ export default ({ T0, REQUEST, ROWS, TASK, SALES, chat, gemini, promptOf, SEARCH
     // DeepInfra 가 두 번째 문맥 답에서 바닥나고 Gemini 가 없으면 첫 문맥의 답을 다시 쓴다. (두 문맥이 모두 답을 내면 talks 에
     // 무작위 id 행이 둘 생겨 id 순 정렬이 실행마다 달라지므로, 두 번째 문맥은 답을 못 내게 한다)
     {
-      name: "fix_search_generation_per_context",
+      name: "fix_search_generation_per_context", fixes: ["fix-search-answer-owner"],
       rows: searchRows("무거운 제품과 취소된 주문"),
       request: REQUEST({ models: { deepinfra: 3, cloudflare: 3000 }, gemini_llm_api: "" }),
       llm: SEARCH_LLM({ contexts: TWO_CONTEXTS }),
@@ -86,21 +86,21 @@ export default ({ T0, REQUEST, ROWS, TASK, SALES, chat, gemini, promptOf, SEARCH
     },
     // fix-search-primitive-results: contexts 원소가 글 — 원본은 context.id = hashId() 에서 던지고, 고친 판은 유형 없는 문맥으로 건너뛴다
     {
-      name: "fix_search_contexts_strings",
+      name: "fix_search_contexts_strings", fixes: ["fix-search-answer-owner"],
       rows: searchRows("여름 상품"),
       request: REQUEST(),
       llm: SEARCH_LLM({ contexts: { contexts: ["여름 상품", { type: "goods", text: "여름 상품", substantial: "sale_price", find: "few", condition: { sale_price: { gte: 1000 } } }] } }),
     },
     // fix-search-condition-guard: 문맥에 condition 이 없다 — 원본은 Object.keys(undefined) 에서 던진다
     {
-      name: "fix_search_condition_missing",
+      name: "fix_search_condition_missing", fixes: ["fix-search-answer-owner"],
       rows: searchRows("무거운 제품"),
       request: REQUEST(),
       llm: SEARCH_LLM({ contexts: { contexts: [{ type: "goods", text: "무거운 제품", substantial: "weight", find: "heavy" }] } }),
     },
     // fix-search-created-at: 날짜 조건(시작만) + now 뒤에 만들어진 판매 행 — 고친 판만 "created_at" < now 를 붙여 그 행을 뺀다
     {
-      name: "fix_search_created_at_bound",
+      name: "fix_search_created_at_bound", fixes: ["fix-search-answer-owner"],
       rows: searchRows("6월 이후 상품", [
         { db: "commerce_logis_apac1_sales", table: "sales", values: {
           id: "SF", type: "goods", from: "0xowner", to: "0xteam", cc: "shop.example.com", ref: "RF",

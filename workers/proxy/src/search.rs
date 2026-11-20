@@ -474,6 +474,9 @@ async fn context_step(ctx: &mut Ctx, env: &Env, scope: Option<&SearchScope>) -> 
         "markdown" => ctx.generation.g("markdown")?,
         "results" => ctx.generation.g("results")?,
         "search" => ctx.rag.g("search")?,
+        // 고침 (fix-search-answer-owner): 검색한 사람(task.from)을 답의 data 에 남긴다 — 열(from = 팀 · to · cc · bcc)은 클라이언트가 읽어 그대로 둔다.
+        // commerce 는 이것으로 팀장이 아닌 사람에게 자기 검색의 답만 싣는다 (없는 옛 행은 작업의 updated_at 으로 잇는다)
+        "by" => task.g("from")?,
     })?;
 
     context.s_("data", ctx.arr.clone())?;

@@ -161,7 +161,9 @@ for (const scenario of SCENARIOS.filter((s) => !ONLY || ONLY.split(",").includes
   const same = a === b;
   if (!same) fail++;
   const kinds = (r) => r.records.map((x) => x.kind[0]).join("");
-  console.log(`${same ? "SAME" : "DIFF"}  ${scenario.name}  status=${ts.response.status}/${rs.response.status}  records=${kinds(ts)}/${kinds(rs)}  tables=${Object.keys(ts.state).length}/${Object.keys(rs.state).length}`);
+  // scenario.fixes: 그 수정이 쓰기를 바꾸는 시나리오 — PROXY_SKIP 에 든 id 가 달린 시나리오의 DIFF 는 예상된 것으로 표시
+  const tagged = (scenario.fixes || []).filter((id) => (process.env.PROXY_SKIP || "").split(",").includes(id));
+  console.log(`${same ? "SAME" : "DIFF"}  ${scenario.name}  status=${ts.response.status}/${rs.response.status}  records=${kinds(ts)}/${kinds(rs)}  tables=${Object.keys(ts.state).length}/${Object.keys(rs.state).length}${tagged.length ? `  (tagged ${tagged.join(",")})` : ""}`);
 }
 console.log(fail ? `${fail} scenario(s) differ` : "all scenarios identical");
 process.exit(fail ? 1 : 0);

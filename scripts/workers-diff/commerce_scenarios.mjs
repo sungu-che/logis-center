@@ -475,3 +475,28 @@ SCENARIOS.push(
   // 팀장: 지금과 같이 모든 답
   { name: "searchans_owner_home", rows: ANSWER_ROWS(), s3: S3_PERPAGE, requests: [JSON_GET(HOME_GET)] },
 );
+
+// ---------------------------------------------------------------------------------------------------------------------
+// fix-search-answer-owner: proxy 가 답 data 에 검색한 사람(by)을 남긴 뒤의 답은 그것으로 가린다 — 작업 잇기(ref · updated_at)를 보지 않는다.
+// 시각을 일부러 엇갈려 맞춘다: OTHER 의 답(by = OTHER)은 팀장 작업의 updated_at 에, 팀장 · 다른 팀원(THIRD)의 답은 OTHER 작업의 updated_at 에.
+// by 가 없는 옛 답 둘은 지금처럼 작업으로 잇는다(OTHER 작업과 맞는 것은 싣고, 팀장 작업과 맞는 것은 뺌)
+const THIRD = "0x" + "c7".repeat(20);
+const OWNED_ANSWER = (id, created_at, by, markdown) => TALK({ id, from: TEAM, to: "", cc: HOME_CC, bcc: "", ref: HOME_REF, created_at,
+  data: { id, markdown, results: [{ id: "x" }], search: { query: {}, sql: { results: [] }, vector: { results: [] } }, by } });
+const OWNED_ROWS = () => SCOPE_ROWS([MEMBER_A,
+  OWNED_ANSWER("0x" + "6a".repeat(20), T0 - 40000, OTHER, "OTHER 의 검색 답 (팀장 작업과 시각이 맞음)"),
+  OWNED_ANSWER("0x" + "6b".repeat(20), T0 - 50000, USER, "팀장의 검색 답 (OTHER 작업과 시각이 맞음)"),
+  OWNED_ANSWER("0x" + "6c".repeat(20), T0 - 50000, THIRD, "다른 팀원의 검색 답 (OTHER 작업과 시각이 맞음)"),
+  ANSWER("0x" + "6d".repeat(20), T0 - 50000, "옛 답 — OTHER 작업과 맞음"),
+  ANSWER("0x" + "6e".repeat(20), T0 - 40000, "옛 답 — 팀장 작업과 맞음"),
+  LOGIS_TASK("0x" + "96".repeat(20), HOME_REF, OTHER, { type: "prompt", cc: HOME_CC, updated_at: T0 - 50000 }),
+  LOGIS_TASK("0x" + "97".repeat(20), HOME_REF, USER, { type: "prompt", cc: HOME_CC, updated_at: T0 - 40000 }),
+  LOGIS_TASK("0x" + "98".repeat(20), HOME_REF, THIRD, { type: "prompt", cc: HOME_CC, updated_at: T0 - 20000 }),
+]);
+
+SCENARIOS.push(
+  // 팀원(OTHER): 자기 답(by = OTHER)과 OTHER 작업과 맞는 옛 답만 — 팀장 · THIRD 의 답은 시각이 OTHER 작업과 맞아도 빠진다
+  { name: "searchowner_member_home", fixes: ["fix-search-answer-owner"], rows: OWNED_ROWS(), s3: S3_PERPAGE, requests: [JGET(OTHER_COOKIES, HOME_GET)] },
+  // 팀장: 지금과 같이 모든 답
+  { name: "searchowner_owner_home", fixes: ["fix-search-answer-owner"], rows: OWNED_ROWS(), s3: S3_PERPAGE, requests: [JSON_GET(HOME_GET)] },
+);

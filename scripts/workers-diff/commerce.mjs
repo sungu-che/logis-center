@@ -244,7 +244,9 @@ for (const scenario of SCENARIOS.filter((s) => !ONLY || ONLY.split(",").includes
   if (!same) fail++;
   const st = (x) => x.responses.map((r) => r.status ?? "E").join(",");
   const kinds = (x) => x.records.map((r) => r.kind[0]).join("");
-  console.log(`${same ? "SAME" : "DIFF"}  ${scenario.name}  status=${st(ts)}/${st(rs)}  records=${kinds(ts)}/${kinds(rs)}  tables=${Object.keys(ts.state).length}/${Object.keys(rs.state).length}`);
+  // scenario.fixes: 그 수정이 바꾸는 시나리오 — COMMERCE_SKIP 에 든 id 가 달린 시나리오의 DIFF 는 예상된 것으로 표시
+  const tagged = (scenario.fixes || []).filter((id) => (process.env.COMMERCE_SKIP || "").split(",").includes(id));
+  console.log(`${same ? "SAME" : "DIFF"}  ${scenario.name}  status=${st(ts)}/${st(rs)}  records=${kinds(ts)}/${kinds(rs)}  tables=${Object.keys(ts.state).length}/${Object.keys(rs.state).length}${tagged.length ? `  (tagged ${tagged.join(",")})` : ""}`);
 }
 console.log(fail ? `${fail} scenario(s) differ` : "all scenarios identical");
 process.exit(fail ? 1 : 0);

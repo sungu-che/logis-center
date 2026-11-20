@@ -1677,3 +1677,55 @@ async function teamOwner(
 								}
 								talk.table = 'talks'
 >>>
+
+
+=====================================================================================================================
+fix-search-answer-owner: proxy 가 검색의 답 data(gzip JSON)에 검색한 사람 by = task.from 을 남긴다(proxy 의 같은 id). 팀장이 아니면 by 가 있는 답은
+그것이 이 사람일 때만 싣고(작업으로 잇지 않음 — 답의 created_at 이 우연히 남의 작업 updated_at 과 맞아도), by 가 없는 옛 답만 지금처럼 작업으로 잇는다.
+팀장은 그대로. workers/commerce/src/fixes.rs(foreign_search_answers) 와 1:1. fix-member-search-answers 위에 덧댄다(foreignSearchAnswers).
+@@ fix-search-answer-owner
+<<< find
+		if(typeof row.id == "string"){
+			cands.push(row)
+		}
+	}
+	if(!cands.length){
+		return []
+	}
+=== replace
+		if(typeof row.id == "string"){
+			// fix-search-answer-owner: 답에 검색한 사람(by)이 있으면 그것으로 가린다. 없는 옛 답만 작업으로 잇는다
+			if(typeof data.by == "string" && data.by){
+				if(data.by != address){
+					owned.push(row.id)
+				}
+				continue
+			}
+			cands.push(row)
+		}
+	}
+	if(!cands.length){
+		return owned
+	}
+>>>
+
+@@ fix-search-answer-owner
+<<< find
+async function foreignSearchAnswers(env, logisRegion, rows, team, address){
+	var cands = []
+=== replace
+async function foreignSearchAnswers(env, logisRegion, rows, team, address){
+	var cands = []
+	var owned = []
+>>>
+
+@@ fix-search-answer-owner
+<<< find
+	var drop = []
+	cands.forEach(row => {
+		var matched = results.filter(k => k.ref == row.ref && k.updated_at == row.created_at)
+=== replace
+	var drop = owned
+	cands.forEach(row => {
+		var matched = results.filter(k => k.ref == row.ref && k.updated_at == row.created_at)
+>>>

@@ -267,9 +267,11 @@ const SQL_ANSWER_TASKS: &str = r#"SELECT "from", "ref", "updated_at" FROM tasks 
 
 /// `await foreignSearchAnswers(env, logisRegion, results, team, address)` — fix-member-search-answers: 이 주소의 대화(2584) 가운데 proxy 검색의 답
 /// (`from` = 팀, data 에 `search`)이 그 사람의 검색이 아니면 그 대화 id 들. 답 행에는 검색한 사람이 없어 원래 작업으로 잇는다: proxy 는 답을
-/// `ref` = task.ref · `created_at` = now 로 쓰고 같은 now 로 작업 행의 `updated_at` 을 고친다(epilogue). 그런 작업이 없거나 하나라도 남의 것이면 뺀다
+/// `ref` = task.ref · `created_at` = now 로 쓰고 같은 now 로 작업 행의 `updated_at` 을 고친다(epilogue). 그런 작업이 없거나 하나라도 남의 것이면 뺀다.
+/// fix-search-answer-owner: proxy 가 답 data 에 검색한 사람(`by`)을 남긴 뒤의 행은 그것이 이 사람이 아니면 뺀다(작업으로 잇지 않음 — 시각이 우연히 맞아도)
 pub async fn foreign_search_answers(env: &Env, logis_region: &str, rows: &V, team: &V, address: &V) -> R<Vec<String>> {
     let mut cands: Vec<(String, V, V)> = Vec::new();
+    let mut drop = Vec::new();
     for row in rows.items() {
         if !logis_worker_common::loose_eq(&row.get("from"), team) {
             continue;
@@ -278,12 +280,19 @@ pub async fn foreign_search_answers(env: &Env, logis_region: &str, rows: &V, tea
         if !(matches!(d, V::Obj(_)) && d.get("search").truthy()) {
             continue;
         }
-        if let Some(id) = row.get("id").as_str() {
-            cands.push((id.to_string(), row.get("ref"), row.get("created_at")));
+        let Some(id) = row.get("id").as_str().map(str::to_string) else { continue };
+        // 고침 (fix-search-answer-owner): proxy 가 답에 검색한 사람(data.by)을 남기면 그것으로 가린다 — 작업으로 잇지 않는다.
+        // 없는 행(그 전에 쓴 답)만 아래의 작업 잇기로
+        if let Some(by) = d.get("by").as_str().filter(|s| !s.is_empty()) {
+            if !logis_worker_common::loose_eq(&V::from(by), address) {
+                drop.push(id);
+            }
+            continue;
         }
+        cands.push((id, row.get("ref"), row.get("created_at")));
     }
     if cands.is_empty() {
-        return Ok(Vec::new());
+        return Ok(drop);
     }
     let mut refs: Vec<String> = Vec::new();
     for (_, r, _) in &cands {
@@ -293,7 +302,6 @@ pub async fn foreign_search_answers(env: &Env, logis_region: &str, rows: &V, tea
     }
     let refs = V::from(stringify_str(&V::from(refs.iter().map(|s| V::from(s.as_str())).collect::<Vec<_>>())));
     let tasks = js::query_bound(env, logis_region, SQL_ANSWER_TASKS, &[team.clone(), refs]).await?.items();
-    let mut drop = Vec::new();
     for (id, r, t) in cands {
         let matched: Vec<&V> = tasks
             .iter()

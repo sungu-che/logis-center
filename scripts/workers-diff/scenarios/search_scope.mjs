@@ -39,11 +39,11 @@ export default ({ T0, REQUEST, ROWS, TASK, SEARCH_LLM }) => {
   });
   return [
     // 페이지 A 의 멤버: A(목록 꼴 포함) · 팀 공통 행만 — 다른 사이트 행은 벡터 · SQL 모두에서 빠진다
-    { name: "search_scope_member", rows: SCOPE_ROWS("0xmember"), vectors: VECTORS, request: REQUEST(), llm: LLM },
+    { name: "search_scope_member", fixes: ["fix-search-answer-owner"], rows: SCOPE_ROWS("0xmember"), vectors: VECTORS, request: REQUEST(), llm: LLM },
     // 팀장: 지금과 같이 팀 전체
-    { name: "search_scope_owner", rows: SCOPE_ROWS("0xowner"), vectors: VECTORS, request: REQUEST(), llm: LLM },
+    { name: "search_scope_owner", fixes: ["fix-search-answer-owner"], rows: SCOPE_ROWS("0xowner"), vectors: VECTORS, request: REQUEST(), llm: LLM },
     // 사이트 멤버(bcc = cc): 그 사이트 통째 + 팀 공통
-    { name: "search_scope_site", rows: SCOPE_ROWS("0xsite", [item("M2", { type: "member", from: "0xsite", cc: "0xowner", bcc: CC, data: { name: "park" } })]),
+    { name: "search_scope_site", fixes: ["fix-search-answer-owner"], rows: SCOPE_ROWS("0xsite", [item("M2", { type: "member", from: "0xsite", cc: "0xowner", bcc: CC, data: { name: "park" } })]),
       vectors: VECTORS, request: REQUEST(), llm: LLM },
   ];
 };

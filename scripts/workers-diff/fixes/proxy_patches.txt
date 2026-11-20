@@ -90,3 +90,19 @@ var { results } = await env[`commerce_logis_${zoneRegion}_${type}`].prepare(`SEL
 === replace
 var { results } = await searchScopeBind(env[`commerce_logis_${zoneRegion}_${type}`].prepare(`SELECT * FROM ${type} WHERE ${condition} AND "to" = '${team.id}'${searchScopeSql(searchScope, 1)} ${orderBy} LIMIT 300`), searchScope).all()
 >>>
+
+=====================================================================================================================
+fix-search-answer-owner: 검색의 답은 대화 행(id = 문맥 id · from = 팀 · to = 작업 bcc('') · cc = 작업 cc · ref = task.ref)으로 쌓이고 검색한 사람이 남지 않아,
+commerce 의 fix-member-search-answers 가 답의 created_at = 작업의 updated_at 으로 원래 작업을 찾아 이었다 → 답의 data(gzip JSON)에 검색한 사람
+by = task.from 을 남긴다. 열(from · to · cc · bcc)은 그대로 — 데스크톱 앱은 from 으로 말한 사람을, 확장은 bcc(없으면 from)로 아바타를 정하고,
+commerce 는 from = 팀 · to = 나 를 "팀이 나에게 보낸 대화"로 읽는다. workers/proxy/src/search.rs 와 1:1.
+@@ fix-search-answer-owner
+<<< find
+search : rag.search
+											})), { to: 'arraybuffer' })
+=== replace
+search : rag.search,
+												// fix-search-answer-owner: 검색한 사람 (commerce 가 팀장이 아닌 사람에게 자기 답만 싣는 데 씀)
+												by : task.from
+											})), { to: 'arraybuffer' })
+>>>

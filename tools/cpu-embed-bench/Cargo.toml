@@ -12,7 +12,7 @@ description = "Mac/Linux CPU verification 3-2: profile of the granite embedding 
 [dependencies]
 candle-core = { path = "../../../candle-rocm-vulkan/candle-core", default-features = false }
 candle-nn = { path = "../../../candle-rocm-vulkan/candle-nn", default-features = false }
-premium-discount-cpu-kernels = { git = "https://github.com/Qntology/premium-discount", rev = "b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5" }
+premium-discount-cpu-kernels = { git = "https://github.com/Qntology/premium-discount", rev = "7810fdc8c145fa7b5ca28d32d21f8528dddfb3b6" }
 rayon = "1.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

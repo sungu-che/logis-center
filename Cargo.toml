@@ -59,23 +59,23 @@ logis-app = { path = "apps/core" }
 
 # premium-discount 공용 라이브러리 (Tier 0 PD_LIB_PIN_REV 고정).
 # 로컬 ../premium-discount 로 같이 고칠 때는 아래 [patch."https://github.com/Qntology/premium-discount"] 의 주석을 푼다.
-premium-discount-identity = { git = "https://github.com/Qntology/premium-discount", rev = "b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5" }
-premium-discount-manifest = { git = "https://github.com/Qntology/premium-discount", rev = "b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5" }
-premium-discount-cpu-kernels = { git = "https://github.com/Qntology/premium-discount", rev = "b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5" }
-premium-discount-eval = { git = "https://github.com/Qntology/premium-discount", rev = "b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5" }
-premium-discount-sds = { git = "https://github.com/Qntology/premium-discount", rev = "b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5" }
-premium-discount-quant = { git = "https://github.com/Qntology/premium-discount", rev = "b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5" }
+premium-discount-identity = { git = "https://github.com/Qntology/premium-discount", rev = "7810fdc8c145fa7b5ca28d32d21f8528dddfb3b6" }
+premium-discount-manifest = { git = "https://github.com/Qntology/premium-discount", rev = "7810fdc8c145fa7b5ca28d32d21f8528dddfb3b6" }
+premium-discount-cpu-kernels = { git = "https://github.com/Qntology/premium-discount", rev = "7810fdc8c145fa7b5ca28d32d21f8528dddfb3b6" }
+premium-discount-eval = { git = "https://github.com/Qntology/premium-discount", rev = "7810fdc8c145fa7b5ca28d32d21f8528dddfb3b6" }
+premium-discount-sds = { git = "https://github.com/Qntology/premium-discount", rev = "7810fdc8c145fa7b5ca28d32d21f8528dddfb3b6" }
+premium-discount-quant = { git = "https://github.com/Qntology/premium-discount", rev = "7810fdc8c145fa7b5ca28d32d21f8528dddfb3b6" }
 # AI 엔진: Stanza (ONNX Runtime, 실행할 때 불러옴) · granite 임베딩 인코더 (candle). logis 쪽은 이 위의 얇은 층입니다.
-premium-discount-nlp = { git = "https://github.com/Qntology/premium-discount", rev = "b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5", default-features = false }
-premium-discount-nms = { git = "https://github.com/Qntology/premium-discount", rev = "b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5" }
+premium-discount-nlp = { git = "https://github.com/Qntology/premium-discount", rev = "7810fdc8c145fa7b5ca28d32d21f8528dddfb3b6", default-features = false }
+premium-discount-nms = { git = "https://github.com/Qntology/premium-discount", rev = "7810fdc8c145fa7b5ca28d32d21f8528dddfb3b6" }
 
 # louis-vision Tier 1 통합 비전 · 도메인 · 에이전트 코어 (LV_LIB_PIN_REV 고정, 무통신/무DB/무SAM).
-lv-kernels = { git = "https://github.com/Qntology/louis-vision", rev = "54b161b3f182ccef867ff9fafa1c684946be2611" }
-lv-sds = { git = "https://github.com/Qntology/louis-vision", rev = "54b161b3f182ccef867ff9fafa1c684946be2611" }
-lv-core = { git = "https://github.com/Qntology/louis-vision", rev = "54b161b3f182ccef867ff9fafa1c684946be2611" }
-lv-doc = { git = "https://github.com/Qntology/louis-vision", rev = "54b161b3f182ccef867ff9fafa1c684946be2611", default-features = false }
-lv-domain = { git = "https://github.com/Qntology/louis-vision", rev = "54b161b3f182ccef867ff9fafa1c684946be2611" }
-lv-agent = { git = "https://github.com/Qntology/louis-vision", rev = "54b161b3f182ccef867ff9fafa1c684946be2611" }
+lv-kernels = { git = "https://github.com/Qntology/louis-vision", rev = "a2dd50a682720c622db76450c003b3ffd6785644" }
+lv-sds = { git = "https://github.com/Qntology/louis-vision", rev = "a2dd50a682720c622db76450c003b3ffd6785644" }
+lv-core = { git = "https://github.com/Qntology/louis-vision", rev = "a2dd50a682720c622db76450c003b3ffd6785644" }
+lv-doc = { git = "https://github.com/Qntology/louis-vision", rev = "a2dd50a682720c622db76450c003b3ffd6785644", default-features = false }
+lv-domain = { git = "https://github.com/Qntology/louis-vision", rev = "a2dd50a682720c622db76450c003b3ffd6785644" }
+lv-agent = { git = "https://github.com/Qntology/louis-vision", rev = "a2dd50a682720c622db76450c003b3ffd6785644" }
 
 # candle-rocm-vulkan 포크: premium-discount (crates/ · app/) · raon-zena 와 같은 커밋으로 고정한다.
 # 예전에는 branch = "master" 를 따라가고 커밋은 Cargo.lock 이 정했다 (60ec257, ebaf93d 의 조상).
@@ -94,10 +94,14 @@ candle-flash-attn = { git = "https://github.com/Qntology/candle-rocm-vulkan", re
 # [patch."https://github.com/Qntology/premium-discount"]
 # premium-discount-identity = { path = "../premium-discount/crates/premium-discount-identity" }
 # premium-discount-manifest = { path = "../premium-discount/crates/premium-discount-manifest" }
+# premium-discount-cpu-kernels = { path = "../premium-discount/crates/premium-discount-cpu-kernels" }
+# premium-discount-eval = { path = "../premium-discount/crates/premium-discount-eval" }
 # premium-discount-sds = { path = "../premium-discount/crates/premium-discount-sds" }
 # premium-discount-quant = { path = "../premium-discount/crates/premium-discount-quant" }
 # premium-discount-nlp = { path = "../premium-discount/crates/premium-discount-nlp" }
 # premium-discount-nms = { path = "../premium-discount/crates/premium-discount-nms" }
+# lv-core 가 끌어오는 relay (기술 기호 판별) 도 같은 경로로 바꿔야 두 벌이 되지 않는다
+# premium-discount-relay = { path = "../premium-discount/crates/premium-discount-relay" }
 
 # [patch."https://github.com/Qntology/louis-vision"]
 # lv-kernels = { path = "../louis-vision/crates/lv-kernels" }
